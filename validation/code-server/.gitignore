@@ -1,0 +1,12 @@
+code-server-*/
+*.tar.gz
+config.yaml
+server.pid
+user-data/
+extensions/
+roaming/
+local/
+data/
+config/
+watcher-probe.snapshot
+watcher-test-*/
