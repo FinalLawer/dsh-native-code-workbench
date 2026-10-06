@@ -82,20 +82,6 @@ node tools/analyze-bundle.mjs         # bundle 体积归因（哪个模块最胖
 
 **依赖安装**：本机 npm 需走系统代理（`$env:HTTPS_PROXY='http://127.0.0.1:7897'`），否则被 DNS 劫持。
 
-## 路线图（复刻 Cursor）
-
-- [x] **M1 编辑器工作台**：Monaco 内核 + 文件树 + 版本守卫保存 + 主题跟随
-- [x] **M2 Cmd+K 内联编辑**：选区→提示→流式改写→行内 diff→接受/拒绝→自动保存
-- [x] **M3a 代码库检索**：有界遍历 + 正则/大小写搜索 + 结果跳转高亮
-- [x] **M3b @codebase 喂给 Agent**：`codebase_search` 工具注册进官方 Tool Runtime，多词排序检索
-- [x] **M4 Tab 补全**：Monaco inline completions + 流式续写，Tab 接受、打字即取消
-- [x] **M5a 保存检查点**：账本 + 历史面板 + 一键回滚（回滚可再回滚）
-- [x] **M5b bundle 瘦身**：砍 TS 语言服务/冷门语法 + minify，**10.36 → 5.09 MiB**（JSON 语言服务保留，Worker 按 label 路由）
-- [x] **M5c 快捷键入册**：`registerFixed` 把 Ctrl+S / Ctrl+K / Enter·Tab / Esc 挂进 DSH 快捷键设置（只读展示）
-- [x] **M5d 外部改动自动重载**：`workspaceFiles.changes` 流订阅，干净即刷新、脏则警告
-- [x] **M6 加到对话**：选中代码 → `Ctrl+L` → 引用胶囊进主对话输入框（显示行数，提交时展开为代码块）
-- [ ] **M5e 终端 Cmd+K**（可选增强）：终端内联 AI 改写；当前终端集成 = DSH 官方右栏终端
-
 ## 已知限制
 
 - 文件同步使用官方 changes 流，并每 1.5 秒检查打开文件版本、窗口重新聚焦时检查；干净缓冲区自动重读，未保存修改保留。
