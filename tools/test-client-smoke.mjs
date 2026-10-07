@@ -77,6 +77,48 @@ globalThis.document = {
   addEventListener: addDocumentListener,
   removeEventListener: removeDocumentListener,
 }
+/**
+ * Tree row nodes, so the keyboard-navigation path can be observed.
+ *
+ * `react-test-renderer` has no DOM: `createNodeMock` decides what a host element
+ * is, and it only ever receives `{ ref, className, children }` — React strips
+ * every other prop first. The tree therefore files each row node into its own
+ * path→node map through a callback ref, and `focusRow` is the only code that
+ * reaches for a node. This mock records what `focusRow` did to it.
+ */
+const treeRowNodes = []
+let lastFocusedTreeRow = null
+/** The last selection range an in-tree name field was given, so the test can
+ *  assert *which part* of a filename is preselected on rename. */
+let lastFieldSelection = null
+function createMockNode(element) {
+  const { ref, className, type } = element.props ?? {}
+  if (type === 'text' && className === 'code-workbench-tree-editor-input') {
+    // The rename field preselects the stem before the extension. A real input
+    // would apply this itself; the mock records the request instead.
+    return {
+      value: element.props.value ?? '',
+      focus() {},
+      setSelectionRange(start, end) { lastFieldSelection = { start, end, value: this.value } },
+    }
+  }
+  if (className === 'code-workbench-tree-row') {
+    // Stand in for the real element and hand it back to the tree through the
+    // same callback ref React would call. `title` carries the absolute path and
+    // is what the assertions use to say *which* row took focus.
+    const node = {
+      path: element.props?.title,
+      focused: false,
+      scrolled: null,
+      focus() { this.focused = true; lastFocusedTreeRow = node.path },
+      scrollIntoView(options) { this.scrolled = options },
+    }
+    treeRowNodes.push(node)
+    ref?.(node)
+    return node
+  }
+  return {}
+}
 globalThis.window = {
   __ModuleLoader__: {
     load(registration) {
@@ -374,8 +416,9 @@ console.log('render shell + file tree')
 let renderer
 await act(async () => {
   // createNodeMock gives host elements (the editor container div) a non-null
-  // instance, so the panel's hostRef behaves as it does in a browser.
-  renderer = create(h(CodePanel, props), { createNodeMock: () => ({}) })
+  // instance, so the panel's hostRef behaves as it does in a browser. Tree rows
+  // and the tree scroller get richer stand-ins so keyboard focus is observable.
+  renderer = create(h(CodePanel, props), { createNodeMock: createMockNode })
 })
 await act(async () => {})
 const tree = () => renderer.toJSON()
@@ -529,20 +572,95 @@ const contextMenuFor = async (path) => {
 const menuAction = async (label) => {
   await act(async () => { findAll(tree(), (node) => node.props?.role === 'menuitem' && textOf(node) === label)[0].props.onClick() })
 }
+/**
+ * Type a name into the in-tree field and commit it with Enter.
+ *
+ * Creating and renaming happen *inside* the tree — the field is a row-shaped
+ * `<input>` in the row list, not a modal — so this drives the real element the
+ * user types into, including the Enter keydown that commits it.
+ */
+const inlineInput = () => findAll(tree(), (node) => node.type === 'input' && node.props?.className === 'code-workbench-tree-editor-input')[0]
 const submitName = async (name) => {
-  await act(async () => { findAll(tree(), (node) => node.type === 'input' && node.props['aria-label'] === '名称')[0].props.onChange({ target: { value: name } }) })
-  await act(async () => { findAll(tree(), (node) => node.type === 'form')[0].props.onSubmit({ preventDefault() {} }) })
+  await act(async () => { inlineInput().props.onChange({ target: { value: name } }) })
+  await act(async () => { inlineInput().props.onKeyDown({ key: 'Enter', preventDefault() {}, stopPropagation() {} }) })
+  await act(async () => {})
 }
 await contextMenuFor('C:\\repo\\b.js')
 check('removed context actions are absent', !allText().includes('打开工作区终端') && !allText().includes('在文件夹中查找'))
 await menuAction('新建文件…')
-check('new file uses an embedded dialog', !!findAll(tree(), (node) => node.props?.role === 'dialog')[0])
+// The field lives in the tree, so the files around it stay visible. It must
+// NOT be a modal — that is the whole point of editing in place.
+check('new file uses an in-tree field, not a dialog',
+  inlineInput() !== undefined && findAll(tree(), (node) => node.props?.role === 'dialog').length === 0,
+  { hasInput: inlineInput() !== undefined, dialogs: findAll(tree(), (node) => node.props?.role === 'dialog').length })
+check('the create field sits in the row list at the destination depth',
+  inlineInput().props.placeholder === '文件名' && inlineInput().props.value === '')
 await submitName('new.js')
 check('new file submits the selected parent directory', calls.fetch.some((call) => call.body.operation === 'createFile' && call.body.path === 'C:\\repo\\new.js'))
 await contextMenuFor('C:\\repo\\b.js')
 await menuAction('新建文件夹…')
 await submitName('new-folder')
 check('new folder submits its name', calls.fetch.some((call) => call.body.operation === 'createDirectory' && call.body.path === 'C:\\repo\\new-folder'))
+
+console.log('\nin-tree field: cancelling, empty names, and rejected names')
+// The field must never trap the user. Escape abandons the edit, clicking away
+// abandons an *empty* edit, and a rejected name keeps the input alive.
+const createCalls = () => calls.fetch.filter((call) => call.body?.operation === 'createFile' || call.body?.operation === 'createDirectory')
+await contextMenuFor('C:\\repo\\b.js')
+await menuAction('新建文件…')
+const beforeEscape = createCalls().length
+await act(async () => { inlineInput().props.onChange({ target: { value: 'typed-then-abandoned.js' } }) })
+await act(async () => { inlineInput().props.onKeyDown({ key: 'Escape', preventDefault() {}, stopPropagation() {} }) })
+await act(async () => {})
+check('Escape closes an open create field', inlineInput() === undefined)
+check('Escape creates nothing', createCalls().length === beforeEscape, createCalls().map((call) => call.body.path))
+
+await contextMenuFor('C:\\repo\\b.js')
+await menuAction('新建文件…')
+await act(async () => { inlineInput().props.onBlur() })
+await act(async () => {})
+check('blurring an untouched field closes it without creating anything',
+  inlineInput() === undefined && createCalls().length === beforeEscape,
+  createCalls().map((call) => call.body.path))
+
+await contextMenuFor('C:\\repo\\b.js')
+await menuAction('新建文件…')
+await act(async () => { inlineInput().props.onChange({ target: { value: 'has/slash.js' } }) })
+await act(async () => { inlineInput().props.onKeyDown({ key: 'Enter', preventDefault() {}, stopPropagation() {} }) })
+await act(async () => {})
+check('a name with a path separator is rejected', createCalls().length === beforeEscape)
+check('a rejected name keeps the field open so the input is not lost',
+  inlineInput() !== undefined && inlineInput().props.value === 'has/slash.js',
+  { open: inlineInput() !== undefined, value: inlineInput()?.props.value })
+check('the rejection is explained to the user', allText().includes('不能包含路径分隔符'), allText().slice(-90))
+check('the field is marked invalid for assistive tech', inlineInput().props['aria-invalid'] === true)
+// Correcting the name clears the complaint and commits normally.
+await act(async () => { inlineInput().props.onChange({ target: { value: 'corrected.js' } }) })
+await act(async () => {})
+check('editing clears the previous error', inlineInput().props['aria-invalid'] === false && !allText().includes('不能包含路径分隔符'))
+await act(async () => { inlineInput().props.onKeyDown({ key: 'Enter', preventDefault() {}, stopPropagation() {} }) })
+await act(async () => {})
+check('the corrected name commits', calls.fetch.some((call) => call.body.operation === 'createFile' && call.body.path === 'C:\\repo\\corrected.js'))
+check('the field closes after a successful commit', inlineInput() === undefined)
+
+// --- Committing must happen exactly once. Enter both submits the name and
+// unmounts the field, which fires blur; if blur submitted too, every file would
+// be created twice.
+await contextMenuFor('C:\\repo\\b.js')
+await menuAction('新建文件…')
+const beforeSingleSubmit = createCalls().length
+await act(async () => { inlineInput().props.onChange({ target: { value: 'exactly-once.js' } }) })
+// Capture the handlers before the field unmounts, since the input is gone after.
+const committingProps = inlineInput().props
+await act(async () => { committingProps.onKeyDown({ key: 'Enter', preventDefault() {}, stopPropagation() {} }) })
+await act(async () => {})
+check('Enter creates the file once',
+  createCalls().length === beforeSingleSubmit + 1, createCalls().slice(beforeSingleSubmit).map((call) => call.body.path))
+// The blur that React fires while unmounting must be a no-op, not a second write.
+await act(async () => { committingProps.onBlur() })
+await act(async () => {})
+check('the blur that follows a commit does not submit again',
+  createCalls().length === beforeSingleSubmit + 1, createCalls().slice(beforeSingleSubmit).map((call) => call.body.path))
 
 console.log('\ntoolbar create targets the selected row, not the workspace root')
 const toolbarButton = (label) => findAll(tree(), (node) => node.type === 'button' && node.props['aria-label'] === label)[0]
@@ -777,6 +895,195 @@ fakeActx.bail = (self, event, payload) => { calls.bailed.push({ event, payload }
 check('the busy path did not append a chip', calls.bailed.length === insertCountBeforeBusy, calls.bailed.length)
 props['sessions.scope'] = originalScope
 void bailCountBeforeBusy
+
+console.log('\nfile-tree keyboard navigation')
+// The tree is a flat `role="tree"` scroller holding `role="button"` rows. Keys
+// are delivered to the container, exactly as a browser does when a focused row
+// lets the event bubble, so these assertions exercise the real handler.
+const treeBody = () => findAll(tree(), (node) => node.props?.className === 'code-workbench-tree-body')[0]
+const rowNode = (title) => treeRowFor(title)
+const selectedTitle = () => findAll(tree(), (node) => node.props?.['data-selected'] === true).map((node) => node.props.title)
+/** Deliver a key to the tree container and let React flush. */
+const pressTreeKey = async (key, extra = {}) => {
+  let prevented = false
+  await act(async () => {
+    treeBody().props.onKeyDown({ key, preventDefault() { prevented = true }, ...extra })
+  })
+  await act(async () => {})
+  return prevented
+}
+// A keypress on a row bubbles to the container in a browser; assert the rows
+// themselves stay out of the way of movement keys so that bubbling is possible.
+// The status bar is deliberately excluded: the drag suite above leaves a
+// message there, and this assertion is about the *document*, not the chrome.
+const editorBeforeKeys = currentModel?.getValue()
+const dirtyBeforeKeys = allText().includes('未保存')
+check('the tree exposes a single flat tree container', treeBody() !== undefined, Boolean(treeBody()))
+const ajsKeys = rowNode('C:\\repo\\a.js').props.onKeyDown
+let rowPrevented = false
+ajsKeys({ key: 'ArrowDown', preventDefault() { rowPrevented = true } })
+check('a row ignores movement keys so they bubble to the tree',
+  rowPrevented === false, rowPrevented)
+let enterPrevented = false
+ajsKeys({ key: 'Enter', preventDefault() { enterPrevented = true } })
+await act(async () => {})
+check('a row still claims Enter for itself', enterPrevented === true)
+
+// --- ↓ moves down, ↑ moves back, and both stop at the ends.
+await act(async () => { rowNode('C:\\repo\\a.js').props.onClick() })
+await act(async () => {})
+check('a click still selects its row', selectedTitle().includes('C:\\repo\\a.js'), selectedTitle())
+// The selection is announced, not just painted: rows are treeitems and carry
+// aria-selected, so a screen reader follows the caret the same way the eye does.
+check('the selected row is announced to assistive tech',
+  rowNode('C:\\repo\\a.js').props['aria-selected'] === true
+  && rowNode('C:\\repo\\b.js').props['aria-selected'] === false)
+check('rows identify themselves as tree items at their depth',
+  rowNode('C:\\repo\\a.js').props.role === 'treeitem' && rowNode('C:\\repo\\a.js').props['aria-level'] === 1)
+// The selection effect focuses the selected row, so this is the row that took
+// DOM focus — which is what makes the next keypress reach the tree at all.
+check('the selected row is the one holding focus', lastFocusedTreeRow === 'C:\\repo\\a.js', lastFocusedTreeRow)
+await pressTreeKey('ArrowDown')
+check('↓ moves the selection to the next visible row', selectedTitle().includes('C:\\repo\\b.js'), selectedTitle())
+check('↓ moves DOM focus onto the row it selected', lastFocusedTreeRow === 'C:\\repo\\b.js', lastFocusedTreeRow)
+await pressTreeKey('ArrowUp')
+check('↑ moves the selection back up', selectedTitle().includes('C:\\repo\\a.js'), selectedTitle())
+const topRowTitle = rowNode('C:\\repo\\a.js').props.title
+await pressTreeKey('ArrowUp')
+check('↑ stops at the first row instead of wrapping', selectedTitle().includes(topRowTitle), selectedTitle())
+
+// --- Movement must not count as typing over the open document: the buffer and
+// the dirty flag are untouched, and no key was swallowed into the file.
+check('tree navigation leaves the editor buffer untouched',
+  currentModel.getValue() === editorBeforeKeys,
+  { before: editorBeforeKeys.slice(0, 60), now: currentModel.getValue().slice(0, 60) })
+check('tree navigation does not mark the open file dirty',
+  allText().includes('未保存') === dirtyBeforeKeys)
+
+// --- A collapsed folder is a boundary: its children are simply not in the
+// tree, so ↓ can never skip into them. → is what opens the door.
+const subRow = () => rowNode('C:\\repo\\sub')
+const subChild = 'C:\\repo\\sub\\a.js'
+check('the folder starts collapsed', subRow().props['aria-expanded'] === false)
+check('a collapsed folder keeps its children out of the tree', rowNode(subChild) === undefined)
+// a.js → b.js → sub, so ↓ from b.js selects the folder without expanding it.
+await act(async () => { rowNode('C:\\repo\\b.js').props.onClick() })
+await act(async () => {})
+await pressTreeKey('ArrowDown')
+check('↓ stops on a collapsed folder instead of entering it', selectedTitle().includes('C:\\repo\\sub'), selectedTitle())
+check('landing on a collapsed folder did not expand it', rowNode('C:\\repo\\sub').props['aria-expanded'] === false)
+check('↓ never skipped past the folder into its children', rowNode(subChild) === undefined)
+await pressTreeKey('ArrowRight')
+check('→ expands the folder the selection is on', rowNode('C:\\repo\\sub').props['aria-expanded'] === true)
+check('→ reveals the first child', rowNode(subChild) !== undefined, rowNode(subChild)?.props.title)
+await pressTreeKey('ArrowRight')
+check('→ again steps onto the first child', selectedTitle().includes(subChild), selectedTitle())
+await pressTreeKey('ArrowLeft')
+check('← on a child steps up to its parent folder', selectedTitle().includes('C:\\repo\\sub') && !selectedTitle().includes(subChild), selectedTitle())
+await pressTreeKey('ArrowLeft')
+check('← on an expanded folder collapses it', rowNode('C:\\repo\\sub').props['aria-expanded'] === false)
+// Collapsed again, so the folder is the last row and ↓ has nowhere to go.
+await pressTreeKey('ArrowDown')
+check('↓ at the last row stays put instead of wrapping', selectedTitle().includes('C:\\repo\\sub'), selectedTitle())
+
+// --- F2 opens the in-tree rename field on the selected row.
+const dialogTitle = () => findAll(tree(), (node) => node.props?.className === 'code-workbench-dialog-title').map(textOf)[0]
+await act(async () => { rowNode('C:\\repo\\a.js').props.onClick() })
+await act(async () => {})
+check('no editor is open before the shortcut is used', inlineInput() === undefined)
+await pressTreeKey('F2')
+check('F2 opens a rename field in the tree, not a dialog',
+  inlineInput() !== undefined && dialogTitle() === undefined, { input: inlineInput() !== undefined, dialog: dialogTitle() })
+check('the rename field is pre-filled with the current name',
+  inlineInput().props.value === 'a.js', inlineInput().props.value)
+// The field replaces the row it renames, so the old name is not shown twice.
+check('the renamed row is replaced by the field',
+  rowNode('C:\\repo\\a.js') === undefined, Boolean(rowNode('C:\\repo\\a.js')))
+// The extension is left out of the selection: renaming usually means changing
+// the stem, not the type. `a.js` should select "a", not "a.js".
+check('the rename field selects only the stem, not the extension',
+  lastFieldSelection?.value === 'a.js' && lastFieldSelection.start === 0 && lastFieldSelection.end === 1,
+  lastFieldSelection)
+await act(async () => { inlineInput().props.onKeyDown({ key: 'Escape', preventDefault() {}, stopPropagation() {} }) })
+await act(async () => {})
+check('Escape closes the rename field and restores the row',
+  inlineInput() === undefined && rowNode('C:\\repo\\a.js') !== undefined)
+check('Escape issues no rename', calls.fetch.filter((call) => call.body?.operation === 'rename' && call.body.path === 'C:\\repo\\a.js').length === 0)
+
+// --- Delete routes to the delete confirmation, and the dialog guards it.
+// Re-anchor the selection on a row with no unsaved buffer: the guard below
+// deliberately refuses to delete a file that is still dirty, and `a.js` has
+// been edited by earlier suites.
+const deleteTarget = 'C:\\repo\\b.js'
+await act(async () => { rowNode(deleteTarget).props.onClick() })
+await act(async () => {})
+const deleteCalls = () => calls.fetch.filter((call) => call.body?.operation === 'delete')
+const deletesBefore = deleteCalls().length
+/** Deletes issued from here on, so the pre-existing `b.js` delete above is not counted. */
+const newDeletes = () => deleteCalls().slice(deletesBefore)
+await pressTreeKey('Delete')
+check('Delete opens a confirmation instead of acting immediately',
+  (dialogTitle() ?? '').includes(deleteTarget), dialogTitle())
+check('Delete names the selected row, not a neighbour',
+  dialogTitle() === `确定删除 ${deleteTarget}？此操作无法撤销。`, dialogTitle())
+check('Delete performs no file operation until it is confirmed',
+  newDeletes().length === 0, newDeletes().map((call) => call.body.path))
+const destructiveCallsBeforeConfirm = calls.fetch.length
+await act(async () => { findAll(tree(), (node) => node.type === 'button' && textOf(node) === '取消')[0].props.onClick() })
+check('cancelling the delete leaves the file alone', calls.fetch.length === destructiveCallsBeforeConfirm)
+check('cancelling the delete issues no delete operation',
+  newDeletes().length === 0, newDeletes().map((call) => call.body.path))
+
+// --- Confirming is what actually commits, and the field closes on commit.
+// `rename` is used for the commit step rather than `delete`: the tree fixture
+// is shared with the suites that follow, and a real delete would change what
+// they see. The rename targets `b.js`, which no later suite opens.
+const renamesBefore = calls.fetch.filter((call) => call.body?.operation === 'rename').length
+await pressTreeKey('F2')
+await act(async () => { inlineInput().props.onChange({ target: { value: 'b-during-keyboard-test.js' } }) })
+await act(async () => {})
+check('the field shows the name being typed', inlineInput().props.value === 'b-during-keyboard-test.js', inlineInput().props.value)
+await act(async () => { inlineInput().props.onKeyDown({ key: 'Enter', preventDefault() {}, stopPropagation() {} }) })
+await act(async () => {})
+const renameCalls = calls.fetch.filter((call) => call.body?.operation === 'rename')
+check('confirming a rename issues exactly one new rename operation',
+  renameCalls.length === renamesBefore + 1, renameCalls.map((call) => call.body))
+check('the rename carries the name typed into the field',
+  renameCalls.at(-1)?.body?.destination === 'C:\\repo\\b-during-keyboard-test.js', renameCalls.at(-1)?.body)
+check('the rename is sourced from the selected row, not its neighbour',
+  renameCalls.at(-1)?.body?.path === 'C:\\repo\\b.js', renameCalls.at(-1)?.body)
+check('the field closes once the rename is committed', inlineInput() === undefined)
+// The rename moved the open tab onto the new name; hand the editor back to
+// a.js so the history suite below still has the file it expects.
+await act(async () => { tabFor('a.js').props.onClick() })
+await act(async () => {})
+const activeTabText = textOf(findAll(tree(), (node) => node.props?.className?.includes('code-workbench-tab') && node.props.className.includes('active'))[0])
+check('the open file is handed back after the rename',
+  activeTabText.includes('a.js') && !activeTabText.includes('b-during'), activeTabText)
+
+console.log('\ncreating inside a collapsed folder')
+// Runs last among the tree suites: creating a file opens it, which moves the
+// active editor, so nothing may depend on the buffer after this point.
+const dirRow = (title) => findAll(tree(), (node) => node.props?.className === 'code-workbench-tree-row' && node.props.title === title)[0]
+const clickDir = async (title) => { await act(async () => { dirRow(title).props.onClick() }); await act(async () => {}) }
+if (dirRow('C:\\repo\\sub').props['aria-expanded'] === true) await clickDir('C:\\repo\\sub')
+check('the target folder starts collapsed', dirRow('C:\\repo\\sub').props['aria-expanded'] === false)
+await contextMenuFor('C:\\repo\\sub')
+await menuAction('新建文件…')
+// The field renders inside the folder's entry list, so the folder has to open
+// or the user would be typing into something they cannot see.
+check('creating inside a collapsed folder expands it so the field is visible',
+  dirRow('C:\\repo\\sub').props['aria-expanded'] === true)
+check('the field is present once the folder opens', inlineInput() !== undefined)
+await act(async () => { inlineInput().props.onChange({ target: { value: 'in-sub.js' } }) })
+await act(async () => { inlineInput().props.onKeyDown({ key: 'Enter', preventDefault() {}, stopPropagation() {} }) })
+await act(async () => {})
+check('the file lands inside the folder, not beside it',
+  calls.fetch.some((call) => call.body.operation === 'createFile' && call.body.path === 'C:\\repo\\sub\\in-sub.js'))
+// Creating a file opens it, so hand the editor back to the file the history
+// suite below queries.
+await act(async () => { tabFor('a.js').props.onClick() })
+await act(async () => {})
 
 console.log('\ncompact sent reference')
 const Chat = registered.slots.find((row) => row.options.name === 'conversation.chat.node' && row.options.key === 'user')?.component

@@ -35,12 +35,43 @@
   background: var(--dsw-alias-interactive-bg-hover);
   box-shadow: inset 0 0 0 1px var(--dsw-alias-border-l2);
 }
+.code-workbench-tree-row[aria-selected="true"] {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
 .code-workbench-tree-row[data-selected="true"][data-active="true"] {
   box-shadow: inset 0 0 0 1px var(--dsw-alias-brand-primary);
 }
 .code-workbench-tree-row:focus-visible {
   outline: 2px solid var(--dsw-alias-brand-primary);
   outline-offset: -2px;
+}
+/* The row scroller. It is focusable only as a programmatic landing spot, never
+   a tab stop, so the keyboard path runs through the rows themselves. */
+.code-workbench-tree-body { outline: none; min-height: 0; }
+/* The in-tree name field that stands in for a row while creating or renaming.
+   It reads as part of the tree — one line at the row's depth — rather than as a
+   floating panel, which is the whole point of editing in place. */
+.code-workbench-tree-editor { cursor: default; }
+.code-workbench-tree-editor-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 20px;
+  box-sizing: border-box;
+  padding: 0 4px;
+  border: 1px solid var(--dsw-alias-brand-primary);
+  border-radius: 3px;
+  outline: none;
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-alias-bg-base);
+  font-family: inherit;
+  font-size: 12.5px;
+  line-height: 18px;
+}
+.code-workbench-tree-editor-input[aria-invalid="true"] { border-color: var(--dsw-alias-label-error, #d54941); }
+.code-workbench-tree-editor-error {
+  padding: 2px 8px 4px 24px;
+  font-size: 11px;
+  overflow-wrap: anywhere;
 }
 .code-workbench-tree-toolbar { display: flex; justify-content: flex-end; gap: 3px; padding: 5px 8px; border-bottom: 1px solid var(--dsw-alias-border-l2); }
 .code-workbench-tree-toolbar button { width: 25px; height: 24px; padding: 0; border: 0; border-radius: 5px; background: transparent; color: var(--dsw-alias-label-secondary); cursor: pointer; font-size: 15px; }

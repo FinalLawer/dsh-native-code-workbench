@@ -223,7 +223,8 @@ const rowStyle = (depth) => ({
   alignItems: 'center',
   gap: '6px',
   padding: `3px 8px 3px ${8 + depth * 12}px`,
-  cursor: 'pointer',
+  // Reserved for future drag-to-move; see the tree's drag source below.
+  cursor: 'default',
   color: T.fg,
   fontSize: '12.5px',
   lineHeight: '18px',
@@ -266,6 +267,22 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
    * itself, a file creates alongside it.
    */
   const [selected, setSelected] = useState(null)
+  /**
+   * An in-tree name field, in place of a modal dialog.
+   *
+   * VS Code creates and renames *inside the tree*: the row itself becomes a
+   * text field, so the new name appears where it will live and the surrounding
+   * files stay visible for reference. Shape:
+   * `{ mode: 'createFile'|'createDirectory', parent } | { mode: 'rename', path, isDir } | null`.
+   * Indentation is derived when the tree renders, not stored here.
+   */
+  const [editor, setEditor] = useState(null)
+  const [editorValue, setEditorValue] = useState('')
+  /** Set when a commit fails, so the field stays open and explains itself. */
+  const [editorError, setEditorError] = useState(null)
+  const editorInputRef = useRef(null)
+  /** Guards against onBlur firing a second commit after Enter already did. */
+  const editorSettledRef = useRef(false)
   useEffect(() => {
     const close = () => setMenu(null)
     const keydown = (event) => { if (event.key === 'Escape') close() }
@@ -292,6 +309,96 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
     setMenu({ path, isDir, element: event.currentTarget, x: Math.max(0, Math.min(event.clientX, window.innerWidth - 230)), y: Math.max(0, Math.min(event.clientY, window.innerHeight - 380)) })
   }
 
+  /** Put DOM focus on a row and keep it inside the scroller. */
+  const focusRow = (path) => {
+    const node = nodesRef.current.get(path)
+    if (!node) return
+    node.focus?.()
+    node.scrollIntoView?.({ block: 'nearest' })
+  }
+
+  /**
+   * How much of a name to preselect when the field opens.
+   *
+   * Renaming usually means changing the stem, not the type, so the extension is
+   * left out of the selection. A name with no extension is selected whole —
+   * otherwise a file like `Makefile` could not be replaced by typing. Dotfiles
+   * count as extension-less: `.gitignore` selects entirely rather than
+   * preselecting the empty stem before the dot.
+   */
+  const selectableEnd = (name) => {
+    const dot = name.lastIndexOf('.')
+    return dot > 0 ? dot : name.length
+  }
+  /** Open the in-tree field for a create, anchored on the destination folder. */
+  const openCreate = (action, target) => {
+    const isDir = target?.isDir === true
+    const parent = isDir
+      ? target.path
+      : target.path.slice(0, Math.max(target.path.lastIndexOf('/'), target.path.lastIndexOf('\\')))
+    const folder = parent === '' ? cwd : parent
+    // A new child of a collapsed folder needs the folder open to be visible —
+    // the field renders inside that folder's entry list.
+    if (!expanded.has(folder)) toggle(folder)
+    setEditor({ mode: action, parent: folder })
+    setEditorValue('')
+    setEditorError(null)
+    editorSettledRef.current = false
+  }
+  /** Open the in-tree field over an existing row to rename it. */
+  const openRename = (target) => {
+    setEditor({ mode: 'rename', path: target.path, isDir: target.isDir })
+    setEditorValue(target.path.split(/[\\/]/).at(-1))
+    setEditorError(null)
+    editorSettledRef.current = false
+  }
+  const closeEditor = () => {
+    editorSettledRef.current = true
+    setEditor(null)
+    setEditorValue('')
+    setEditorError(null)
+  }
+  /**
+   * Hand the typed name to the host, which owns every write. The field stays
+   * open and shows the reason if the name is rejected, so a typo never costs
+   * the user their input.
+   */
+  const commitEditor = async () => {
+    if (editor === null || editorSettledRef.current) return
+    const name = editorValue.trim()
+    if (name === '') { closeEditor(); return }
+    editorSettledRef.current = true
+    const result = await onAction(editor.mode, {
+      path: editor.mode === 'rename' ? editor.path : editor.parent,
+      isDir: editor.mode === 'rename' ? editor.isDir : true,
+      newName: name,
+    })
+    if (result?.ok === false) {
+      // Reopen the guard so the user can correct the name and retry.
+      editorSettledRef.current = false
+      setEditorError(result.error ?? '操作失败')
+      editorInputRef.current?.focus?.()
+      return
+    }
+    // Unmounting the field fires `onBlur`; close the guard so that cannot start
+    // a second submit for a name that is already being written.
+    editorSettledRef.current = true
+    setEditor(null)
+    setEditorValue('')
+    setEditorError(null)
+  }
+  // The field takes focus and preselects the stem as soon as it appears. Done
+  // after paint so the node exists; `select()` on a detached input is a no-op.
+  useEffect(() => {
+    if (editor === null) return
+    const field = editorInputRef.current
+    if (!field) return
+    field.focus?.()
+    if (editor.mode === 'rename') {
+      const end = selectableEnd(field.value ?? '')
+      field.setSelectionRange?.(0, end)
+    }
+  }, [editor])
   const toggle = useCallback((dir) => {
     setExpanded((prev) => {
       const next = new Set(prev)
@@ -314,7 +421,60 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
   })()
 
   const rows = []
-  const walk = (dir, depth) => {
+  /**
+   * Every row that is actually on screen, in visual order, as the data a
+   * movement key needs rather than as a DOM node. `walk` fills this in the same
+   * pass that builds `rows`, so the two can never disagree.
+   * @type {{key: string, path: string, isDir: boolean, isOpen: boolean, depth: number, parent: string|null}[]}
+   */
+  const flat = []
+  /** Row path → its live DOM node, so a selection can be focused and revealed. */
+  const nodesRef = useRef(new Map())
+  nodesRef.current = new Map()
+  const pushRow = (spec) => {
+    flat.push(spec)
+  }
+  /**
+   * The in-tree name field, rendered where a row would be.
+   *
+   * It is a real `<input>` inside the tree rather than a modal, so the files
+   * around it stay visible and the field sits exactly where the name will land.
+   * Escape and blur both abandon the edit; Enter commits it.
+   */
+  const pushEditorRow = (depth) => {
+    const isRename = editor.mode === 'rename'
+    const placeholder = editor.mode === 'createDirectory' ? '文件夹名' : '文件名'
+    rows.push(h('div', {
+      key: 'code-workbench-inline-editor',
+      className: 'code-workbench-tree-row code-workbench-tree-editor',
+      'data-depth': depth,
+      style: { ...rowStyle(depth), padding: '1px 5px' },
+    },
+      h('span', { style: { color: T.fgMuted, width: '10px', display: 'inline-block' } }, isRename ? (editor.isDir ? '▸' : ' ') : ' '),
+      h('input', {
+        ref: editorInputRef,
+        className: 'code-workbench-tree-editor-input',
+        type: 'text',
+        value: editorValue,
+        placeholder,
+        'aria-label': isRename ? '新的名称' : placeholder,
+        'aria-invalid': editorError !== null,
+        spellCheck: false,
+        autoComplete: 'off',
+        // The tree's own key handler must not treat typing as navigation.
+        onKeyDown: (event) => {
+          event.stopPropagation()
+          if (event.key === 'Escape') { event.preventDefault(); closeEditor() }
+          else if (event.key === 'Enter') { event.preventDefault(); commitEditor() }
+        },
+        onChange: (event) => { setEditorValue(event.target.value); if (editorError !== null) setEditorError(null) },
+        // Clicking away commits an explicit name but silently drops an empty
+        // one, so opening the field by accident costs nothing.
+        onBlur: () => { commitEditor() },
+      })),
+    editorError === null ? null : h('div', { key: 'code-workbench-inline-error', className: 'code-workbench-tree-editor-error', style: { color: T.danger } }, editorError))
+  }
+  const walk = (dir, depth, parent) => {
     const entries = children[dir]
     if (entries === undefined || entries === 'loading') {
       rows.push(h('div', { key: `${dir}#loading`, style: rowStyle(depth) }, '加载中…'))
@@ -324,30 +484,45 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
       rows.push(h('div', { key: `${dir}#err`, style: { ...rowStyle(depth), color: T.danger } }, entries))
       return
     }
+    // A create field belongs at the top of its destination folder, ahead of the
+    // existing entries — that is where the new name will land.
+    if (editor !== null && editor.mode !== 'rename' && editor.parent === dir) pushEditorRow(depth + 1)
     for (const entry of entries) {
       const full = joinPath(dir, entry.name)
       const isDir = entry.type === 'directory'
       const isOpen = isDir && expanded.has(full)
-      rows.push(h('div', {
-        key: full,
-        className: 'code-workbench-tree-row',
-        'data-active': !isDir && full === activePath,
-        'data-selected': selected?.path === full && selected.isDir === isDir,
-        role: 'button',
-        tabIndex: 0,
-        'aria-expanded': isDir ? isOpen : undefined,
-        'aria-pressed': isDir ? undefined : full === activePath,
-        style: rowStyle(depth),
-        // Selecting and opening are separate concerns: a click both marks the
-        // row (so the toolbar knows where to create) and does what the row
-        // normally does — expand a directory, or open a file.
-        onClick: () => { setSelected({ path: full, isDir }); isDir ? toggle(full) : onOpen(full) },
-        onKeyDown: (event) => {
-          if (event.key !== 'Enter' && event.key !== ' ') return
-          event.preventDefault()
-          setSelected({ path: full, isDir })
-          isDir ? toggle(full) : onOpen(full)
-        },
+      // Renaming replaces the row: the field stands where the old name was.
+      if (editor?.mode === 'rename' && editor.path === full) { pushEditorRow(depth) }
+      else {
+        pushRow({ key: full, path: full, isDir, isOpen, depth, parent })
+        rows.push(h('div', {
+          key: full,
+          className: 'code-workbench-tree-row',
+          'data-active': !isDir && full === activePath,
+          'data-selected': selected?.path === full && selected.isDir === isDir,
+          role: 'treeitem',
+          tabIndex: 0,
+          // The focus target for keyboard navigation. The callback ref files the
+          // node under its path and clears itself on unmount, so the map only ever
+          // holds rows that are on screen right now.
+          ref: (node) => { if (node === null) nodesRef.current.delete(full); else nodesRef.current.set(full, node) },
+          'aria-level': depth + 1,
+          'aria-selected': selected?.path === full && selected.isDir === isDir,
+          'aria-expanded': isDir ? isOpen : undefined,
+          'aria-pressed': isDir ? undefined : full === activePath,
+          style: rowStyle(depth),
+          // Selecting and opening are separate concerns: a click both marks the
+          // row (so the toolbar knows where to create) and does what the row
+          // normally does — expand a directory, or open a file.
+          onClick: () => { setSelected({ path: full, isDir }); isDir ? toggle(full) : onOpen(full) },
+          // Only Enter/space belong to the row itself. Movement keys bubble to the
+          // container handler, which is what makes ↑/↓ work while a row has focus.
+          onKeyDown: (event) => {
+            if (event.key !== 'Enter' && event.key !== ' ') return
+            event.preventDefault()
+            setSelected({ path: full, isDir })
+            isDir ? toggle(full) : onOpen(full)
+          },
         onContextMenu: (event) => { setSelected({ path: full, isDir }); contextMenu(event, full, isDir) },
         // Drag source: the row hands out its workspace-relative path so the
         // composer drop target can turn it into a reference chip. The private
@@ -363,10 +538,90 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
         title: full,
       }, h('span', { style: { color: T.fgMuted, width: '10px', display: 'inline-block' } }, isDir ? (isOpen ? '▾' : '▸') : ' '),
         h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis' } }, entry.name)))
-      if (isOpen) walk(full, depth + 1)
+      }
+      if (isOpen) walk(full, depth + 1, full)
     }
   }
-  walk(cwd, 0)
+  walk(cwd, 0, null)
+  /**
+   * Move the selection one row up or down and put focus on it. Crossing a
+   * directory boundary is *not* automatic: the child row only exists in `flat`
+   * once its parent has been expanded, so ↑/↓ naturally stop at a collapsed
+   * folder and the user opens it with → first. `flush` re-runs this after the
+   * rows rebuild, which is what carries the selection from a directory into the
+   * child it just expanded.
+   */
+  const moveSelection = useCallback((step) => {
+    const current = selected === null ? -1 : flat.findIndex((row) => row.path === selected.path && row.isDir === selected.isDir)
+    if (current < 0) {
+      const edge = step > 0 ? flat[0] : flat.at(-1)
+      if (edge) setSelected({ path: edge.path, isDir: edge.isDir })
+      return
+    }
+    const nextIndex = current + step
+    if (nextIndex < 0 || nextIndex >= flat.length) return
+    const next = flat[nextIndex]
+    setSelected({ path: next.path, isDir: next.isDir })
+    // The row's keys are stable, so the node can be focused directly instead of
+    // waiting for the re-render that `setSelected` schedules.
+    focusRow(next.path)
+  }, [selected, flat])
+  const handleTreeKeys = (event) => {
+    // While the name field is open it owns every key — arrows move the caret,
+    // Delete erases characters. `stopPropagation` in the field usually keeps
+    // events from arriving here, but this guard makes it airtight.
+    if (editor !== null) return
+    const row = selected === null ? -1 : flat.findIndex((item) => item.path === selected.path && item.isDir === selected.isDir)
+    const target = row >= 0 ? flat[row] : null
+    switch (event.key) {
+      case 'ArrowDown':
+        // Focus is about to move to another row; that is not a typing context.
+        event.preventDefault()
+        moveSelection(1)
+        return
+      case 'ArrowUp':
+        event.preventDefault()
+        moveSelection(-1)
+        return
+      case 'ArrowRight': {
+        event.preventDefault()
+        if (!target) return
+        // On a collapsed folder this expands it, which reveals the child the
+        // next ↓ will land on. On an open folder it steps onto the first child.
+        if (!target.isDir) return
+        if (!target.isOpen) { toggle(target.path); return }
+        const child = flat[row + 1]
+        if (child && child.parent === target.path) { setSelected({ path: child.path, isDir: child.isDir }); focusRow(child.path) }
+        return
+      }
+      case 'ArrowLeft': {
+        event.preventDefault()
+        if (!target) return
+        // Open folder → close it; anything else → step up to the parent folder.
+        if (target.isDir && target.isOpen) { toggle(target.path); return }
+        if (!target.parent || target.parent === cwd) return
+        setSelected({ path: target.parent, isDir: true })
+        focusRow(target.parent)
+        return
+      }
+      case 'F2':
+        event.preventDefault()
+        if (target && !(target.path === cwd && target.isDir)) openRename({ path: target.path, isDir: target.isDir })
+        return
+      case 'Delete':
+        event.preventDefault()
+        // The workspace root is the only thing the tree refuses to delete; the
+        // dialog that guards the rest belongs to the action itself.
+        if (target && !(target.path === cwd && target.isDir)) onAction('delete', { path: target.path, isDir: target.isDir })
+        return
+      default:
+    }
+  }
+  // Keyboard navigation drives the selection, so the selection drives reveal.
+  useEffect(() => {
+    if (selected === null) return
+    focusRow(selected.path)
+  }, [selected?.path, selected?.isDir, refreshRevision, expanded])
   const items = menu ? [
     ['createFile', '新建文件…'], ['createDirectory', '新建文件夹…'],
     ['reveal', '在资源管理器中显示'],
@@ -375,24 +630,46 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
     ['copyPath', '复制路径'], ['copyRelativePath', '复制相对路径'],
     ['rename', '重命名…'], ['delete', '删除…'],
   ] : []
-  return h('div', { style: { overflow: 'auto', padding: '4px 0' }, onContextMenu: (event) => contextMenu(event, cwd, true) },
+  /**
+   * The context menu's create/rename entries open the field directly, the same
+   * way the toolbar does — no dialog. The host action is only called once the
+   * name is committed, so the menu stays a pure front-end.
+   */
+  const menuAction = (action, target) => {
+    if (action === 'createFile' || action === 'createDirectory') return openCreate(action, target)
+    if (action === 'rename') return openRename(target)
+    return onAction(action, target)
+  }
+  return h('div', {
+    style: { overflow: 'auto', padding: '4px 0' },
+    onContextMenu: (event) => contextMenu(event, cwd, true),
+  },
     h('div', { className: 'code-workbench-tree-toolbar' },
       h('button', {
         title: selected === null ? '新建文件' : `在 ${relativeToCwd(createTarget.path, cwd) || '工作区'} 中新建文件`,
         'aria-label': '新建文件',
-        onClick: () => onAction('createFile', createTarget),
+        onClick: () => openCreate('createFile', createTarget),
       }, workbenchIcon('createFile')),
       h('button', {
         title: selected === null ? '新建文件夹' : `在 ${relativeToCwd(createTarget.path, cwd) || '工作区'} 中新建文件夹`,
         'aria-label': '新建文件夹',
-        onClick: () => onAction('createDirectory', createTarget),
+        onClick: () => openCreate('createDirectory', createTarget),
       }, workbenchIcon('createDirectory')),
       h('button', { title: '刷新', 'aria-label': '刷新文件树', onClick: () => { for (const dir of expanded) load(dir) } }, workbenchIcon('refresh')),
       h('button', { title: '全部折叠', 'aria-label': '全部折叠', onClick: () => setExpanded(new Set([cwd])) }, workbenchIcon('collapse')),
     ),
-    h('div', { style: rowStyle(0), onContextMenu: (event) => contextMenu(event, cwd, true) }, cwd.split(/[\\/]/).filter(Boolean).at(-1)), rows,
+    h('div', { style: rowStyle(0), onContextMenu: (event) => contextMenu(event, cwd, true) }, cwd.split(/[\\/]/).filter(Boolean).at(-1)),
+    // The keyboard handler sits on the scroller, not on each row: with focus on
+    // a row, ↑/↓/←/→/F2/Delete bubble here, so every row shares one
+    // implementation and there is no per-row listener to keep in sync.
+    h('div', {
+      className: 'code-workbench-tree-body',
+      role: 'tree',
+      tabIndex: -1,
+      onKeyDown: handleTreeKeys,
+    }, rows),
     menu ? h('div', { role: 'menu', className: 'code-workbench-context-menu', style: { left: menu.x, top: menu.y }, onClick: (event) => event.stopPropagation() },
-      items.map(([action, label]) => h('button', { key: action, type: 'button', role: 'menuitem', disabled: action === 'paste' && !clipboard || ['cut', 'rename', 'delete'].includes(action) && menu.path === cwd, onClick: () => { const target = menu; setMenu(null); onAction(action, target) } }, label))) : null)
+      items.map(([action, label]) => h('button', { key: action, type: 'button', role: 'menuitem', disabled: action === 'paste' && !clipboard || ['cut', 'rename', 'delete'].includes(action) && menu.path === cwd, onClick: () => { const target = menu; setMenu(null); menuAction(action, target) } }, label))) : null)
 }
 
 // ---------------------------------------------------------------------------
@@ -1026,9 +1303,12 @@ function CodePanel(props) {
         } else if (action === 'delete') {
           if (!await askDialog(`确定删除 ${path}？此操作无法撤销。`)) return
         } else {
-          const name = await askDialog(action === 'rename' ? '新的名称' : action === 'createDirectory' ? '新建文件夹名称' : '新建文件名称', action === 'rename' ? path.split(/[\\/]/).at(-1) : '')
-          if (name === null) return
-          if (!name.trim() || /[\\/]/.test(name) || ['.', '..'].includes(name.trim())) throw new Error('请输入有效名称，不能包含路径分隔符')
+          // createFile / createDirectory / rename: the name comes from the
+          // in-tree field. `newName` is absent when another caller (the context
+          // menu's …) opens the field itself, so there is nothing to do here.
+          const name = target.newName
+          if (name === undefined) return
+          if (!name.trim() || /[\\/]/.test(name) || ['.', '..'].includes(name.trim())) return { ok: false, error: '请输入有效名称，不能包含路径分隔符' }
           if (action === 'rename') destination = joinPath(parent, name.trim())
           else source = joinPath(directory, name.trim())
         }
@@ -1068,7 +1348,13 @@ function CodePanel(props) {
         if (action === 'createFile') await openFile(source)
       }
       setStatus('操作完成')
-    } catch (error) { setStatus(`操作失败：${error.message ?? error}`) }
+      return { ok: true }
+    } catch (error) {
+      const message = error.message ?? String(error)
+      setStatus(`操作失败：${message}`)
+      // The in-tree field reads this to explain itself and stay open.
+      return { ok: false, error: message }
+    }
   }
 
   const closeFile = useCallback(async (path) => {
