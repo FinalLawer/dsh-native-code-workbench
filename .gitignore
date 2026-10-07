@@ -4,3 +4,7 @@ __pycache__/
 *.pyc
 tmp-*.txt
 .DS_Store
+
+# Local agent working context (session logs, project conventions) — not project artifacts.
+.workbuddy/
+.workbuddy-ai/

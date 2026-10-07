@@ -1,7 +1,0 @@
-DSH embedded editor validation
-original content
-saved from full workbench
-external change synchronized
-live watcher validation
-polling watcher validation
-native watcher fixed

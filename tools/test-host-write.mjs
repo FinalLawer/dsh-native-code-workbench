@@ -1,7 +1,7 @@
 /**
  * Host-half write-route test.
  *
- * Runs the real `apply` from `dsh-cursor-code/index.js` against recording stubs
+ * Runs the real `apply` from `dsh-code-workbench/index.js` against recording stubs
  * and pushes requests through the registered Fetch route, pinning the two facts
  * that break silently at runtime:
  *
@@ -13,7 +13,7 @@
  *
  *   node tools/test-host-write.mjs
  */
-import { apply } from '../dsh-cursor-code/index.js'
+import { apply } from '../dsh-code-workbench/index.js'
 
 let failures = 0
 /** Assert one expectation. */
@@ -44,7 +44,7 @@ function makeScope(options = {}) {
       return callback()
     },
     llm: {
-      async *stream() { /* rewrites only */ },
+      async *stream() { /* unused in write tests */ },
     },
     tools: {
       register(definition) {
@@ -85,7 +85,7 @@ function makeScope(options = {}) {
 
 /** Build one JSON POST request carrying the standard body. */
 function makeRequest(body, extra = {}) {
-  return new Request('http://127.0.0.1/api/cursor-code/write', {
+  return new Request('http://127.0.0.1/api/code-workbench/write', {
     method: 'POST',
     headers: { 'content-type': 'application/json', ...(extra.headers ?? {}) },
     body: JSON.stringify(body),
@@ -110,7 +110,7 @@ function mount(options = {}) {
   }
   apply(ctx)
   calls.injectNames = injectNames
-  return { route: calls.routes.find((r) => r.path === '/api/cursor-code/write'), calls, session }
+  return { route: calls.routes.find((r) => r.path === '/api/code-workbench/write'), calls, session }
 }
 
 console.log('wiring')
@@ -118,10 +118,12 @@ console.log('wiring')
   const { route, calls } = mount()
   check('injects connection, fs, sessions, llm, tools',
     JSON.stringify(calls.injectNames) === JSON.stringify(['connection', 'fs', 'sessions', 'llm', 'tools']), calls.injectNames)
-  check('registers every route', ['/api/cursor-code/write', '/api/cursor-code/rewrite', '/api/cursor-code/search',
-    '/api/cursor-code/complete', '/api/cursor-code/history', '/api/cursor-code/rollback']
+  check('registers every route', ['/api/code-workbench/write', '/api/code-workbench/file-operation', '/api/code-workbench/search',
+    '/api/code-workbench/complete', '/api/code-workbench/history', '/api/code-workbench/rollback']
     .every((p) => calls.routes.some((r) => r.path === p)), calls.routes.map((r) => r.path))
-  check('route path is the write endpoint', route?.path === '/api/cursor-code/write', route?.path)
+  check('removed inline editing route is not registered',
+    !calls.routes.some((r) => r.path === '/api/code-workbench/rewrite'), calls.routes.map((r) => r.path))
+  check('route path is the write endpoint', route?.path === '/api/code-workbench/write', route?.path)
   check('route accepts POST buffered', route?.methods?.[0] === 'POST' && route?.requestBody === 'buffered')
 }
 
@@ -133,7 +135,7 @@ console.log('\nrequest gating')
 }
 {
   const { route } = mount()
-  const bad = new Request('http://127.0.0.1/api/cursor-code/write', { method: 'POST', body: 'not json' })
+  const bad = new Request('http://127.0.0.1/api/code-workbench/write', { method: 'POST', body: 'not json' })
   const response = await route.fetch(bad)
   check('a non-JSON body is rejected with 400', response.status === 400, response.status)
   const missing = await route.fetch(makeRequest({ sessionId: 's' }))
@@ -167,9 +169,9 @@ console.log('\nthe sandbox policy stamp (the FS_SANDBOX_DENIED regression)')
     && JSON.stringify(args?.[2]?.version) === JSON.stringify(SAMPLE.expectedVersion), args?.[2])
   check('the new version is returned to the editor', body.version !== undefined, body.version)
   check('one session remark records the manual save', calls.remarks.length === 1, calls.remarks)
-  await route.fetch(makeRequest({ ...SAMPLE, note: 'Cmd+K 改写: 加注释' }))
+  await route.fetch(makeRequest({ ...SAMPLE, note: '手动编辑: 加注释' }))
   check('the note travels into the session remark',
-    calls.remarks.at(-1)?.text.includes('Cmd+K 改写: 加注释'), calls.remarks.at(-1))
+    calls.remarks.at(-1)?.text.includes('手动编辑: 加注释'), calls.remarks.at(-1))
 }
 
 console.log('\nversion and sandbox failures map to honest statuses')

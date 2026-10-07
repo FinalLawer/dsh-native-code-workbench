@@ -1,14 +1,14 @@
 /**
- * dsh-cursor-code — client half source (bundled by build.mjs into client.js).
+ * dsh-code-workbench — client half source (bundled by build.mjs into client.js).
  *
- * A right-sidebar tab type ("cursor-code") that renders a Cursor-style code
+ * A right-sidebar tab type ("code-workbench") that renders a VS Code-style code
  * workspace: recursive file tree + Monaco (the VS Code editor core) with full
- * editing, syntax highlighting, multi-cursor, find, and undo.
+ * editing, syntax highlighting, multi-selection, find, and undo.
  *
  * Mechanisms composed (nothing private):
  *  - listing / reading  → `ctx.remote.workspaceFiles` (`list`, `read`, `stat`)
  *  - the workspace root → standard `useSessions` prop (`byId[sessionId].cwd`)
- *  - writing            → the package's own host half, `POST /api/cursor-code/write`,
+ *  - writing            → the package's own host half, `POST /api/code-workbench/write`,
  *                         version-guarded via `ctx.fs.writeText` on the Host
  *                         (implemented in index.js; the only mutation path)
  *
@@ -18,12 +18,11 @@
 
 import React from 'react'
 import './workbench.css'
-import { diffLines, collapseDiff } from './diff.mjs'
 import { serializeSnippet, splitSnippets } from './snippets.mjs'
 
 const { useCallback, useEffect, useMemo, useRef, useState } = React
 const h = React.createElement
-const SETTINGS_NS = 'cursor-code'
+const SETTINGS_NS = 'code-workbench'
 const defaultSettings = { autoSave: false, completionEnabled: true, completionProvider: '', completionModel: '' }
 function usePluginSettings(form) {
   const [snapshot, setSnapshot] = useState(() => form?.getSnapshot?.() ?? { value: defaultSettings, writable: false })
@@ -43,21 +42,54 @@ let monacoPromise = null
 const completionCache = new Map()
 function loadMonaco() {
   if (monacoPromise === null) {
-    monacoPromise = globalThis.__CURSOR_CODE_TEST_MONACO__ !== undefined
-      ? Promise.resolve(globalThis.__CURSOR_CODE_TEST_MONACO__)
+    monacoPromise = globalThis.__CODE_WORKBENCH_TEST_MONACO__ !== undefined
+      ? Promise.resolve(globalThis.__CODE_WORKBENCH_TEST_MONACO__)
       : import('./monaco-entry.mjs')
   }
   return monacoPromise
 }
 
 /** This plugin's identity in the tab system; also the body's slot key. */
-const TAB_ID = 'dsh-cursor-code'
+const TAB_ID = 'dsh-code-workbench'
 /** The page kind users open. */
-const TAB_KIND = 'cursor-code'
+const TAB_KIND = 'code-workbench'
 /** Tab chip and guide-capsule label. */
-const TAB_LABEL = '代码编辑器'
+const TAB_LABEL = '代码工作台'
 /** Guide-capsule description. */
-const TAB_DESCRIPTION = '像 Cursor 一样浏览和编辑工作区代码（VS Code 内核）'
+const TAB_DESCRIPTION = '编辑工作区代码，使用 AI 补全，将选中代码加入对话'
+
+/**
+ * The private drag flavor for tree rows.
+ *
+ * Deliberately NOT `text/uri-list` and NOT a `Files` payload: DSH's own
+ * document-level drop pipeline (`dsh-client-ui-attachment`
+ * `installDocumentDropEvents`) accepts a drop only when
+ * `dataTransfer.types.includes("Files")`, so a distinct flavor guarantees the
+ * two never fight over the same gesture. The payload is the row's workspace
+ * relative path, with a leading `d`/`f` marking directory vs file.
+ */
+const TREE_DRAG_MIME = 'application/x-code-workbench-tree'
+
+/** Workspace-relative path for an absolute tree path. */
+function relativeToCwd(path, cwd) {
+  if (typeof path !== 'string' || path === '') return ''
+  return path.startsWith(cwd) ? path.slice(cwd.length).replace(/^[\\/]+/, '') : path
+}
+
+/** The drag payload for one tree row. */
+function treeDragPayload(path, cwd, isDir) {
+  return `${isDir ? 'd' : 'f'}${relativeToCwd(path, cwd) || '.'}`
+}
+
+/** Decode a {@link TREE_DRAG_MIME} payload back into a reference's `ref`. */
+function parseTreeDragPayload(raw) {
+  if (typeof raw !== 'string' || raw.length < 2) return null
+  const kind = raw[0]
+  if (kind !== 'd' && kind !== 'f') return null
+  const path = raw.slice(1)
+  if (path === '') return null
+  return { path, directory: kind === 'd' }
+}
 
 /** Theme-token vocabulary: the only shared styling dependency. */
 const T = {
@@ -103,28 +135,25 @@ function monacoTheme() {
 }
 
 // ---------------------------------------------------------------------------
-// Cmd+K inline rewrite
+// Host endpoints and Tab-completion streaming
 // ---------------------------------------------------------------------------
 
-/** The host half's streaming rewrite endpoint (NDJSON frames). */
 /** The host half's codebase search endpoint. */
-const SEARCH_PATH = '/api/cursor-code/search'
-/** The host half's Tab-completion endpoint (ghost text at the cursor). */
-const COMPLETE_PATH = '/api/cursor-code/complete'
+const SEARCH_PATH = '/api/code-workbench/search'
+/** The host half's Tab-completion endpoint (ghost text at the caret). */
+const COMPLETE_PATH = '/api/code-workbench/complete'
 /** The save journal endpoints (checkpoints: list and roll back saves). */
-const HISTORY_PATH = '/api/cursor-code/history'
-const ROLLBACK_PATH = '/api/cursor-code/rollback'
+const HISTORY_PATH = '/api/code-workbench/history'
+const ROLLBACK_PATH = '/api/code-workbench/rollback'
 
 /**
- * Stream one NDJSON LLM endpoint (rewrite or completion).
- * @param path - the endpoint to post to.
- * @param body - the framed request.
- * @param onDelta - called with the assembled text after every fragment.
- * @param signal - cancellation (Esc closes the widget, typing cancels ghost text).
- * @returns the final text.
+ * Read the Tab-completion NDJSON stream.
+ * @param body - the framed caret-context request.
+ * @param signal - cancellation when typing invalidates the suggestion.
+ * @returns the final completion text.
  */
-async function streamRewrite(path, body, onDelta, signal) {
-  const response = await fetch(path, {
+async function streamCompletion(body, signal) {
+  const response = await fetch(COMPLETE_PATH, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
@@ -150,12 +179,11 @@ async function streamRewrite(path, body, onDelta, signal) {
       const frame = JSON.parse(line)
       if (frame.t === 'delta') {
         text += frame.text
-        onDelta(text)
       } else if (frame.t === 'done') {
         return text
       } else if (frame.t === 'error') {
         const route = frame.provider && frame.model ? `（${frame.provider} / ${frame.model}）` : ''
-        throw new Error(`${frame.message ?? frame.code ?? 'rewrite failed'}${route}`)
+        throw new Error(`${frame.message ?? frame.code ?? 'completion failed'}${route}`)
       }
     }
   }
@@ -186,182 +214,16 @@ function formatSnippet(anchor, range) {
   return serializeSnippet(anchor, range.language, range.code)
 }
 
-/**
- * Open the Cmd+K widget below the selection.
- *
- * Cursor's interaction, in one content widget: type an instruction → the
- * proposal streams in → an inline diff review → Enter accepts (the caller edits
- * and saves), Esc closes. Pure DOM: Monaco owns the widget lifecycle.
- * @param monaco - the monaco namespace.
- * @param editor - the live editor.
- * @param hooks - `{ status, onAccept }` supplied by the panel.
- */
-function openRewriteWidget(monaco, editor, hooks) {
-  const model = editor.getModel()
-  if (!model) return
-  let selection = editor.getSelection()
-  if (selection.isEmpty()) {
-    const line = selection.startLineNumber
-    selection = new monaco.Range(line, 1, line, model.getLineMaxColumn(line))
-  }
-  const selectedText = model.getValueInRange(selection)
-  const lines = model.getLinesContent()
-  const contextBefore = lines.slice(Math.max(0, selection.startLineNumber - 41), selection.startLineNumber - 1).join('\n')
-  const contextAfter = lines.slice(selection.endLineNumber, selection.endLineNumber + 40).join('\n')
-
-  // ---- DOM ----
-  const root = document.createElement('div')
-  Object.assign(root.style, {
-    width: '560px', maxWidth: '80vw', background: T.bgRaised, border: `1px solid ${T.border}`,
-    borderRadius: '8px', boxShadow: '0 8px 24px rgba(0,0,0,.3)', padding: '10px',
-    display: 'flex', flexDirection: 'column', gap: '8px', color: T.fg, fontSize: '12px',
-    textAlign: 'left',
-  })
-  const bar = document.createElement('div')
-  Object.assign(bar.style, { display: 'flex', gap: '6px', alignItems: 'center' })
-  const inputEl = document.createElement('input')
-  inputEl.placeholder = '告诉 AI 怎么改选中的代码… (Enter 生成 / 接受, Esc 关闭)'
-  Object.assign(inputEl.style, {
-    flex: '1 1 auto', padding: '5px 8px', borderRadius: '5px', border: `1px solid ${T.border}`,
-    background: T.bg, color: T.fg, fontSize: '12px', outline: 'none', minWidth: '0',
-  })
-  const mkButton = (label, onClick) => {
-    const el = document.createElement('button')
-    el.textContent = label
-    Object.assign(el.style, {
-      padding: '3px 10px', borderRadius: '5px', border: `1px solid ${T.border}`,
-      background: T.bg, color: T.fg, cursor: 'pointer', fontSize: '11.5px', whiteSpace: 'nowrap',
-    })
-    el.addEventListener('click', onClick)
-    return el
-  }
-  const statusEl = document.createElement('div')
-  Object.assign(statusEl.style, { color: T.fgMuted, fontSize: '11px', minHeight: '14px' })
-  const preview = document.createElement('div')
-  Object.assign(preview.style, {
-    maxHeight: '260px', overflow: 'auto', borderRadius: '5px', border: `1px solid ${T.border}`,
-    padding: '6px 8px', background: T.bg, fontFamily: 'ui-monospace, Consolas, monospace',
-    fontSize: '11.5px', lineHeight: '17px', whiteSpace: 'pre-wrap', wordBreak: 'break-all',
-    display: 'none', minHeight: '0',
-  })
-  const acceptBtn = mkButton('接受 (Enter)', () => accept())
-  const closeBtn = mkButton('关闭 (Esc)', () => close())
-  bar.append(inputEl, acceptBtn, closeBtn)
-  root.append(bar, statusEl, preview)
-
-  // ---- state machine: prompt → streaming → review ----
-  let phase = 'prompt'
-  let proposal = ''
-  let controller = null
-
-  const setStatus = (text) => { statusEl.textContent = text }
-
-  const renderDiff = () => {
-    preview.style.display = 'block'
-    preview.textContent = ''
-    const rows = collapseDiff(diffLines(selectedText.split('\n'), proposal.split('\n')), 2)
-    for (const row of rows) {
-      const line = document.createElement('div')
-      const prefix = row.kind === 'add' ? '+' : row.kind === 'del' ? '-' : row.kind === 'gap' ? '⋯' : ' '
-      line.textContent = `${prefix} ${row.text ?? ''}`
-      Object.assign(line.style, {
-        color: row.kind === 'add' ? '#1a7f37' : row.kind === 'del' ? T.danger : T.fgMuted,
-        background: row.kind === 'add' ? 'rgba(26,127,55,.12)'
-          : row.kind === 'del' ? 'rgba(229,72,77,.12)' : 'transparent',
-      })
-      preview.append(line)
-    }
-  }
-
-  const generate = async () => {
-    const instruction = inputEl.value.trim()
-    if (instruction === '') { setStatus('先写下改写要求'); return }
-    controller = new AbortController()
-    phase = 'streaming'
-    proposal = ''
-    preview.style.display = 'block'
-    preview.textContent = ''
-    setStatus('生成中…（Esc 取消）')
-    try {
-      const text = await streamRewrite(REWRITE_PATH, {
-        sessionId: hooks.sessionId,
-        path: hooks.path,
-        language: hooks.language,
-        instruction,
-        selectedText,
-        contextBefore,
-        contextAfter,
-      }, (partial) => { preview.textContent = partial }, controller.signal)
-      proposal = stripFences(text)
-      if (proposal === '') { phase = 'prompt'; setStatus('模型没有返回内容，换个说法再试'); return }
-      phase = 'review'
-      renderDiff()
-      setStatus('Enter 接受 · Esc 关闭 · 不满意可改描述后 Enter 重新生成')
-    } catch (error) {
-      phase = 'prompt'
-      if (error?.name === 'AbortError') setStatus('已取消')
-      else setStatus(`生成失败: ${error?.message ?? error}`)
-    }
-  }
-
-  const accept = () => {
-    if (phase !== 'review') return
-    const instruction = inputEl.value.trim()
-    close()
-    hooks.onAccept(proposal, selection, instruction)
-  }
-
-  const close = () => {
-    controller?.abort()
-    editor.removeContentWidget(widget)
-    hooks.status(`已${phase === 'review' ? '放弃' : '关闭'} AI 改写`)
-  }
-
-  inputEl.addEventListener('keydown', (event) => {
-    if (event.key === 'Enter') {
-      event.preventDefault()
-      event.stopPropagation()
-      if (phase === 'prompt') generate()
-      else if (phase === 'review') accept()
-    } else if (event.key === 'Escape') {
-      event.preventDefault()
-      event.stopPropagation()
-      close()
-    } else if (event.key === 'Tab' && phase === 'review') {
-      event.preventDefault()
-      event.stopPropagation()
-      accept()
-    }
-    event.stopPropagation()
-  })
-  root.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape') { event.stopPropagation(); close() }
-  })
-
-  const widget = {
-    getId: () => 'cursor-code.rewrite',
-    getDomNode: () => root,
-    getPosition: () => ({
-      position: { lineNumber: selection.endLineNumber, column: 1 },
-      preference: [monaco.editor.ContentWidgetPositionPreference.BELOW],
-    }),
-  }
-  editor.addContentWidget(widget)
-  editor.updateContentWidget(widget)
-  inputEl.focus()
-}
-
 // ---------------------------------------------------------------------------
 // Small UI atoms (no external UI imports; theme tokens only)
 // ---------------------------------------------------------------------------
 
-const rowStyle = (depth, active) => ({
+const rowStyle = (depth) => ({
   display: 'flex',
   alignItems: 'center',
   gap: '6px',
   padding: `3px 8px 3px ${8 + depth * 12}px`,
   cursor: 'pointer',
-  background: active ? T.bgHover : 'transparent',
   color: T.fg,
   fontSize: '12.5px',
   lineHeight: '18px',
@@ -391,7 +253,7 @@ function workbenchIcon(name) {
   return h('svg', { width: 18, height: 18, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.6, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true }, h('path', { d: paths[name] }))
 }
 
-function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRevision, clipboard }) {
+function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRevision, clipboard, closeMenuSignal, onMenuOpen }) {
   const [expanded, setExpanded] = useState(() => new Set([cwd]))
   const [children, setChildren] = useState({}) // dir path -> entries | 'loading' | error string
   const [menu, setMenu] = useState(null)
@@ -413,10 +275,12 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
 
   useEffect(() => { load(cwd) }, [cwd, load])
   useEffect(() => { for (const dir of expanded) load(dir) }, [refreshRevision, list])
+  useEffect(() => { setMenu(null) }, [closeMenuSignal])
   const contextMenu = (event, path, isDir) => {
     event.preventDefault()
     event.stopPropagation()
-    setMenu({ path, isDir, element: event.currentTarget, x: Math.max(0, Math.min(event.clientX, window.innerWidth - 260)), y: Math.max(0, Math.min(event.clientY, window.innerHeight - 430)) })
+    onMenuOpen?.()
+    setMenu({ path, isDir, element: event.currentTarget, x: Math.max(0, Math.min(event.clientX, window.innerWidth - 230)), y: Math.max(0, Math.min(event.clientY, window.innerHeight - 380)) })
   }
 
   const toggle = useCallback((dir) => {
@@ -432,11 +296,11 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
   const walk = (dir, depth) => {
     const entries = children[dir]
     if (entries === undefined || entries === 'loading') {
-      rows.push(h('div', { key: `${dir}#loading`, style: rowStyle(depth, false) }, '加载中…'))
+      rows.push(h('div', { key: `${dir}#loading`, style: rowStyle(depth) }, '加载中…'))
       return
     }
     if (typeof entries === 'string') {
-      rows.push(h('div', { key: `${dir}#err`, style: { ...rowStyle(depth, false), color: T.danger } }, entries))
+      rows.push(h('div', { key: `${dir}#err`, style: { ...rowStyle(depth), color: T.danger } }, entries))
       return
     }
     for (const entry of entries) {
@@ -445,9 +309,31 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
       const isOpen = isDir && expanded.has(full)
       rows.push(h('div', {
         key: full,
-        style: rowStyle(depth, !isDir && full === activePath),
+        className: 'code-workbench-tree-row',
+        'data-active': !isDir && full === activePath,
+        role: 'button',
+        tabIndex: 0,
+        'aria-expanded': isDir ? isOpen : undefined,
+        'aria-pressed': isDir ? undefined : full === activePath,
+        style: rowStyle(depth),
         onClick: () => (isDir ? toggle(full) : onOpen(full)),
+        onKeyDown: (event) => {
+          if (event.key !== 'Enter' && event.key !== ' ') return
+          event.preventDefault()
+          isDir ? toggle(full) : onOpen(full)
+        },
         onContextMenu: (event) => contextMenu(event, full, isDir),
+        // Drag source: the row hands out its workspace-relative path so the
+        // composer drop target can turn it into a reference chip. The private
+        // flavor keeps this gesture disjoint from DSH's own file-drop pipeline.
+        draggable: true,
+        onDragStart: (event) => {
+          event.dataTransfer.effectAllowed = 'copy'
+          event.dataTransfer.setData(TREE_DRAG_MIME, treeDragPayload(full, cwd, isDir))
+          // A plain-text flavor as the universal fallback; Lexical would render
+          // this as raw text if our interceptor ever declined the drop.
+          event.dataTransfer.setData('text/plain', relativeToCwd(full, cwd) || full)
+        },
         title: full,
       }, h('span', { style: { color: T.fgMuted, width: '10px', display: 'inline-block' } }, isDir ? (isOpen ? '▾' : '▸') : ' '),
         h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis' } }, entry.name)))
@@ -470,7 +356,7 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
       h('button', { title: '刷新', 'aria-label': '刷新文件树', onClick: () => { for (const dir of expanded) load(dir) } }, workbenchIcon('refresh')),
       h('button', { title: '全部折叠', 'aria-label': '全部折叠', onClick: () => setExpanded(new Set([cwd])) }, workbenchIcon('collapse')),
     ),
-    h('div', { style: rowStyle(0, false), onContextMenu: (event) => contextMenu(event, cwd, true) }, cwd.split(/[\\/]/).filter(Boolean).at(-1)), rows,
+    h('div', { style: rowStyle(0), onContextMenu: (event) => contextMenu(event, cwd, true) }, cwd.split(/[\\/]/).filter(Boolean).at(-1)), rows,
     menu ? h('div', { role: 'menu', className: 'code-workbench-context-menu', style: { left: menu.x, top: menu.y }, onClick: (event) => event.stopPropagation() },
       items.map(([action, label]) => h('button', { key: action, type: 'button', role: 'menuitem', disabled: action === 'paste' && !clipboard || ['cut', 'rename', 'delete'].includes(action) && menu.path === cwd, onClick: () => { const target = menu; setMenu(null); onAction(action, target) } }, label))) : null)
 }
@@ -538,6 +424,12 @@ function CodePanel(props) {
   const [treeRevision, setTreeRevision] = useState(0)
   const [treeClipboard, setTreeClipboard] = useState(null)
   const [searchDirectory, setSearchDirectory] = useState(null)
+  const [tabMenu, setTabMenu] = useState(null)
+  useEffect(() => {
+    const close = () => setTabMenu(null)
+    document.addEventListener?.('click', close)
+    return () => document.removeEventListener?.('click', close)
+  }, [])
 
   useEffect(() => {
     setCompletionStatus((current) => {
@@ -590,7 +482,7 @@ function CodePanel(props) {
       setHasSelection(!editor.getSelection().isEmpty())
     })
     // Tab-completion ghost text: Monaco renders the preview and accepts on Tab;
-    // this provider only answers "what should be inserted at the cursor".
+    // this provider only answers "what should be inserted at the caret".
     const completions = monaco.languages.registerInlineCompletionsProvider('*', {
       debounceDelayMs: 300,
       async provideInlineCompletions(model, position, context, token) {
@@ -614,13 +506,13 @@ function CodePanel(props) {
         inFlightRef.current = true
         setCompletionStatus('AI 补全生成中…')
         try {
-          const text = await streamRewrite(COMPLETE_PATH, {
+          const text = await streamCompletion({
             sessionId,
             path: st.path,
             language: model.getLanguageId(),
             prefix,
             suffix,
-          }, () => {}, controller.signal)
+          }, controller.signal)
           const insertText = stripFences(text, true).slice(0, 2000)
           if (token.isCancellationRequested) {
             setCompletionStatus('AI 补全已取消')
@@ -670,7 +562,7 @@ function CodePanel(props) {
     const text = st.model.getValue()
     setStatus('保存中…')
     try {
-      const response = await fetch('/api/cursor-code/write', {
+      const response = await fetch('/api/code-workbench/write', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -742,7 +634,7 @@ function CodePanel(props) {
         setStatus('文件读取期间发生编辑，保留未保存内容')
         return
       }
-      const uri = monaco.Uri.parse(`inmemory://cursor-code/${sessionId}/${path}`)
+      const uri = monaco.Uri.parse(`inmemory://code-workbench/${sessionId}/${path}`)
       if (buffer?.dirty) {
         setStatus('磁盘文件已更新，保留未保存修改')
         return
@@ -769,7 +661,7 @@ function CodePanel(props) {
         inlineTriggerTimerRef.current = setTimeout(() => {
           inlineTriggerTimerRef.current = null
           if (editor.getModel() === model && editor.getPosition?.() && typeof editor.trigger === 'function') {
-            editor.trigger('cursor-code', 'editor.action.inlineSuggest.trigger', {})
+            editor.trigger('code-workbench', 'editor.action.inlineSuggest.trigger', {})
           }
         }, 400)
       })
@@ -791,7 +683,7 @@ function CodePanel(props) {
         const range = new monaco.Range(lineNumber, column, lineNumber, Math.max(column, endColumn))
         editor.setSelection(range)
         editor.revealLineInCenter(lineNumber)
-        const decorations = editor.deltaDecorations([], [{ range, options: { className: 'cursor-code-flash' } }])
+        const decorations = editor.deltaDecorations([], [{ range, options: { className: 'code-workbench-flash' } }])
         setTimeout(() => { editor.deltaDecorations(decorations, []) }, 1500)
       }
     } catch (error) {
@@ -799,7 +691,7 @@ function CodePanel(props) {
     }
   }, [files, monaco, sessionId])
 
-  // ---- external change watch (auto-reload, the Cursor behaviour) --------
+  // ---- external change watch (auto-reload on external edits) --------
   useEffect(() => {
     const path = activePath
     if (!path || typeof watchStream !== 'function') return
@@ -808,7 +700,7 @@ function CodePanel(props) {
     ;(async () => {
       try {
         const stream = watchStream({
-          name: `cursor-code watch ${path}`,
+          name: `code-workbench watch ${path}`,
           open: (signal) => files.changes(sessionId, path, signal),
           ended: () => new Error('watch ended'),
         })
@@ -871,7 +763,7 @@ function CodePanel(props) {
     }
   }, [activePath, files, sessionId])
 
-  // ---- codebase search (Cursor's Search / @codebase retrieval) ----------
+  // ---- codebase search (@codebase retrieval) ----------
   const runSearch = useCallback(async () => {
     const q = query.trim()
     if (q === '') return
@@ -943,7 +835,7 @@ function CodePanel(props) {
   }, [loadHistory, openFile, sessionId])
 
   // ---- Add to Chat (selection → a reference chip in the main draft) -----
-  // Cursor's look: the draft shows a small chip (`a.js:3-5 · 3 行`), and the
+  // The chip look: the draft shows a small chip (`a.js:3-5 · 3 行`), and the
   // code expands only at submit through this plugin's reference codec.
   const addToChat = useCallback(() => {
     const editor = editorRef.current
@@ -967,7 +859,7 @@ function CodePanel(props) {
     const lines = endLine - startLine + 1
     const anchor = lines === 1 ? `${rel}:${startLine}` : `${rel}:${startLine}-${endLine}`
     const reference = {
-      source: 'cursor-code',
+      source: 'code-workbench',
       ref: { path: rel, startLine, endLine, language: model.getLanguageId(), code },
       label: `${anchor} · ${lines} 行`,
       appearance: 'file',
@@ -979,6 +871,78 @@ function CodePanel(props) {
       ? `已添加到对话：${anchor}（${lines} 行）— 去主对话输入你的问题`
       : '添加失败：对话输入框正忙（正在提交？），请重试')
   }, [cwd, inputActions, sessionId, sessionsScope])
+
+  // ---- Drop a tree row onto the composer → a reference chip --------------
+  // Reuses the same `slash/input-insert-reference` channel as `addToChat`, so a
+  // dropped row lands as a proper chip rather than Lexical's plain-text
+  // fallback (`insertRawText`, which is all the official code path would do).
+  //
+  // The listeners run in the CAPTURE phase on `document`: Lexical binds its own
+  // `drop` handler to the contenteditable root (see `dsh-client-ui-conversation`
+  // `["drop", Pn]`), and capture is the only way to settle the gesture first.
+  // Interception is deliberately narrow — our private flavor AND a composer
+  // target — so file drops keep flowing to DSH's attachment pipeline untouched.
+  useEffect(() => {
+    const accepts = (event) => {
+      const types = event.dataTransfer?.types
+      if (!types) return null
+      // `types` is a DOMStringList in some engines; normalize before probing.
+      const has = typeof types.includes === 'function'
+        ? (name) => types.includes(name)
+        : (name) => Array.from(types).includes(name)
+      // Our flavor must be present *and* no real file payload, so an OS file
+      // drag that merely passes over the tree is never hijacked.
+      if (!has(TREE_DRAG_MIME) || has('Files')) return null
+      const target = event.target
+      if (!target || typeof target.closest !== 'function') return null
+      return target.closest('[data-composer-input]') !== null ? event.dataTransfer : null
+    }
+    const onDragOver = (event) => {
+      const dataTransfer = accepts(event)
+      if (dataTransfer === null) return
+      event.preventDefault()
+      event.stopPropagation()
+      dataTransfer.dropEffect = 'copy'
+      setStatus(`松开即把文件加入对话`)
+    }
+    const onDrop = (event) => {
+      const dataTransfer = accepts(event)
+      if (dataTransfer === null) return
+      // Claim the gesture from Lexical before it can insert raw text.
+      event.preventDefault()
+      event.stopPropagation()
+      const parsed = parseTreeDragPayload(dataTransfer.getData(TREE_DRAG_MIME))
+      if (parsed === null) {
+        setStatus('拖入的文件无法识别，请重试')
+        return
+      }
+      const scope = typeof sessionsScope === 'function' ? sessionsScope(sessionId) : undefined
+      if (scope === undefined || typeof inputActions?.captureInsertion !== 'function') {
+        setStatus('对话输入框尚不可用，请稍后再试')
+        return
+      }
+      const label = `${parsed.path}${parsed.directory ? '/' : ''}`
+      const reference = {
+        source: 'code-workbench',
+        ref: { path: parsed.path, directory: parsed.directory, pathOnly: true },
+        label,
+        appearance: 'file',
+        clipboardText: parsed.path,
+      }
+      const span = inputActions.captureInsertion()
+      const applied = scope.bail(scope, 'slash/input-insert-reference', { reference, span }) === true
+      setStatus(applied
+        ? `已添加到对话：${label} — 去主对话输入你的问题`
+        : '添加失败：对话输入框正忙（正在提交？），请重试')
+    }
+    // Capture phase, so these outrank Lexical's bubble-phase listeners.
+    document.addEventListener?.('dragover', onDragOver, true)
+    document.addEventListener?.('drop', onDrop, true)
+    return () => {
+      document.removeEventListener?.('dragover', onDragOver, true)
+      document.removeEventListener?.('drop', onDrop, true)
+    }
+  }, [inputActions, sessionId, sessionsScope])
 
   const treeAction = async (action, target) => {
     const path = target.path
@@ -997,7 +961,7 @@ function CodePanel(props) {
         const scope = sessionsScope?.(sessionId)
         if (!scope || !inputActions?.captureInsertion) throw new Error('对话输入框尚未就绪')
         const relative = path.slice(cwd.length).replace(/^[\\/]+/, '') || '.'
-        const reference = { source: 'cursor-code', ref: { path: relative, directory: target.isDir, pathOnly: true }, label: relative, appearance: 'file', clipboardText: relative }
+        const reference = { source: 'code-workbench', ref: { path: relative, directory: target.isDir, pathOnly: true }, label: relative, appearance: 'file', clipboardText: relative }
         if (scope.bail(scope, 'slash/input-insert-reference', { reference, span: inputActions.captureInsertion() }) !== true) throw new Error('对话输入框正忙')
       } else {
         let operation = action
@@ -1036,7 +1000,7 @@ function CodePanel(props) {
         }
         const affected = [...buffersRef.current.values()].filter((buffer) => buffer.path === source || buffer.path.startsWith(`${source}/`) || buffer.path.startsWith(`${source}\\`))
         if (['rename', 'delete'].includes(operation) && affected.some((buffer) => buffer.dirty || buffer.saving)) throw new Error('请先保存受影响文件的修改，并等待保存完成')
-        const response = await fetch('/api/cursor-code/file-operation', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId, operation, path: source, destination }) })
+        const response = await fetch('/api/code-workbench/file-operation', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId, operation, path: source, destination }) })
         const result = await response.json()
         if (!response.ok || !result.ok) throw new Error(result.error?.message ?? `HTTP ${response.status}`)
         if (action === 'paste' && treeClipboard.operation === 'cut') setTreeClipboard(null)
@@ -1095,6 +1059,39 @@ function CodePanel(props) {
     }
   }, [activePath, openFile, openPaths])
 
+  const copyPath = useCallback(async (path, relative = false) => {
+    const value = relative && cwd
+      ? path.startsWith(cwd) ? path.slice(cwd.length).replace(/^[\\/]+/, '') : path
+      : path
+    try {
+      await globalThis.navigator?.clipboard?.writeText?.(value)
+      setStatus(relative ? '已复制相对路径' : '已复制路径')
+    } catch { setStatus('复制路径失败') }
+  }, [cwd])
+
+  const closeTabSet = useCallback(async (paths) => {
+    const selected = openPaths.filter((path) => paths.includes(path))
+    if (!selected.length) return
+    const dirtyPaths = selected.filter((path) => buffersRef.current.get(path)?.dirty)
+    if (dirtyPaths.length && !await askDialog(`关闭 ${dirtyPaths.length} 个未保存文件并放弃修改？取消后可先保存。`)) return
+    ++openRequestRef.current
+    const remaining = openPaths.filter((path) => !selected.includes(path))
+    for (const path of selected) {
+      const buffer = buffersRef.current.get(path)
+      buffersRef.current.delete(path)
+      buffer?.model.dispose()
+    }
+    setOpenPaths(remaining)
+    if (selected.includes(activePath)) {
+      const next = remaining.at(-1)
+      editorRef.current?.setModel(null)
+      stateRef.current = { path: null, version: null, dirty: false, text: '' }
+      setActivePath(null)
+      setDirty(false)
+      if (next) await openFile(next)
+    }
+  }, [activePath, openFile, openPaths])
+
   // Keep the editor keybindings pointing at the latest closures.
   useEffect(() => {
     saveRef.current = save
@@ -1119,7 +1116,7 @@ function CodePanel(props) {
       const rel = hit.path.startsWith(cwd) ? hit.path.slice(cwd.length).replace(/^[\\/]+/, '') : hit.path
       searchRows.push(h('div', {
         key: `${hit.path}#${hit.line}#${index}`,
-        style: { ...rowStyle(0, false), flexDirection: 'column', alignItems: 'flex-start', gap: '1px', padding: '4px 8px' },
+        style: { ...rowStyle(0), flexDirection: 'column', alignItems: 'flex-start', gap: '1px', padding: '4px 8px' },
         onClick: () => openFile(hit.path, { line: hit.line, column: hit.column, length: hit.length }),
         title: hit.path,
       },
@@ -1160,7 +1157,7 @@ function CodePanel(props) {
     for (const entry of history.entries) {
       historyRows.push(h('div', {
         key: entry.id,
-        style: { ...rowStyle(0, false), flexDirection: 'column', alignItems: 'flex-start', gap: '2px', padding: '5px 8px' },
+        style: { ...rowStyle(0), flexDirection: 'column', alignItems: 'flex-start', gap: '2px', padding: '5px 8px' },
       },
         h('span', { style: { color: T.fgMuted, fontSize: '10.5px' } },
           `${new Date(entry.at).toLocaleString()} · ${entry.operation} · ${entry.lines} 行`),
@@ -1189,14 +1186,19 @@ function CodePanel(props) {
   )
 
   const relativePath = activePath?.startsWith(cwd) ? activePath.slice(cwd.length).replace(/^[\\/]+/, '') : activePath
+  const showTabMenu = (event, path) => {
+    event.preventDefault()
+    event.stopPropagation()
+    setTabMenu({ path, x: Math.max(0, Math.min(event.clientX, window.innerWidth - 230)), y: Math.max(0, Math.min(event.clientY, window.innerHeight - 220)) })
+  }
   const tabs = openPaths.map((path) => {
     const name = path.split(/[\\/]/).at(-1)
     const tabDirty = buffersRef.current.get(path)?.dirty
-    return h('div', { key: path, className: `code-workbench-tab${path === activePath ? ' active' : ''}`, onClick: () => openFile(path) },
+    return h('div', { key: path, className: `code-workbench-tab${path === activePath ? ' active' : ''}`, onClick: () => openFile(path), onContextMenu: (event) => showTabMenu(event, path) },
       h('span', { title: path }, `${name}${tabDirty ? ' ●' : ''}`),
       h('button', { title: `关闭 ${name}`, onClick: (event) => { event.stopPropagation(); closeFile(path) } }, '×'))
   })
-  return h('div', { className: 'cursor-code-workbench', style: { display: 'flex', flexDirection: 'column', height: '100%', minWidth: 0, background: T.bg, color: T.fg } },
+  return h('div', { className: 'code-workbench', onContextMenuCapture: () => setTabMenu(null), style: { display: 'flex', flexDirection: 'column', height: '100%', minWidth: 0, background: T.bg, color: T.fg } },
     dialog ? h('div', { className: 'code-workbench-dialog-backdrop', onKeyDown: (event) => { if (event.key === 'Escape') finishDialog(false) } },
       h('form', { className: 'code-workbench-dialog', role: 'dialog', 'aria-modal': true, 'aria-label': dialog.title, onSubmit: (event) => { event.preventDefault(); finishDialog(true) } },
         h('div', { className: 'code-workbench-dialog-title' }, dialog.title),
@@ -1219,13 +1221,13 @@ function CodePanel(props) {
       }, '加到对话'),
       h('button', { style: button, onClick: () => save(), disabled: !dirty }, '保存 (Ctrl+S)'),
     ),
-    h('div', { className: 'cursor-code-body', style: { display: 'flex', flex: '1 1 auto', minHeight: 0 } },
+    h('div', { className: 'code-workbench-body', style: { display: 'flex', flex: '1 1 auto', minHeight: 0 } },
       h('div', { className: 'code-workbench-activity', role: 'toolbar', 'aria-label': '工作区视图' },
         [['tree', '文件', 'files'], ['search', '搜索', 'search'], ['history', '历史', 'history']].map(([mode, label, icon]) => h('button', {
           key: mode, title: label, 'aria-label': label, 'aria-pressed': navigationOpen && leftMode === mode,
           onClick: () => { setNavigationOpen(leftMode === mode ? !navigationOpen : true); setLeftMode(mode); if (mode === 'history') loadHistory() },
         }, workbenchIcon(icon)))),
-      h('div', { className: 'cursor-code-navigation', style: { width: 'clamp(150px, 28%, 210px)', flex: '0 0 auto', borderRight: `1px solid ${T.border}`, background: T.bgRaised, display: navigationOpen ? 'flex' : 'none', flexDirection: 'column', minHeight: 0 } },
+      h('div', { className: 'code-workbench-navigation', style: { width: 'clamp(150px, 28%, 210px)', flex: '0 0 auto', borderRight: `1px solid ${T.border}`, background: T.bgRaised, display: navigationOpen ? 'flex' : 'none', flexDirection: 'column', minHeight: 0 } },
         h('div', { className: 'code-workbench-navigation-title' }, leftMode === 'tree' ? '文件' : leftMode === 'search' ? '搜索' : '历史'),
         leftMode === 'search'
           ? searchPanel
@@ -1233,16 +1235,25 @@ function CodePanel(props) {
             ? historyPanel
             : h('div', { style: { flex: '1 1 auto', minHeight: 0, overflow: 'auto' } },
               cwd
-                ? h(FileTree, { list, cwd, activePath, onOpen: openFile, joinPath, onAction: treeAction, refreshRevision: treeRevision, clipboard: treeClipboard })
+                ? h(FileTree, { list, cwd, activePath, onOpen: openFile, joinPath, onAction: treeAction, refreshRevision: treeRevision, clipboard: treeClipboard, closeMenuSignal: tabMenu?.path ?? null, onMenuOpen: () => setTabMenu(null) })
                 : h('div', { style: { padding: '12px', color: T.fgMuted, fontSize: '12px' } }, '会话没有工作区目录')),
       ),
       h('div', { style: { display: 'flex', flexDirection: 'column', flex: '1 1 auto', minHeight: 0, minWidth: 0 } },
-        h('div', { className: 'code-workbench-tabs' }, tabs.length ? tabs : h('span', { className: 'code-workbench-no-tabs' }, '未打开文件')),
+        h('div', { className: 'code-workbench-tabs', onClick: () => tabMenu && setTabMenu(null) }, tabs.length ? tabs : h('span', { className: 'code-workbench-no-tabs' }, '未打开文件')),
+        tabMenu ? h('div', { role: 'menu', className: 'code-workbench-context-menu', style: { left: tabMenu.x, top: tabMenu.y }, onClick: (event) => event.stopPropagation() }, [
+          ['close', '关闭', () => closeFile(tabMenu.path)],
+          ['closeOthers', '关闭其他', () => closeTabSet(openPaths.filter((path) => path !== tabMenu.path))],
+          ['closeRight', '关闭右侧标签页', () => closeTabSet(openPaths.slice(openPaths.indexOf(tabMenu.path) + 1))],
+          ['closeSaved', '关闭已保存', () => closeTabSet(openPaths.filter((path) => !buffersRef.current.get(path)?.dirty))],
+          ['closeAll', '全部关闭', () => closeTabSet(openPaths)],
+          ['copyPath', '复制路径', () => copyPath(tabMenu.path)],
+          ['copyRelativePath', '复制相对路径', () => copyPath(tabMenu.path, true)],
+        ].map(([action, label, handler]) => h('button', { key: action, type: 'button', role: 'menuitem', onClick: () => { setTabMenu(null); handler() } }, label))) : null,
         h('div', { className: 'code-workbench-breadcrumb', title: relativePath ?? '' },
           (relativePath ?? '代码工作台').split(/[\\/]/).filter(Boolean).map((part, index) => h('span', { key: `${part}-${index}` }, index > 0 ? ` › ${part}` : part))),
         h('div', { style: { position: 'relative', display: 'flex', flex: '1 1 auto', minHeight: 0, minWidth: 0 } },
         h('div', { ref: hostRef, style: { flex: '1 1 auto', minHeight: 0, minWidth: 0, visibility: activePath ? 'visible' : 'hidden' } }),
-        activePath === null ? h('div', { className: 'cursor-code-empty' },
+        activePath === null ? h('div', { className: 'code-workbench-empty' },
           h('div', { style: { fontSize: '18px', fontWeight: 500, color: T.fg } }, '开始编辑代码'),
           h('div', null, '从工作区选择一个文件'),
           h('div', { style: { fontSize: '11px', lineHeight: 2 } }, 'Ctrl+L 加到对话', h('br'), '输入代码获取 AI 建议，Tab 接受'),
@@ -1263,7 +1274,7 @@ function CodePanel(props) {
 
 const inject = ['slots', 'sidebarRightTabs', 'remote.workspaceFiles', 'remote.session', 'shortcuts', 'sessions', 'inputTriggers', 'configForms']
 
-function CursorCodeSettings({ form }) {
+function CodeWorkbenchSettings({ form }) {
   const snapshot = usePluginSettings(form)
   const value = snapshot.value ?? defaultSettings
   const [autoSave, setAutoSave] = useState(value.autoSave === true)
@@ -1330,7 +1341,7 @@ function CursorCodeSettings({ form }) {
   }
   const disabled = busy
   const input = { width: '100%', boxSizing: 'border-box', padding: '7px 9px', borderRadius: '7px', border: `1px solid ${T.border}`, background: T.bg, color: T.fg, font: 'inherit' }
-  return h('section', { className: 'cursor-code-settings', style: { color: T.fg, background: T.bgRaised, padding: '14px', borderBottom: `1px solid ${T.border}`, flexShrink: 0 } },
+  return h('section', { className: 'code-workbench-settings', style: { color: T.fg, background: T.bgRaised, padding: '14px', borderBottom: `1px solid ${T.border}`, flexShrink: 0 } },
     h('div', { style: { fontSize: '14px', fontWeight: 500, marginBottom: '12px' } }, '代码工作台 · 插件设置'),
     h('div', { className: 'code-workbench-setting-row' },
       h('div', null,
@@ -1375,10 +1386,10 @@ function CursorCodeSettings({ form }) {
   )
 }
 
-function CursorCodeSection({ renderSlot }) {
+function CodeWorkbenchSection({ renderSlot }) {
   return h('div', { style: { display: 'flex', flexDirection: 'column', minHeight: 0 } },
     h('h2', { style: { margin: '0 0 18px', fontSize: '20px', fontWeight: 500, color: T.fg } }, '代码工作台'),
-    renderSlot('settings.cursor-code.item', {}),
+    renderSlot('settings.code-workbench.item', {}),
   )
 }
 
@@ -1390,29 +1401,29 @@ function CursorCodeSection({ renderSlot }) {
 function registerShortcuts(ctx) {
   const fixed = [
     {
-      id: 'cursor-code.save',
-      label: () => '保存文件（代码编辑器）',
+      id: 'code-workbench.save',
+      label: () => '保存文件（代码工作台）',
       keys: ['Ctrl+S'],
       bindings: [{ code: 'KeyS', modifiers: ['primary'] }],
-      group: 'cursor-code',
+      group: 'code-workbench',
     },
     {
-      id: 'cursor-code.tabCompletion',
+      id: 'code-workbench.tabCompletion',
       label: () => '接受 Tab 补全建议（编辑器内 Tab）',
       keys: ['Tab'],
       bindings: [{ code: 'Tab', modifiers: [] }],
-      group: 'cursor-code',
+      group: 'code-workbench',
     },
     {
-      id: 'cursor-code.addToChat',
-      label: () => '把选中代码添加到主对话输入框（代码编辑器，Ctrl+L）',
+      id: 'code-workbench.addToChat',
+      label: () => '把选中代码添加到主对话输入框（代码工作台，Ctrl+L）',
       keys: ['Ctrl+L'],
       bindings: [{ code: 'KeyL', modifiers: ['primary'] }],
-      group: 'cursor-code',
+      group: 'code-workbench',
     },
   ]
   for (const command of fixed) {
-    ctx.effect(() => ctx.shortcuts.registerFixed(command), `cursor-code: shortcut ${command.id}`)
+    ctx.effect(() => ctx.shortcuts.registerFixed(command), `code-workbench: shortcut ${command.id}`)
   }
 }
 
@@ -1422,17 +1433,17 @@ function apply(ctx) {
   if (ctx.configForms) {
     ctx.effect(() => ctx.slots.inject('settings.section', () => ctx.slots.register({
       name: 'settings.section',
-      id: 'cursor-code',
+      id: 'code-workbench',
       order: 25,
       label: () => '代码工作台',
-      children: { 'settings.cursor-code.item': { kind: 'list', scope: 'root' } },
-    }, CursorCodeSection)), 'cursor-code: settings section')
-    ctx.effect(() => ctx.slots.inject('settings.cursor-code.item', () => ctx.slots.register({
-      name: 'settings.cursor-code.item',
+      children: { 'settings.code-workbench.item': { kind: 'list', scope: 'root' } },
+    }, CodeWorkbenchSection)), 'code-workbench: settings section')
+    ctx.effect(() => ctx.slots.inject('settings.code-workbench.item', () => ctx.slots.register({
+      name: 'settings.code-workbench.item',
       id: SETTINGS_NS,
       order: 0,
       inject: () => ({ form: settingsForm }),
-    }, CursorCodeSettings)), 'cursor-code: settings content')
+    }, CodeWorkbenchSettings)), 'code-workbench: settings content')
   }
   ctx.effect(() => ctx.slots.inject('conversation.chat.node', () => {
     const disposers = []
@@ -1447,7 +1458,7 @@ function apply(ctx) {
         const content = props.node?.data?.content
         const hasOriginal = typeof Original === 'function' || (typeof Original === 'object' && Original !== null && Original.$$typeof !== undefined)
         if (!Array.isArray(content)) {
-          return h('div', { className: 'cursor-code-chat-fallback' },
+          return h('div', { className: 'code-workbench-chat-fallback' },
             hasOriginal ? h(Original, props) : typeof content === 'string' ? content : '',
           )
         }
@@ -1462,11 +1473,11 @@ function apply(ctx) {
         })
         const renderMessage = (messageContent) => hasOriginal
           ? h(Original, { ...props, node: { ...props.node, data: { ...props.node.data, content: messageContent } } })
-          : h('div', { className: 'cursor-code-chat-fallback' }, messageContent.map((part) => part.type === 'text' ? part.text : '').join('\n'))
+          : h('div', { className: 'code-workbench-chat-fallback' }, messageContent.map((part) => part.type === 'text' ? part.text : '').join('\n'))
         if (snippets.length === 0) return renderMessage(content)
-        return h('div', { className: 'cursor-code-chat-reference' },
+        return h('div', { className: 'code-workbench-chat-reference' },
           renderMessage(compactContent),
-          snippets.map((snippet, index) => h('details', { key: index, className: 'cursor-code-chat-snippet' },
+          snippets.map((snippet, index) => h('details', { key: index, className: 'code-workbench-chat-snippet' },
             h('summary', null, `${snippet.anchor} · ${snippet.code.split('\n').length} 行`),
             h('pre', null, h('code', null, snippet.code)),
           )),
@@ -1474,8 +1485,8 @@ function apply(ctx) {
       }))
     }
     return () => { for (const dispose of disposers) dispose() }
-  }), 'cursor-code: compact chat references')
-  // The reference codec: what a `cursor-code` chat chip expands to when the
+  }), 'code-workbench: compact chat references')
+  // The reference codec: what a `code-workbench` chat chip expands to when the
   // draft is submitted. Registered under the `@` trigger so the input pipeline
   // can route serialization to it (`inputTriggers.serializeReference`).
   ctx.inject(['inputTriggers'], (scope) => {
@@ -1483,7 +1494,7 @@ function apply(ctx) {
       try {
         return scope.inputTriggers.registerSource({
           trigger: '@',
-          name: 'cursor-code',
+          name: 'code-workbench',
           label: () => '选中代码',
           codec: {
             serialize: async (ref) => {
@@ -1501,22 +1512,22 @@ function apply(ctx) {
           },
         })
       } catch (error) {
-        console.error('[cursor-code] reference codec registration failed:', error)
+        console.error('[code-workbench] reference codec registration failed:', error)
         return () => {}
       }
-    }, 'cursor-code: chat chip codec')
+    }, 'code-workbench: chat chip codec')
   })
   ctx.effect(() => ctx.sidebarRightTabs.register({
     id: TAB_ID,
     kind: TAB_KIND,
     title: () => TAB_LABEL,
     guide: [{
-      id: 'cursor-code',
+      id: 'code-workbench',
       order: 30,
       title: () => TAB_LABEL,
       description: () => TAB_DESCRIPTION,
     }],
-  }), 'cursor-code: tab type')
+  }), 'code-workbench: tab type')
 
   ctx.effect(() => ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({
     name: 'sidebar.right.pane.tab',
@@ -1533,7 +1544,7 @@ function apply(ctx) {
       'remote.stream': (spec) => ctx.remote.$stream(spec),
       'sessions.scope': (id) => ctx.sessions.scope(id),
     }),
-  }, CodePanel)), 'cursor-code: tab body')
+  }, CodePanel)), 'code-workbench: tab body')
 }
 
 export { inject, apply }

@@ -3,13 +3,13 @@
  *
  *   node tools/analyze-bundle.mjs
  */
-import esbuild from '../dsh-cursor-code/node_modules/esbuild/lib/main.js'
+import esbuild from '../dsh-code-workbench/node_modules/esbuild/lib/main.js'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 
 const { build } = esbuild
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'dsh-cursor-code')
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'dsh-code-workbench')
 
 const result = await build({
   entryPoints: [path.join(root, 'src', 'monaco-entry.mjs')],

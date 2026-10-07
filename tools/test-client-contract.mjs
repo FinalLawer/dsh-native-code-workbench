@@ -40,7 +40,7 @@ globalThis.document = {
   createElement: () => ({ dataset: {}, style: {}, remove() {} }),
 }
 
-const source = fs.readFileSync(new URL('../dsh-cursor-code/client.js', import.meta.url), 'utf8')
+const source = fs.readFileSync(new URL('../dsh-code-workbench/client.js', import.meta.url), 'utf8')
 // eslint-disable-next-line no-new-func
 new Function(source)()
 if (typeof factory !== 'function') throw new Error('client.js did not register a factory')
@@ -82,6 +82,17 @@ check('the bundle wires a Blob-based monaco worker environment',
 check('monaco is bundled inline, not require()d from the module table',
   !source.includes('require("monaco') && !source.includes("require('monaco"))
 
+const existingStyle = { textContent: 'previous revision' }
+globalThis.document.getElementById = () => existingStyle
+factory((specifier) => {
+  if (specifier === 'react') return reactStub
+  throw new Error(`unexpected external require("${specifier}")`)
+})
+check('hot reload updates the existing stylesheet including tree hover rules',
+  existingStyle.textContent.includes('.code-workbench-tree-row:hover')
+  && existingStyle.textContent !== 'previous revision')
+delete globalThis.document.getElementById
+
 console.log('\nmodule face')
 check('exports apply', typeof module.apply === 'function')
 check('exports inject as a service-name array', Array.isArray(module.inject), module.inject)
@@ -97,7 +108,7 @@ check('injects the official workspaceFiles and session Remote namespaces',
   module.inject.includes('remote.workspaceFiles') && module.inject.includes('remote.session'),
   module.inject)
 check('declares no private namespace of its own',
-  !module.inject.some((name) => /cursor/i.test(name)), module.inject)
+  !module.inject.some((name) => /code-workbench/i.test(name)), module.inject)
 check('declares no bare "remote" service',
   !module.inject.includes('remote'), module.inject)
 
@@ -172,16 +183,16 @@ check('every fixed row has a callable label returning a string',
 check('bindings are physical codes with modifier arrays',
   registeredShortcuts.every((row) => Array.isArray(row.bindings) && row.bindings.every(
     (binding) => typeof binding.code === 'string' && Array.isArray(binding.modifiers))))
-check('rows are grouped under cursor-code',
-  registeredShortcuts.every((row) => row.group === 'cursor-code'), registeredShortcuts.map((row) => row.group))
+check('rows are grouped under code-workbench',
+  registeredShortcuts.every((row) => row.group === 'code-workbench'), registeredShortcuts.map((row) => row.group))
 check('save and Tab completion are among the rows',
-  registeredShortcuts.some((row) => row.id === 'cursor-code.save')
-  && registeredShortcuts.some((row) => row.id === 'cursor-code.tabCompletion'),
+  registeredShortcuts.some((row) => row.id === 'code-workbench.save')
+  && registeredShortcuts.some((row) => row.id === 'code-workbench.tabCompletion'),
   registeredShortcuts.map((row) => row.id))
 
 console.log('\nchat-chip reference codec')
-const codec = registeredSources.find((source) => source.name === 'cursor-code')?.codec
-check('registers the cursor-code reference source', codec !== undefined, registeredSources.map((s) => s.name))
+const codec = registeredSources.find((source) => source.name === 'code-workbench')?.codec
+check('registers the code-workbench reference source', codec !== undefined, registeredSources.map((s) => s.name))
 check('the codec serializes to a promise of text', typeof codec?.serialize === 'function')
 const codecText = typeof codec?.serialize === 'function'
   ? await codec.serialize({ path: 'a.js', startLine: 3, endLine: 5, language: 'javascript', code: 'x\ny' })

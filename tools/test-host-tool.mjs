@@ -1,6 +1,6 @@
 /**
- * Host-half retrieval-tool test (`codebase_search`, the Cursor-style
- * `@codebase` for the chat Agent).
+ * Host-half retrieval-tool test (`codebase_search`, the ranked
+ * `@codebase` retrieval for the chat Agent).
  *
  * Pins the registration shape the Tool Runtime consumes (JSON-Schema
  * parameters, output schema + render) and the ranking behaviour that makes the
@@ -9,7 +9,7 @@
  *
  *   node tools/test-host-tool.mjs
  */
-import { apply } from '../dsh-cursor-code/index.js'
+import { apply } from '../dsh-code-workbench/index.js'
 
 let failures = 0
 /** Assert one expectation. */
@@ -43,7 +43,7 @@ function makeScope() {
   const calls = { tool: null }
   const scope = {
     effect: (callback) => callback(),
-    llm: { async *stream() { /* rewrites only */ } },
+    llm: { async *stream() { /* unused in tool tests */ } },
     tools: {
       register(definition) {
         calls.tool = definition

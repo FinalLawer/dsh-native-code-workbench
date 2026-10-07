@@ -10,7 +10,7 @@
  */
 import fs from 'node:fs'
 
-const source = fs.readFileSync(new URL('../dsh-cursor-code/client.js', import.meta.url), 'utf8')
+const source = fs.readFileSync(new URL('../dsh-code-workbench/client.js', import.meta.url), 'utf8')
 const bytes = Buffer.byteLength(source)
 
 let failures = 0
@@ -30,7 +30,7 @@ console.log('\nwhat must stay')
 check('find widget ships', source.includes('findWidget'))
 check('suggest widget ships', source.includes('suggestWidget'))
 check('inline completions ship (Tab ghost text)', source.includes('inlineCompletions'))
-check('multicursor ships', source.includes('multicursor') || source.includes('addCursor'))
+check('multi-selection support ships', source.includes('multicursor') || source.includes('addCursor'))
 check('json tokenization ships', source.includes('delimiter.bracket.json'))
 check('worker routing serves the json worker by label', source.includes("label === 'json'"))
 // Grammar markers: language alias strings survive minification (identifiers do not).

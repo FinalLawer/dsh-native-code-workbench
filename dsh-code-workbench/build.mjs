@@ -1,5 +1,5 @@
 /**
- * dsh-cursor-code — client bundle build.
+ * dsh-code-workbench — client bundle build.
  *
  * The DSH client module runtime loads each plugin as one self-contained classic
  * script: `window.__ModuleLoader__.load({ id, factory(require) { … } })`. The
@@ -97,7 +97,7 @@ if (!mainJs) throw new Error('build: main bundle produced no js output')
 // ---------------------------------------------------------------------------
 const q = (value) => JSON.stringify(value)
 const banner = `/**
- * dsh-cursor-code — generated client bundle. DO NOT EDIT.
+ * dsh-code-workbench — generated client bundle. DO NOT EDIT.
  * Source: src/client.mjs (+ monaco-editor inline). Rebuild: node build.mjs
  */
 window.__ModuleLoader__.load({
@@ -106,11 +106,12 @@ window.__ModuleLoader__.load({
 \t\t// ---- injected assets (build.mjs): theme css + monaco worker environment ----
 \t\t(function () {
 \t\t\tif (typeof document === 'undefined' || !document.head) return;
-\t\t\tvar css = ${q(`${mainCss ? mainCss.text : ''}\n.cursor-code-flash{background:rgba(255,213,0,.35);border-radius:2px;}\n`)};
-\t\t\tvar hasCss = typeof document.getElementById === 'function' && document.getElementById('dsh-cursor-code-style');
+\t\t\tvar css = ${q(`${mainCss ? mainCss.text : ''}\n.code-workbench-flash{background:rgba(255,213,0,.35);border-radius:2px;}\n`)};
+\t\t\tvar hasCss = typeof document.getElementById === 'function' && document.getElementById('dsh-code-workbench-style');
+\t\t\tif (css && hasCss) hasCss.textContent = css;
 \t\t\tif (css && !hasCss && typeof document.createElement === 'function') {
 \t\t\t\tvar style = document.createElement('style');
-\t\t\t\tstyle.id = 'dsh-cursor-code-style';
+\t\t\t\tstyle.id = 'dsh-code-workbench-style';
 \t\t\t\tstyle.textContent = css;
 \t\t\t\tdocument.head.appendChild(style);
 \t\t\t}

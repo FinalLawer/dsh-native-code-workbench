@@ -1,13 +1,13 @@
 /**
- * Host-half completion-route test (`POST /api/cursor-code/complete`).
+ * Host-half completion-route test (`POST /api/code-workbench/complete`).
  *
  * The Tab-completion ghost text rides on one short auxiliary call per typing
- * pause; this pins its framing (before/after JSON around the cursor), its
- * small token budget, and the same NDJSON stream contract as the rewrite route.
+ * pause; this pins its framing (before/after JSON around the caret), its
+ * small token budget, and the NDJSON stream contract.
  *
  *   node tools/test-host-complete.mjs
  */
-import { apply, Config } from '../dsh-cursor-code/index.js'
+import { apply, Config } from '../dsh-code-workbench/index.js'
 
 let failures = 0
 /** Assert one expectation. */
@@ -36,7 +36,8 @@ function makeScope(options = {}) {
       async *stream(generate) {
         calls.stream.push(generate)
         for (const text of options.deltas ?? ['.map(x => x']) yield { type: 'text-delta', index: 0, text }
-        yield { type: 'finish', reason: { kind: 'stop' } }
+        if (options.throwError) throw options.throwError
+        yield { type: 'finish', reason: options.finishReason ?? { kind: 'stop' } }
       },
     },
     tools: { register: () => () => {} },
@@ -70,12 +71,12 @@ function makeScope(options = {}) {
 function mount(options = {}) {
   const { scope, calls } = makeScope(options)
   apply({ inject: (names, callback) => callback(scope) }, options.config)
-  return { route: calls.routes.find((r) => r.path === '/api/cursor-code/complete'), calls }
+  return { route: calls.routes.find((r) => r.path === '/api/code-workbench/complete'), calls }
 }
 
 /** Build one completion POST request. */
 function makeRequest(body) {
-  return new Request('http://127.0.0.1/api/cursor-code/complete', {
+  return new Request('http://127.0.0.1/api/code-workbench/complete', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
@@ -100,8 +101,8 @@ console.log('wiring')
 {
   const { route, calls } = mount()
   check('registers the completion route', route !== undefined)
-  check('every route is mounted', ['/api/cursor-code/write', '/api/cursor-code/rewrite', '/api/cursor-code/search',
-    '/api/cursor-code/complete', '/api/cursor-code/history', '/api/cursor-code/rollback']
+  check('every route is mounted', ['/api/code-workbench/write', '/api/code-workbench/file-operation', '/api/code-workbench/search',
+    '/api/code-workbench/complete', '/api/code-workbench/history', '/api/code-workbench/rollback']
     .every((p) => calls.routes.some((r) => r.path === p)), calls.routes.map((r) => r.path))
   check('accepts POST buffered', route?.methods?.[0] === 'POST' && route?.requestBody === 'buffered')
 }
@@ -127,12 +128,26 @@ console.log('\nthe auxiliary call (framing and budget)')
     generate?.provider === 'deepseek' && generate?.model === 'deepseek-chat')
   check('keeps the token budget small', generate?.maxTokens === 128, generate?.maxTokens)
   check('uses the completion system instruction',
-    typeof generate?.system === 'string' && generate.system.includes('insert exactly at the cursor'))
+    typeof generate?.system === 'string' && generate.system.includes('insert exactly at the caret'))
   const framed = generate?.messages?.[0]?.content?.[0]?.text ?? ''
   const contextLine = framed.split('\n').at(-1)
-  check('frames before/after the cursor as JSON',
+  check('frames before/after the caret as JSON',
     contextLine === JSON.stringify({ before: SAMPLE.prefix, after: SAMPLE.suffix }), contextLine)
   check('plain RequestMessage input', generate?.messages?.[0]?.role === 'user' && generate?.messages?.[0]?.id === undefined)
+}
+
+console.log('\nstream failures')
+{
+  for (const kind of ['error', 'max-tokens', 'aborted']) {
+    const { route } = mount({ finishReason: { kind } })
+    const got = await frames(await route.fetch(makeRequest(SAMPLE)))
+    check(`${kind} finish returns an error frame rather than success`,
+      got.at(-1)?.t === 'error' && !got.some((frame) => frame.t === 'done'), got)
+  }
+  const { route } = mount({ throwError: new Error('provider unavailable') })
+  const got = await frames(await route.fetch(makeRequest(SAMPLE)))
+  check('thrown provider failure returns an error frame',
+    got.at(-1)?.t === 'error' && got.at(-1)?.message === 'provider unavailable', got)
 }
 
 console.log('\ncaps hold')

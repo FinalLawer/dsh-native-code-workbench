@@ -6,7 +6,7 @@
  * entry keeps:
  *
  *  - every editor contribution (`features/register.all.js` + the standalone
- *    tails `editor.main` adds): find, suggest, multicursor, folding, rename,
+ *    tails `editor.main` adds): find, suggest, multi-selection, folding, rename,
  *    inline completions, …
  *  - the lightweight JSON language service (28 KB, worker-routed by label)
  *  - a curated grammar set for the languages a workspace actually contains

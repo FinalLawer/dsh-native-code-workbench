@@ -7,7 +7,7 @@
   "main": "index.js",
   "scripts": {
     "build": "node build.mjs",
-    "test": "node ../tools/test-client-contract.mjs && node ../tools/test-diff.mjs && node ../tools/test-host-write.mjs && node ../tools/test-file-operations.mjs && node ../tools/test-host-rewrite.mjs && node ../tools/test-host-search.mjs && node ../tools/test-host-tool.mjs && node ../tools/test-host-complete.mjs && node ../tools/test-completion-api.mjs && node ../tools/test-host-history.mjs && node ../tools/test-bundle-slim.mjs && node ../tools/test-client-smoke.mjs"
+    "test": "node ../tools/test-client-contract.mjs && node ../tools/test-host-write.mjs && node ../tools/test-file-operations.mjs && node ../tools/test-host-search.mjs && node ../tools/test-host-tool.mjs && node ../tools/test-host-complete.mjs && node ../tools/test-completion-api.mjs && node ../tools/test-host-history.mjs && node ../tools/test-bundle-slim.mjs && node ../tools/test-client-smoke.mjs"
   },
   "exports": {
     ".": "./index.js",

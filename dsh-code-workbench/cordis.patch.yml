@@ -1,7 +1,7 @@
-# dsh-cursor-code — the bundle layer.
+# dsh-code-workbench — the bundle layer.
 #
 # One row mounts this package as a Loader entry. That single row is enough for
-# both halves: the Node half registers the `POST /api/cursor-code/write` route
+# both halves: the Node half registers the `POST /api/code-workbench/write` route
 # (version-guarded `ctx.fs.writeText`, authenticated by the Connection service),
 # and the browser half (`exports["./client"]`, found through this package's
 # `dsh.client` declaration) registers the right-sidebar tab type.
@@ -9,5 +9,5 @@
 # The Host Config schema also backs the plugin's user settings form.
 
 - insert:
-    - id: cursor-code
+    - id: code-workbench
       name: 'dsh-code-workbench'

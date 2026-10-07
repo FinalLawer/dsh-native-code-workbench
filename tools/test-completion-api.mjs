@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
-import { completionEndpoint, streamCompletionApi } from '../dsh-cursor-code/completion-api.mjs'
-import { Config, apply } from '../dsh-cursor-code/index.js'
+import { completionEndpoint, streamCompletionApi } from '../dsh-code-workbench/completion-api.mjs'
+import { Config, apply } from '../dsh-code-workbench/index.js'
 
 assert.equal(completionEndpoint('https://example.com/v1/'), 'https://example.com/v1/chat/completions')
 assert.equal(completionEndpoint('https://example.com/v1/chat/completions'), 'https://example.com/v1/chat/completions')
@@ -25,10 +25,10 @@ try {
   assert.equal(requested.init.headers.authorization, 'Bearer test-key')
   assert.equal(JSON.parse(requested.init.body).model, 'fast-model')
   const routes = []
-  const settings = { configure: () => () => {}, describe: () => [{ ns: 'cursor-code', value: { completionApiEnabled: true, completionBaseUrl: 'https://example.com/v1', completionApiModel: 'dedicated', completionApiKey: 'host-key' } }] }
+  const settings = { configure: () => () => {}, describe: () => [{ ns: 'code-workbench', value: { completionApiEnabled: true, completionBaseUrl: 'https://example.com/v1', completionApiModel: 'dedicated', completionApiKey: 'host-key' } }] }
   const scope = { effect: (callback) => callback(), settings, connection: { admit: () => ({}), fetch: { register: (route) => { routes.push(route); return () => {} } } }, tools: { register: () => () => {} }, get: () => undefined }
   apply({ fiber: {}, inject: (names, callback) => callback(scope) }, {})
-  const result = await routes.find((route) => route.path.endsWith('/complete')).fetch(new Request('http://localhost/api/cursor-code/complete', { method: 'POST', body: JSON.stringify({ sessionId: 's1', path: 'a.js', prefix: 'const x =' }) }))
+  const result = await routes.find((route) => route.path.endsWith('/complete')).fetch(new Request('http://localhost/api/code-workbench/complete', { method: 'POST', body: JSON.stringify({ sessionId: 's1', path: 'a.js', prefix: 'const x =' }) }))
   assert.match(await result.text(), /你好/)
   assert.equal(JSON.parse(requested.init.body).model, 'dedicated')
   assert.equal(requested.init.headers.authorization, 'Bearer host-key')

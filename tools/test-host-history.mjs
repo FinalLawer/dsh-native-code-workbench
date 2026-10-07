@@ -1,14 +1,14 @@
 /**
- * Host-half save-journal test (`/api/cursor-code/history` + `/rollback`).
+ * Host-half save-journal test (`/api/code-workbench/history` + `/rollback`).
  *
- * Every accepted write keeps its before/after in the journal (Cursor-style
+ * Every accepted write keeps its before/after in the journal (save
  * checkpoints); this pins that a save journals, the listing hides contents but
  * says what is rollbackable, and a rollback restores the exact before content
  * — and is itself journaled, so it is reversible too.
  *
  *   node tools/test-host-history.mjs
  */
-import { apply } from '../dsh-cursor-code/index.js'
+import { apply } from '../dsh-code-workbench/index.js'
 
 let failures = 0
 /** Assert one expectation. */
@@ -29,7 +29,7 @@ function makeScope(options = {}) {
   const calls = { write: [], routes: [] }
   const scope = {
     effect: (callback) => callback(),
-    llm: { async *stream() { /* rewrites only */ } },
+    llm: { async *stream() { /* unused in history tests */ } },
     tools: { register: () => () => {} },
     connection: {
       admit: () => ({ peer: {} }),
@@ -80,40 +80,40 @@ function makeRequest(path, body) {
 console.log('journal flow')
 {
   const { route } = makeScope()
-  const write = route('/api/cursor-code/write')
-  const history = route('/api/cursor-code/history')
-  const rollback = route('/api/cursor-code/rollback')
+  const write = route('/api/code-workbench/write')
+  const history = route('/api/code-workbench/history')
+  const rollback = route('/api/code-workbench/rollback')
   const sessionId = 'session-j1'
   const file = 'src\\journal.js'
 
-  await write.fetch(makeRequest('/api/cursor-code/write', { sessionId, path: file, text: 'v1\n', note: '第一次' }))
-  await write.fetch(makeRequest('/api/cursor-code/write', { sessionId, path: file, text: 'v2\n', note: 'Cmd+K 改写: 加注释' }))
+  await write.fetch(makeRequest('/api/code-workbench/write', { sessionId, path: file, text: 'v1\n', note: '第一次' }))
+  await write.fetch(makeRequest('/api/code-workbench/write', { sessionId, path: file, text: 'v2\n', note: '手动编辑: 加注释' }))
 
-  const listed = await (await history.fetch(makeRequest('/api/cursor-code/history', { sessionId, path: file }))).json()
-  check('both saves are listed, newest first', listed.entries?.length === 2 && listed.entries[0]?.note === 'Cmd+K 改写: 加注释', listed.entries)
+  const listed = await (await history.fetch(makeRequest('/api/code-workbench/history', { sessionId, path: file }))).json()
+  check('both saves are listed, newest first', listed.entries?.length === 2 && listed.entries[0]?.note === '手动编辑: 加注释', listed.entries)
   check('listing carries metadata but no contents',
     listed.entries.every((e) => e.before === undefined && e.after === undefined && Number.isFinite(e.at)))
   check('entries are rollbackable', listed.entries.every((e) => e.rollbackable === true))
 
   const target = listed.entries[0]
-  const result = await (await rollback.fetch(makeRequest('/api/cursor-code/rollback', { sessionId, path: file, id: target.id }))).json()
+  const result = await (await rollback.fetch(makeRequest('/api/code-workbench/rollback', { sessionId, path: file, id: target.id }))).json()
   check('rollback succeeds', result.ok === true, result)
-  const after = await (await history.fetch(makeRequest('/api/cursor-code/history', { sessionId, path: file }))).json()
+  const after = await (await history.fetch(makeRequest('/api/code-workbench/history', { sessionId, path: file }))).json()
   check('the rollback is itself journaled', after.entries?.length === 3 && after.entries[0]?.note.startsWith('回滚'), after.entries?.[0])
 }
 
 console.log('\nrollback restores the exact before content')
 {
   const { route, calls } = makeScope()
-  const write = route('/api/cursor-code/write')
-  const history = route('/api/cursor-code/history')
-  const rollback = route('/api/cursor-code/rollback')
+  const write = route('/api/code-workbench/write')
+  const history = route('/api/code-workbench/history')
+  const rollback = route('/api/code-workbench/rollback')
   const sessionId = 'session-j2'
   const file = 'src\\restore.js'
 
-  await write.fetch(makeRequest('/api/cursor-code/write', { sessionId, path: file, text: 'new\n' }))
-  const listed = await (await history.fetch(makeRequest('/api/cursor-code/history', { sessionId, path: file }))).json()
-  await rollback.fetch(makeRequest('/api/cursor-code/rollback', { sessionId, path: file, id: listed.entries[0].id }))
+  await write.fetch(makeRequest('/api/code-workbench/write', { sessionId, path: file, text: 'new\n' }))
+  const listed = await (await history.fetch(makeRequest('/api/code-workbench/history', { sessionId, path: file }))).json()
+  await rollback.fetch(makeRequest('/api/code-workbench/rollback', { sessionId, path: file, id: listed.entries[0].id }))
   check('writeText received the journaled before content', calls.write.at(-1)?.[1] === 'before-1', calls.write.at(-1)?.[1])
   check('with a version intent', calls.write.at(-1)?.[2]?.kind === 'replaceIfVersion', calls.write.at(-1)?.[2])
   check('and the sandbox policy', calls.write.at(-1)?.[4]?.mode === 'workspace-write', calls.write.at(-1)?.[4])
@@ -122,35 +122,35 @@ console.log('\nrollback restores the exact before content')
 console.log('\nhonest failures')
 {
   const { route } = makeScope()
-  const write = route('/api/cursor-code/write')
-  const history = route('/api/cursor-code/history')
-  const rollback = route('/api/cursor-code/rollback')
+  const write = route('/api/code-workbench/write')
+  const history = route('/api/code-workbench/history')
+  const rollback = route('/api/code-workbench/rollback')
   const sessionId = 'session-j3'
   const file = 'src\\fail.js'
 
-  const missing = await rollback.fetch(makeRequest('/api/cursor-code/rollback', { sessionId, path: file, id: 'nope' }))
+  const missing = await rollback.fetch(makeRequest('/api/code-workbench/rollback', { sessionId, path: file, id: 'nope' }))
   check('unknown entry id is 404', missing.status === 404 && (await missing.json()).error?.code === 'ENTRY_NOT_FOUND')
 
-  await write.fetch(makeRequest('/api/cursor-code/write', { sessionId, path: file, text: 'x\n' }))
-  const listed = await (await history.fetch(makeRequest('/api/cursor-code/history', { sessionId, path: file }))).json()
+  await write.fetch(makeRequest('/api/code-workbench/write', { sessionId, path: file, text: 'x\n' }))
+  const listed = await (await history.fetch(makeRequest('/api/code-workbench/history', { sessionId, path: file }))).json()
   check('the journal is per file', listed.entries?.length === 1, listed.entries?.length)
-  const other = await (await history.fetch(makeRequest('/api/cursor-code/history', { sessionId, path: 'src\\other.js' }))).json()
+  const other = await (await history.fetch(makeRequest('/api/code-workbench/history', { sessionId, path: 'src\\other.js' }))).json()
   check('another file has its own (empty) journal', other.entries?.length === 0, other.entries)
 }
 
 console.log('\na save without retained before content is not rollbackable')
 {
   const { route } = makeScope({ firstBefore: null })
-  const write = route('/api/cursor-code/write')
-  const history = route('/api/cursor-code/history')
-  const rollback = route('/api/cursor-code/rollback')
+  const write = route('/api/code-workbench/write')
+  const history = route('/api/code-workbench/history')
+  const rollback = route('/api/code-workbench/rollback')
   const sessionId = 'session-j4'
   const file = 'src\\nobefore.js'
 
-  await write.fetch(makeRequest('/api/cursor-code/write', { sessionId, path: file, text: 'x\n' }))
-  const listed = await (await history.fetch(makeRequest('/api/cursor-code/history', { sessionId, path: file }))).json()
+  await write.fetch(makeRequest('/api/code-workbench/write', { sessionId, path: file, text: 'x\n' }))
+  const listed = await (await history.fetch(makeRequest('/api/code-workbench/history', { sessionId, path: file }))).json()
   check('the entry reports itself not rollbackable', listed.entries[0]?.rollbackable === false, listed.entries[0])
-  const denied = await rollback.fetch(makeRequest('/api/cursor-code/rollback', { sessionId, path: file, id: listed.entries[0].id }))
+  const denied = await rollback.fetch(makeRequest('/api/code-workbench/rollback', { sessionId, path: file, id: listed.entries[0].id }))
   check('rolling it back is 409 NOT_ROLLBACKABLE',
     denied.status === 409 && (await denied.json()).error?.code === 'NOT_ROLLBACKABLE')
 }

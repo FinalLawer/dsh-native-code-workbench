@@ -14,58 +14,56 @@
 
 ## 独立补全 API
 
-在 DSH 设置的「代码工作台」中开启「使用独立补全 API」，填写 API Base URL（例如 `https://api.example.com/v1`）、模型 ID 和 API Key，然后点击「保存补全模型」。独立 API 仅用于 Tab 补全，Cmd+K AI 改写始终使用对话主模型；独立接口支持 OpenAI 兼容的 `/chat/completions` SSE 流式接口，也支持填写完整端点地址；本地免鉴权服务可以不填密钥。
+在 DSH 设置的「代码工作台」中开启「使用独立补全 API」，填写 API Base URL（例如 `https://api.example.com/v1`）、模型 ID 和 API Key，然后点击「保存补全模型」。独立 API 仅用于 Tab 补全；独立接口支持 OpenAI 兼容的 `/chat/completions` SSE 流式接口，也支持填写完整端点地址；本地免鉴权服务可以不填密钥。
 
 API Key 通过 Host 设置服务保存，标记为秘密字段，设置页不会回显。密钥输入框留空保留原密钥，勾选「清除已保存的 API Key」并保存可删除密钥。关闭独立 API 后，使用已配置的 DSH Provider / Model，两项留空则跟随 Agent。当前独立接口不支持 FIM、Anthropic Messages 或厂商特有参数。
 
-给 DSH Web GUI 的右侧栏加一个 **Cursor 风格的代码工作台**：用 **Monaco（VS Code 编辑器内核本体）** 浏览和编辑工作区文件——语法高亮、多光标、查找、撤销，全部与 VS Code 同款。
+给 DSH Web GUI 的右侧栏加一个 **VS Code 风格的代码工作台**：用 **Monaco（VS Code 编辑器内核本体）** 浏览和编辑工作区文件——语法高亮、多光标、查找、撤销，全部与 VS Code 同款。
 
 **设计原则：只组合官方机制，不自建平行协议。** 写盘走官方 Connection 通道 + `ctx.fs`，读盘走官方 `workspaceFiles` Remote。
 
 ---
 
-## 现状（M1 ✅ 编辑器 / M2 ✅ Cmd+K / M3 ✅ 检索 / M4 ✅ Tab 补全 / M5 ✅ 检查点 / M6 ✅ 加到对话）
+## 当前能力：编辑器 / 检索 / Tab 补全 / 检查点 / 加到对话
 
 | 能力 | 实现 | 机制 |
 |---|---|---|
-| 编辑器 | **Monaco 全量内联**（约 10 MiB bundle，懒加载） | `monaco-editor` 打进 bundle（浏览器模块表冻结，无 Monaco，必须内联） |
+| 编辑器 | **Monaco 内联**（约 5.12 MiB bundle，懒加载） | `monaco-editor` 打进 bundle（浏览器模块表冻结，无 Monaco，必须内联） |
 | Worker | Blob URL 内嵌 `editor.worker` | `self.MonacoEnvironment.getWorker`，无 CSP 拦截 |
 | 文件树 | 递归、懒展开 | `ctx.remote.workspaceFiles.list`（官方只读 Remote） |
 | 读文件 | 分页读全量、按扩展名选语言 | `ctx.remote.workspaceFiles.read`（按行分页，`eof` 收尾） |
-| **写文件** | `POST /api/cursor-code/write`，**版本守卫**（`FS_STALE_VERSION` 拒绝覆盖并发修改），沙箱策略 = 会话标准策略 | host 半体 `ctx.connection.fetch.register`（与官方 `/api/file` 同一通道）→ `ctx.fs.writeText(target, text, intent, signal, sandboxPolicy)` |
-| **Cmd+K 内联编辑** | 选区→输入框→**流式生成**→行内 diff 预览→Enter 接受（自动保存）/ Esc 拒绝 | `POST /api/cursor-code/rewrite` 流式 NDJSON；host 直调 `ctx.llm.stream`（官方辅助调用模式，同 `dsh-session-title-llm`）；diff 用 [`src/diff.mjs`](dsh-cursor-code/src/diff.mjs) |
-| **代码库检索** | 左栏「搜索」模式：正则/大小写搜索、结果列表、点击跳转到行并高亮 | `POST /api/cursor-code/search`：`ctx.fs` 有界遍历（忽略 `node_modules`/二进制扩展）+ 行匹配，文件数/匹配数/时间三重预算 |
+| **写文件** | `POST /api/code-workbench/write`，**版本守卫**（`FS_STALE_VERSION` 拒绝覆盖并发修改），沙箱策略 = 会话标准策略 | host 半体 `ctx.connection.fetch.register`（与官方 `/api/file` 同一通道）→ `ctx.fs.writeText(target, text, intent, signal, sandboxPolicy)` |
+| **代码库检索** | 左栏「搜索」模式：正则/大小写搜索、结果列表、点击跳转到行并高亮 | `POST /api/code-workbench/search`：`ctx.fs` 有界遍历（忽略 `node_modules`/二进制扩展）+ 行匹配，文件数/匹配数/时间三重预算 |
 | **@codebase（Agent 工具）** | 对话里的 Agent 自带 `codebase_search` 工具：自然语言多词**排序检索**，返回 top 片段（补官方 `grep` 的精确正则） | `ctx.tools.register`（官方 Tool Runtime）+ 同一检索核心（terms 模式 + 词覆盖率排序） |
-| **Tab 补全** | 打字停顿后灰色 ghost 建议，**Tab 接受**、继续打字即取消；同一时刻最多一个请求 | Monaco `registerInlineCompletionsProvider`（ghost 渲染/接受全是内建）+ `POST /api/cursor-code/complete`（cursor 前后文 JSON 帧，256 token 小预算） |
-| **检查点 / 回滚** | 每次保存自动入账本（含 Cmd+K 指令摘要）；左栏「历史」列出检查点，**一键回滚**到任意保存之前；回滚本身也是检查点，可再回滚 | `POST /api/cursor-code/history` / `rollback`（host 内存账本，每文件 20 条、每侧 200KB 上限）+ `ctx.fs.writeText` 版本守卫 |
+| **Tab 补全** | 打字停顿后灰色 ghost 建议，**Tab 接受**、继续打字即取消；同一时刻最多一个请求 | Monaco `registerInlineCompletionsProvider`（ghost 渲染/接受全是内建）+ `POST /api/code-workbench/complete`（光标前后文 JSON 帧，128 token 小预算） |
+| **检查点 / 回滚** | 每次保存自动入账本；左栏「历史」列出检查点，**一键回滚**到任意保存之前；回滚本身也是检查点，可再回滚 | `POST /api/code-workbench/history` / `rollback`（host 内存账本，每文件 20 条、每侧 200KB 上限）+ `ctx.fs.writeText` 版本守卫 |
 | **外部改动自动重载** | Agent/外部改了盘上文件 → 干净缓冲区**自动刷新**；有未保存修改时警告不覆盖 | 官方 `workspaceFiles.changes` 流（`ctx.remote.$stream`），按打开文件订阅 |
 | **加到对话（Add to Chat）** | 右栏**选中多行代码** → `Ctrl+L`/按钮 → 主对话输入框里出现**引用胶囊**（只显示 `文件:行号 · N 行`），**发送时才展开**成完整代码块给 Agent | 官方 chip 机制：`slash/input-insert-reference` 事件插 `ReferenceChipNode` + 自注册 reference codec（`inputTriggers.registerSource` 的 `codec.serialize` 做提交展开） |
-| 可追溯 | 每次保存记 Session 备注（含 Cmd+K 指令摘要） | `sessionFeedback.record` |
+| 可追溯 | 每次保存记 Session 备注 | `sessionFeedback.record` |
 | 主题 | 跟随 DSH 明暗主题 | `body[data-ds-dark-theme]` MutationObserver → `monaco.editor.setTheme` |
-| 快捷键 | `Ctrl+S` 保存、`Ctrl+K` AI 改写（编辑器内） | `editor.addCommand` |
+| 快捷键 | `Ctrl+S` 保存、`Ctrl+L` 将选中代码加入对话、`Tab` 接受补全（编辑器内） | `editor.addCommand` |
 
 ## 组成
 
 | 半体 | 文件 | 职责 |
 |---|---|---|
-| Host | [`index.js`](dsh-cursor-code/index.js) | `POST /api/cursor-code/write`（版本守卫写盘 + 会话备注）和 `POST /api/cursor-code/rewrite`（流式辅助 LLM 调用） |
-| Client 源码 | [`src/client.mjs`](dsh-cursor-code/src/client.mjs) | 右栏 tab `cursor-code`：文件树 + Monaco + Cmd+K 内联改写 |
-| Diff 算法 | [`src/diff.mjs`](dsh-cursor-code/src/diff.mjs) | 纯函数行级 LCS diff + 折叠 |
-| 构建 | [`build.mjs`](dsh-cursor-code/build.mjs) | esbuild：Monaco/Worker/CSS 全部内联，产出 `client.js`（`__ModuleLoader__` factory 形式） |
+| Host | [`index.js`](dsh-code-workbench/index.js) | 版本守卫写盘、文件操作、检索、Tab 补全、检查点与回滚，以及 `codebase_search` 工具 |
+| Client 源码 | [`src/client.mjs`](dsh-code-workbench/src/client.mjs) | 右栏 tab `code-workbench`：文件树 + Monaco + Tab 补全 + 代码引用 |
+| 构建 | [`build.mjs`](dsh-code-workbench/build.mjs) | esbuild：Monaco/Worker/CSS 全部内联，产出 `client.js`（`__ModuleLoader__` factory 形式） |
 
 ## 开发
 
 配置位于 DSH 官方设置页中的「代码工作台」设置项：可配置编辑自动保存（默认关闭，停顿 900ms 后保存）及专用补全 Provider / Model。模型填写 DSH 已配置的标识，两项留空跟随 Agent；配置由 DSH 持久化。首次更新 Host schema 和客户端依赖后需要重启 DSH。
 
 ```powershell
-node dsh-cursor-code/build.mjs        # 重新构建 client.js（Monaco 内联）
+node dsh-code-workbench/build.mjs        # 重新构建 client.js（Monaco 内联）
 node tools/test-client-contract.mjs   # 客户端契约（bundle 资产/导出/注册/注入）
-node tools/test-diff.mjs              # diff 算法（21 项）
 node tools/test-host-write.mjs        # 写盘路由（沙箱策略戳/版本守卫/鉴权）
-node tools/test-host-rewrite.mjs      # Cmd+K 改写路由（GenerateOptions/NDJSON 流/错误帧）
+node tools/test-file-operations.mjs   # 文件操作（权限/范围/禁止覆盖）
 node tools/test-host-search.mjs       # 检索路由（有界遍历/忽略规则/正则/上限）
 node tools/test-host-tool.mjs         # codebase_search 工具（注册契约/排序/上限）
 node tools/test-host-complete.mjs     # Tab 补全路由（前后文帧/小 token 预算）
+node tools/test-completion-api.mjs    # 独立补全 API（SSE/配置/密钥）
 node tools/test-host-history.mjs      # 检查点账本（入账/回滚/可回滚性）
 node tools/test-bundle-slim.mjs       # bundle 瘦身（体积门槛/该有的在/该删的不在）
 node tools/test-client-smoke.mjs      # 客户端渲染冒烟（真实 React 渲染 + 驱动交互链路）
@@ -91,7 +89,7 @@ node tools/analyze-bundle.mjs         # bundle 体积归因（哪个模块最胖
 - AI Tab 补全尚未完成桌面端验收；路由及客户端 provider 测试通过不代表实际建议渲染和 Tab 接受已验证。状态栏显示生成中、返回建议、空结果及失败原因，便于实测定位。
 - 工作台使用 DSH 官方主题变量；导航可收起，窄面板改为上下布局，顶部文件路径与操作分行显示。
 
-- bundle 5.09 MiB（Monaco 内核 minify 后 + 常用 28 种语法 + JSON 语言服务）；首次打开面板时解析（懒加载）。
+- bundle 5.12 MiB（Monaco 内核 minify 后 + 常用 28 种语法 + JSON 语言服务）；首次打开面板时解析（懒加载）。
 - TS/JS 语义智能未启用（砍掉了 12MB 的 TS 语言服务）：TS/JS 有语法高亮 + 编辑器全套功能，但没有语义诊断/跳转；补全为词级 + AI ghost text。
 - 单文件读取受官方 `workspaceFiles` 上限约束（默认 2 MiB / 5000 行一页，最多 40 页）。
 - 检查点账本在 host 内存（每文件 20 条）：重启 DSH 后清零。

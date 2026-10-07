@@ -1,7 +1,7 @@
 /**
- * dsh-cursor-code — Host half.
+ * dsh-code-workbench — Host half.
  *
- * The one mutation path of the plugin: `POST /api/cursor-code/write`, a
+ * The one mutation path of the plugin: `POST /api/code-workbench/write`, a
  * version-guarded workspace file write. Everything else the panel does is
  * read-only through the shipped `ctx.remote.workspaceFiles`.
  *
@@ -20,7 +20,7 @@
  *    `sessionFeedback.record`, so the edit is visible in the session record
  *    even though a human (not the agent) performed it.
  *
- * @module dsh-cursor-code
+ * @module dsh-code-workbench
  */
 
 import z from '@deepseek-ai/schemastery'
@@ -41,14 +41,12 @@ export const Config = z.object({
 /** Refuse absurd payloads early; the editor sends ordinary source files. */
 const MAX_TEXT_CHARS = 8 * 1024 * 1024
 /** Route this half owns. The client half posts to the exact same string. */
-const WRITE_PATH = '/api/cursor-code/write'
-/** The Cmd+K rewrite route: one auxiliary LLM call, streamed back as NDJSON. */
-const REWRITE_PATH = '/api/cursor-code/rewrite'
-/** The codebase search route (Cursor's Search / @codebase retrieval). */
-const SEARCH_PATH = '/api/cursor-code/search'
-/** The save journal (Cursor-style checkpoints): list and roll back saves. */
-const HISTORY_PATH = '/api/cursor-code/history'
-const ROLLBACK_PATH = '/api/cursor-code/rollback'
+const WRITE_PATH = '/api/code-workbench/write'
+/** The codebase search route (@codebase retrieval). */
+const SEARCH_PATH = '/api/code-workbench/search'
+/** The save journal (save checkpoints): list and roll back saves. */
+const HISTORY_PATH = '/api/code-workbench/history'
+const ROLLBACK_PATH = '/api/code-workbench/rollback'
 /** Journal caps: entries retained per file and bytes retained per side. */
 const JOURNAL_CAPS = { perFile: 20, sideChars: 200_000 }
 /** In-memory save journal: every accepted write keeps its before/after for rollback. */
@@ -74,21 +72,19 @@ function journalWrite(sessionId, path, note, outcome, text) {
   while (entries.length > JOURNAL_CAPS.perFile) entries.pop()
   journal.set(key, entries)
 }
-/** Caps on one rewrite request's framed parts. */
-const REWRITE_CAPS = { instruction: 2000, selected: 60000, context: 8000, maxTokens: 8192 }
-/** The Tab-completion route: short ghost-text continuations at the cursor. */
-const COMPLETE_PATH = '/api/cursor-code/complete'
+/** The Tab-completion route: short ghost-text continuations at the caret. */
+const COMPLETE_PATH = '/api/code-workbench/complete'
 /** Caps on one completion request. */
 const COMPLETE_CAPS = { prefix: 3200, suffix: 900, maxTokens: 128 }
 
 /**
- * The Tab-completion contract: a minimal continuation at the cursor, never a
+ * The Tab-completion contract: a minimal continuation at the caret, never a
  * restatement of what is already there.
  */
 const COMPLETE_SYSTEM = [
-  'The user is typing code in an editor. Given the code before the cursor and the code after it, output ONLY the code to insert exactly at the cursor to continue naturally.',
+  'The user is typing code in an editor. Given the code before the caret and the code after it, output ONLY the code to insert exactly at the caret to continue naturally.',
   'Usually finish the current line or a small block — a few lines at most. Match the surrounding style and indentation.',
-  'Output no explanations, no Markdown fences, and never repeat code that is already present before or after the cursor.',
+  'Output no explanations, no Markdown fences, and never repeat code that is already present before or after the caret.',
 ].join('\n')
 /** Caps keeping one search bounded on a pathological tree. */
 const SEARCH_CAPS = {
@@ -116,17 +112,6 @@ const IGNORED_EXT = new Set([
   '.class', '.jar', '.pyc', '.pyo', '.obj', '.o', '.a', '.lib', '.wasm',
   '.db', '.sqlite', '.lock',
 ])
-
-/**
- * The rewrite contract shown to the model: replacement code only, no fences,
- * no prose — the editor inserts the output verbatim at the selection.
- */
-const REWRITE_SYSTEM = [
-  'You are a code rewriting engine inside a code editor.',
-  'Given the selected code, its surrounding context, and a rewrite instruction, output ONLY the replacement code for the selected region.',
-  'Preserve the surrounding code style, indentation, and language. Keep unrelated lines unchanged unless the instruction requires changing them.',
-  'Output no Markdown fences, no explanations, no apologies — just the replacement code.',
-].join('\n')
 
 /** JSON response helper. */
 function json(status, data) {
@@ -201,7 +186,7 @@ async function handleWrite(scope, request) {
     try {
       scope.get('sessionFeedback')?.record({
         sessionId,
-        text: `[cursor-code] 手动保存 ${path}（${outcome.operation}，${text.split('\n').length} 行）${note === '' ? '' : ` — ${note}`}`,
+        text: `[code-workbench] 手动保存 ${path}（${outcome.operation}，${text.split('\n').length} 行）${note === '' ? '' : ` — ${note}`}`,
       })
     } catch { /* remark is best-effort */ }
 
@@ -215,23 +200,6 @@ async function handleWrite(scope, request) {
             : 500
     return json(status, { ok: false, error: { code, message: error?.message ?? String(error) } })
   }
-}
-
-/**
- * Frame one rewrite request for the model. The code parts travel as JSON so no
- * file content can break a structural delimiter (the session-title plugin's own
- * framing trick).
- * @param body - validated rewrite request.
- * @returns the framed user text.
- */
-function frameRewrite(body) {
-  return [
-    `File: ${body.path}${body.language ? ` (${body.language})` : ''}`,
-    `Instruction: ${body.instruction}`,
-    '',
-    'Context JSON: { before, selected, after }. Replace "selected" per the instruction.',
-    JSON.stringify({ before: body.contextBefore, selected: body.selectedText, after: body.contextAfter }),
-  ].join('\n')
 }
 
 /**
@@ -279,63 +247,9 @@ function llmNdjsonStream(llm, options, label) {
 }
 
 /**
- * Handle one Cmd+K rewrite request: one auxiliary model call, streamed back as
- * NDJSON frames. The call follows the shipped auxiliary-call pattern
- * (`dsh-session-title-llm`): plain `RequestMessage` input, the default model
- * route, caller cancellation; nothing about it enters the agent loop.
- * @param scope - injected Host services.
- * @param request - the buffered Fetch request the Connection dispatched.
- * @returns the streaming response, or a JSON rejection.
- */
-async function handleRewrite(scope, request) {
-  const admission = scope.connection.admit(request)
-  if ('rejection' in admission) return json(admission.rejection, { ok: false, error: { code: 'UNAUTHORIZED' } })
-
-  let body
-  try {
-    body = await request.json()
-  } catch {
-    return json(400, { ok: false, error: { code: 'BAD_REQUEST', message: 'body must be JSON' } })
-  }
-  const { sessionId, path, language, instruction, selectedText, contextBefore, contextAfter } = body ?? {}
-  if (typeof sessionId !== 'string' || sessionId === '') return json(400, { ok: false, error: { code: 'BAD_REQUEST', message: 'sessionId is required' } })
-  if (typeof path !== 'string' || path === '') return json(400, { ok: false, error: { code: 'BAD_REQUEST', message: 'path is required' } })
-  if (typeof instruction !== 'string' || instruction.trim() === '') return json(400, { ok: false, error: { code: 'BAD_REQUEST', message: 'instruction is required' } })
-  if (instruction.length > REWRITE_CAPS.instruction) return json(413, { ok: false, error: { code: 'TOO_LARGE', message: `instruction exceeds ${REWRITE_CAPS.instruction} chars` } })
-  if (typeof selectedText !== 'string') return json(400, { ok: false, error: { code: 'BAD_REQUEST', message: 'selectedText is required' } })
-  if (selectedText.length > REWRITE_CAPS.selected) return json(413, { ok: false, error: { code: 'TOO_LARGE', message: `selection exceeds ${REWRITE_CAPS.selected} chars` } })
-
-  const route = scope.get('agentDefaultModel')?.currentSelection()
-  if (typeof route?.provider !== 'string' || route.provider === '' || typeof route?.model !== 'string' || route.model === '') {
-    return json(409, { ok: false, error: { code: 'MODEL_UNAVAILABLE', message: 'no default model is configured' } })
-  }
-
-  const framed = frameRewrite({
-    path,
-    language: typeof language === 'string' ? language : '',
-    instruction,
-    selectedText,
-    contextBefore: typeof contextBefore === 'string' ? contextBefore.slice(-REWRITE_CAPS.context) : '',
-    contextAfter: typeof contextAfter === 'string' ? contextAfter.slice(0, REWRITE_CAPS.context) : '',
-  })
-
-  const options = {
-    provider: route.provider,
-    model: route.model,
-    messages: [{ role: 'user', content: [{ type: 'text', text: framed }] }],
-    system: REWRITE_SYSTEM,
-    maxTokens: REWRITE_CAPS.maxTokens,
-    sessionId,
-    signal: request.signal,
-  }
-
-  return llmNdjsonStream(scope.llm, options, `改写模型 ${route.provider} / ${route.model}`)
-}
-
-/**
  * Handle one Tab-completion request: the ghost-text continuation at the
- * cursor, streamed as the same NDJSON frames as the rewrite route. One short
- * auxiliary call per user pause, cancelled the moment the user keeps typing.
+ * caret, streamed as NDJSON frames. One short auxiliary call per user pause,
+ * cancelled the moment the user keeps typing.
  * @param scope - injected Host services.
  * @param request - the buffered Fetch request the Connection dispatched.
  * @returns the streaming response, or a JSON rejection.
@@ -356,7 +270,7 @@ async function handleComplete(scope, request, config, settings) {
   if (typeof prefix !== 'string' || prefix.trim() === '') return json(400, { ok: false, error: { code: 'BAD_REQUEST', message: 'prefix is required' } })
 
   const liveSettings = settings?.describe?.({ redactSecrets: false })
-    ?.find((entry) => entry.ns === 'cursor-code')?.value
+    ?.find((entry) => entry.ns === 'code-workbench')?.value
   const preference = (field) => liveSettings?.[field] ?? config?.[field]?.get?.() ?? config?.[field]
   const completionProvider = liveSettings?.completionProvider ?? config?.completionProvider?.get?.() ?? config?.completionProvider
   const completionModel = liveSettings?.completionModel ?? config?.completionModel?.get?.() ?? config?.completionModel
@@ -378,7 +292,7 @@ async function handleComplete(scope, request, config, settings) {
   const framed = [
     `File: ${path}${typeof language === 'string' && language !== '' ? ` (${language})` : ''}`,
     '',
-    'Context JSON: { before, after }. "before" ends at the cursor and "after" starts at it. Output the code to insert between them.',
+    'Context JSON: { before, after }. "before" ends at the caret and "after" starts at it. Output the code to insert between them.',
     JSON.stringify({
       before: prefix.slice(-COMPLETE_CAPS.prefix),
       after: typeof suffix === 'string' ? suffix.slice(0, COMPLETE_CAPS.suffix) : '',
@@ -512,7 +426,7 @@ async function searchWorkspace(scope, workspaceRoot, params, signal) {
 
 /**
  * Handle one codebase search: bounded walk + line matching. This is the
- * retrieval behind Cursor-style Search and `@codebase`; results are plain
+ * retrieval behind `@codebase`; results are plain
  * `{ path, line, column, length, text }` rows the editor can jump to.
  * @param scope - injected Host services.
  * @param request - the buffered Fetch request the Connection dispatched.
@@ -577,7 +491,7 @@ function rankMatches(query, matches) {
 }
 
 /**
- * The Agent-facing retrieval tool (Cursor's `@codebase`): ranked snippets for a
+ * The Agent-facing retrieval tool (the `@codebase` tool): ranked snippets for a
  * natural query, complementary to the shipped `grep` (exact regex lines).
  * @param scope - injected Host services.
  * @returns the registry-ready tool definition.
@@ -744,7 +658,7 @@ async function handleRollback(scope, request) {
     const note = `回滚：恢复到 ${new Date(entry.at).toISOString()} 保存前的内容`
     journalWrite(sessionId, path, note, outcome, entry.before)
     try {
-      scope.get('sessionFeedback')?.record({ sessionId, text: `[cursor-code] ${note}（${path}）` })
+      scope.get('sessionFeedback')?.record({ sessionId, text: `[code-workbench] ${note}（${path}）` })
     } catch { /* remark is best-effort */ }
     return json(200, { ok: true, version: outcome.version, operation: outcome.operation })
   } catch (error) {
@@ -790,12 +704,12 @@ export function apply(ctx, config) {
   if (ctx.fiber) {
     ctx.inject(['settings'], (scope) => {
       runtime.settings = scope.settings
-      scope.effect(() => scope.settings.configure({ auto: false }, ctx.fiber), 'cursor-code: settings')
+      scope.effect(() => scope.settings.configure({ auto: false }, ctx.fiber), 'code-workbench: settings')
     })
   }
   ctx.inject(['connection', 'fs', 'sessions', 'llm', 'tools'], (scope) => {
     scope.effect(() => scope.connection.fetch.register({
-      path: '/api/cursor-code/file-operation', methods: ['POST'], requestBody: 'buffered',
+      path: '/api/code-workbench/file-operation', methods: ['POST'], requestBody: 'buffered',
       fetch: (request) => handleFileOperation(scope, request),
     }), 'code-workbench: file operations')
     scope.effect(() => scope.connection.fetch.register({
@@ -803,37 +717,31 @@ export function apply(ctx, config) {
       methods: ['POST'],
       requestBody: 'buffered',
       fetch: (request) => handleWrite(scope, request),
-    }), 'cursor-code: POST /api/cursor-code/write')
-    scope.effect(() => scope.connection.fetch.register({
-      path: REWRITE_PATH,
-      methods: ['POST'],
-      requestBody: 'buffered',
-      fetch: (request) => handleRewrite(scope, request),
-    }), 'cursor-code: POST /api/cursor-code/rewrite')
+    }), 'code-workbench: POST /api/code-workbench/write')
     scope.effect(() => scope.connection.fetch.register({
       path: COMPLETE_PATH,
       methods: ['POST'],
       requestBody: 'buffered',
       fetch: (request) => handleComplete(scope, request, config, runtime.settings),
-    }), 'cursor-code: POST /api/cursor-code/complete')
+    }), 'code-workbench: POST /api/code-workbench/complete')
     scope.effect(() => scope.connection.fetch.register({
       path: SEARCH_PATH,
       methods: ['POST'],
       requestBody: 'buffered',
       fetch: (request) => handleSearch(scope, request),
-    }), 'cursor-code: POST /api/cursor-code/search')
+    }), 'code-workbench: POST /api/code-workbench/search')
     scope.effect(() => scope.connection.fetch.register({
       path: HISTORY_PATH,
       methods: ['POST'],
       requestBody: 'buffered',
       fetch: (request) => handleHistory(scope, request),
-    }), 'cursor-code: POST /api/cursor-code/history')
+    }), 'code-workbench: POST /api/code-workbench/history')
     scope.effect(() => scope.connection.fetch.register({
       path: ROLLBACK_PATH,
       methods: ['POST'],
       requestBody: 'buffered',
       fetch: (request) => handleRollback(scope, request),
-    }), 'cursor-code: POST /api/cursor-code/rollback')
-    scope.effect(() => scope.tools.register(codebaseSearchTool(scope)), 'cursor-code: codebase_search tool')
+    }), 'code-workbench: POST /api/code-workbench/rollback')
+    scope.effect(() => scope.tools.register(codebaseSearchTool(scope)), 'code-workbench: codebase_search tool')
   })
 }

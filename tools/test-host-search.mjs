@@ -1,14 +1,14 @@
 /**
- * Host-half search-route test (`POST /api/cursor-code/search`).
+ * Host-half search-route test (`POST /api/code-workbench/search`).
  *
- * Pins the retrieval contract behind Cursor-style Search / @codebase:
+ * Pins the retrieval contract behind `@codebase`:
  * the bounded walk (ignored directories and extensions never scanned),
  * literal vs regex matching, the case toggle, and the caps that keep one
  * query from stalling the Host.
  *
  *   node tools/test-host-search.mjs
  */
-import { apply } from '../dsh-cursor-code/index.js'
+import { apply } from '../dsh-code-workbench/index.js'
 
 let failures = 0
 /** Assert one expectation. */
@@ -56,7 +56,7 @@ function makeScope(options = {}) {
   const calls = { routes: [] }
   const scope = {
     effect: (callback) => callback(),
-    llm: { async *stream() { /* rewrites only */ } },
+    llm: { async *stream() { /* unused in search tests */ } },
     tools: { register() { return () => {} } },
     connection: {
       admit: () => (options.unauthorized ? { rejection: 401 } : { peer: {} }),
@@ -94,12 +94,12 @@ function makeScope(options = {}) {
 function mount(options = {}) {
   const { scope, calls } = makeScope(options)
   apply({ inject: (names, callback) => callback(scope) })
-  return { route: calls.routes.find((r) => r.path === '/api/cursor-code/search'), calls }
+  return { route: calls.routes.find((r) => r.path === '/api/code-workbench/search'), calls }
 }
 
 /** Build one search POST request. */
 function makeRequest(body) {
-  return new Request('http://127.0.0.1/api/cursor-code/search', {
+  return new Request('http://127.0.0.1/api/code-workbench/search', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
@@ -117,8 +117,8 @@ console.log('wiring')
 {
   const { route, calls } = mount()
   check('registers the search route', route !== undefined)
-  check('every route is mounted', ['/api/cursor-code/write', '/api/cursor-code/rewrite', '/api/cursor-code/search',
-    '/api/cursor-code/complete', '/api/cursor-code/history', '/api/cursor-code/rollback']
+  check('every route is mounted', ['/api/code-workbench/write', '/api/code-workbench/file-operation', '/api/code-workbench/search',
+    '/api/code-workbench/complete', '/api/code-workbench/history', '/api/code-workbench/rollback']
     .every((p) => calls.routes.some((r) => r.path === p)), calls.routes.map((r) => r.path))
   check('accepts POST buffered', route?.methods?.[0] === 'POST' && route?.requestBody === 'buffered')
 }

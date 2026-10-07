@@ -11,9 +11,9 @@
  */
 import fs from 'node:fs'
 import { createRequire } from 'node:module'
-import { splitSnippets } from '../dsh-cursor-code/src/snippets.mjs'
+import { splitSnippets } from '../dsh-code-workbench/src/snippets.mjs'
 
-const requireFrom = createRequire(new URL('../dsh-cursor-code/package.json', import.meta.url))
+const requireFrom = createRequire(new URL('../dsh-code-workbench/package.json', import.meta.url))
 const React = requireFrom('react')
 const TestRenderer = requireFrom('react-test-renderer')
 const { act, create } = TestRenderer
@@ -35,6 +35,37 @@ function check(label, condition, detail) {
 // Environment stubs: minimal DOM for the bundle prelude, MutationObserver for
 // the theme probe, and a recording fake Monaco namespace.
 // ---------------------------------------------------------------------------
+// A listener registry, not a no-op: the composer drop interceptor installs
+// capture-phase listeners on `document`, and the drag flow below dispatches
+// through it. Capture listeners are kept separately so a test can prove the
+// plugin settles the gesture before any bubble-phase handler would see it.
+const documentListeners = { capture: [], bubble: [] }
+function addDocumentListener(type, handler, capture) {
+  documentListeners[capture === true ? 'capture' : 'bubble'].push({ type, handler })
+}
+function removeDocumentListener(type, handler, capture) {
+  const list = documentListeners[capture === true ? 'capture' : 'bubble']
+  const index = list.findIndex((row) => row.type === type && row.handler === handler)
+  if (index >= 0) list.splice(index, 1)
+}
+/** Dispatch a synthetic event and report the listeners that ran. */
+function dispatchDocument(type, event) {
+  const ran = []
+  for (const row of [...documentListeners.capture]) {
+    if (row.type !== type) continue
+    row.handler(event)
+    ran.push({ phase: 'capture', handler: row.handler })
+    if (event.__stoppedPropagation === true) return ran
+  }
+  for (const row of [...documentListeners.bubble]) {
+    if (row.type !== type) continue
+    row.handler(event)
+    ran.push({ phase: 'bubble', handler: row.handler })
+    if (event.__stoppedPropagation === true) return ran
+  }
+  return ran
+}
+
 globalThis.document = {
   head: { appendChild() {} },
   createElement: () => ({
@@ -43,6 +74,8 @@ globalThis.document = {
   }),
   getElementById: () => null,
   body: { hasAttribute: () => false },
+  addEventListener: addDocumentListener,
+  removeEventListener: removeDocumentListener,
 }
 globalThis.window = {
   __ModuleLoader__: {
@@ -128,7 +161,10 @@ const fakeEditor = {
   },
   getModel: () => currentModel,
   getValue: () => (currentModel ?? fakeModel).getValue(),
-  addCommand() {},
+  addCommand(keybinding, handler) {
+    calls.commands ??= []
+    calls.commands.push({ keybinding, handler })
+  },
   getSelection: () => ({
     isEmpty: () => selectionEmpty,
     startLineNumber: 3,
@@ -192,14 +228,14 @@ const fakeMonaco = {
   },
   Uri: { parse: (value) => ({ toString: () => value }) },
   KeyMod: { CtrlCmd: 2048 },
-  KeyCode: { KeyS: 49, KeyK: 46 },
+  KeyCode: { KeyS: 49, KeyL: 47, KeyK: 46 },
 }
-globalThis.__CURSOR_CODE_TEST_MONACO__ = fakeMonaco
+globalThis.__CODE_WORKBENCH_TEST_MONACO__ = fakeMonaco
 
 // ---------------------------------------------------------------------------
 // Load the shipped bundle and capture the tab body through the real apply().
 // ---------------------------------------------------------------------------
-const source = fs.readFileSync(new URL('../dsh-cursor-code/client.js', import.meta.url), 'utf8')
+const source = fs.readFileSync(new URL('../dsh-code-workbench/client.js', import.meta.url), 'utf8')
 // eslint-disable-next-line no-new-func
 new Function(source)()
 const bundle = globalThis.__factory((specifier) => {
@@ -255,7 +291,7 @@ bundle.apply({
   },
 })
 const CodePanel = registered.slots.find((row) => row.options?.name === 'sidebar.right.pane.tab')?.component
-const SettingsPanel = registered.slots.find((row) => row.options?.name === 'settings.cursor-code.item')?.component
+const SettingsPanel = registered.slots.find((row) => row.options?.name === 'settings.code-workbench.item')?.component
 
 // ---------------------------------------------------------------------------
 // Recording Remote stubs and a fetch stub that answers each endpoint.
@@ -348,10 +384,27 @@ check('the panel shell renders', allText().includes('保存 (Ctrl+S)') && allTex
 check('the tree lists the workspace root', allText().includes('a.js') && allText().includes('sub'), calls.list)
 check('the root listing used the session cwd', calls.list[0] === 'C:\\repo', calls.list)
 check('the editor mounted', calls.editorCreate === 1, calls.editorCreate)
+check('editor commands retain save and Add to Chat without inline editing',
+  JSON.stringify(calls.commands?.map((row) => row.keybinding)) === JSON.stringify([
+    fakeMonaco.KeyMod.CtrlCmd | fakeMonaco.KeyCode.KeyS,
+    fakeMonaco.KeyMod.CtrlCmd | fakeMonaco.KeyCode.KeyL,
+  ]), calls.commands?.map((row) => row.keybinding))
+check('inline editing is absent from the interface and shortcut catalog',
+  !allText().includes('改写') && !registered.shortcuts.some((row) => row.id === 'code-workbench.rewrite'))
 
 console.log('\nopen a file from the tree')
 const fileRow = findAll(tree(), (n) => n.type === 'div' && n.props.title === 'C:\\repo\\a.js')[0]
 check('the file row is clickable', fileRow !== undefined)
+check('file row exposes themed hover styling without an inline background override',
+  fileRow?.props.className === 'code-workbench-tree-row' && fileRow.props.style.background === undefined)
+const folderRow = findAll(tree(), (n) => n.type === 'div' && n.props.title === 'C:\\repo\\sub')[0]
+check('folders share the hover frame and keyboard focus styling',
+  folderRow?.props.className === 'code-workbench-tree-row' && folderRow.props.tabIndex === 0)
+const css = fs.readFileSync(new URL('../dsh-code-workbench/src/workbench.css', import.meta.url), 'utf8')
+check('hover uses theme background and an inset frame without layout shifts',
+  /\.code-workbench-tree-row:hover\s*\{[^}]*background:\s*var\(--dsw-alias-interactive-bg-hover\);[^}]*box-shadow:\s*inset 0 0 0 1px var\(--dsw-alias-border-l2\);/s.test(css))
+check('active row has a separate brand-colored frame',
+  /\.code-workbench-tree-row\[data-active="true"\]\s*\{[^}]*box-shadow:\s*inset 0 0 0 1px var\(--dsw-alias-brand-primary\);/s.test(css))
 await act(async () => {
   fileRow.props.onClick()
 })
@@ -360,6 +413,10 @@ check('the file was read through workspaceFiles', calls.read.at(-1) === 'C:\\rep
 check('the editor model carries the content and language',
   calls.models.at(-1)?.language === 'javascript' && calls.models.at(-1)?.text.includes('needle'), calls.models.at(-1))
 check('status reports the open file', allText().includes('2 行'), allText().slice(-60))
+const activeTreeRows = findAll(tree(), (n) => n.props.className === 'code-workbench-tree-row' && n.props['data-active'] === true)
+check('opening a file marks only its tree row active',
+  activeTreeRows.length === 1 && activeTreeRows[0].props.title === 'C:\\repo\\a.js',
+  activeTreeRows.map((n) => ({ title: n.props.title, active: n.props['data-active'] })))
 
 console.log('\nversion check fallback')
 const readsBeforePolling = calls.read.length
@@ -380,7 +437,7 @@ await act(async () => {
   suggestions = await calls.completionProvider.provideInlineCompletions(currentModel, { lineNumber: 1, column: 17 }, {}, completionToken)
 })
 check('provider implements the installed Monaco disposal API', typeof calls.completionProvider.disposeInlineCompletions === 'function')
-check('provider sends cursor context to the completion route', calls.fetch.at(-1)?.url === '/api/cursor-code/complete' && calls.fetch.at(-1)?.body.prefix.length === 16)
+check('provider sends caret context to the completion route', calls.fetch.at(-1)?.url === '/api/code-workbench/complete' && calls.fetch.at(-1)?.body.prefix.length === 16)
 check('streamed completion becomes an insertion suggestion', suggestions?.items?.[0]?.insertText === ' + 1', suggestions)
 check('completion status is visible', allText().includes('Tab 接受 AI 建议'))
 globalThis.fetch = async () => new Response(JSON.stringify({ error: { message: 'model unavailable' } }), { status: 409 })
@@ -552,12 +609,128 @@ check('the chip is a compact label, not the code',
 check('the chip carries the code in its private ref payload',
   insert?.payload.reference.ref.code.includes('const needle = 1'), insert?.payload.reference.ref)
 check('the chip insertion used a captured draft span', insert?.payload.span?.draftRev === 1, insert?.payload.span)
-const codec = registered.sources.find((source) => source.name === 'cursor-code')?.codec
+const codec = registered.sources.find((source) => source.name === 'code-workbench')?.codec
 const expanded = await codec?.serialize(insert?.payload.reference.ref)
 check('submit-time codec expands the chip to the anchored fenced code',
   expanded?.includes('a.js:3-5') && expanded.includes('```javascript') && expanded.includes('const needle = 1'),
   expanded)
 check('status reports the add', allText().includes('已添加到对话'), allText().slice(-80))
+
+console.log('\ndrag a tree row onto the composer (drop -> reference chip)')
+const dragMime = 'application/x-code-workbench-tree'
+// The search/jump flow above left the left pane on the search view; the drag
+// gesture starts from a tree row, so bring the file tree back first.
+await act(async () => {
+  findAll(tree(), (n) => n.type === 'button' && n.props['aria-label'] === '文件')[0].props.onClick()
+})
+await act(async () => {})
+// A composer input as the real client renders it: `data-composer-input` on the
+// contenteditable root (`ComposerContentEditable` in dsh-client-ui-conversation).
+const composerInput = { closest: (selector) => (selector === '[data-composer-input]' ? {} : null) }
+const outsideInput = { closest: () => null }
+function makeDataTransfer(entries) {
+  const store = new Map(entries)
+  return {
+    types: [...store.keys()],
+    effectAllowed: 'unset',
+    dropEffect: 'unset',
+    setData: (kind, value) => store.set(kind, value),
+    getData: (kind) => store.get(kind) ?? '',
+  }
+}
+function makeEvent(type, { dataTransfer, target }) {
+  return {
+    type, dataTransfer, target,
+    __stoppedPropagation: false,
+    __prevented: false,
+    preventDefault() { this.__prevented = true },
+    stopPropagation() { this.__stoppedPropagation = true },
+  }
+}
+const treeRowFor = (title) => findAll(tree(), (n) => n.props?.className === 'code-workbench-tree-row' && n.props.title === title)[0]
+const fileRowProps = treeRowFor('C:\\repo\\a.js').props
+check('every tree row is a drag source', fileRowProps.draggable === true && typeof fileRowProps.onDragStart === 'function')
+
+const dragTransfer = makeDataTransfer([])
+await act(async () => {
+  fileRowProps.onDragStart({ dataTransfer: dragTransfer })
+})
+check('the row publishes its workspace-relative path under the private flavor',
+  dragTransfer.getData(dragMime) === 'fa.js', dragTransfer.getData(dragMime))
+check('the drag advertises a copy operation', dragTransfer.effectAllowed === 'copy', dragTransfer.effectAllowed)
+check('a plain-text fallback rides along for non-composer targets',
+  dragTransfer.getData('text/plain') === 'a.js', dragTransfer.getData('text/plain'))
+
+const folderRowProps = treeRowFor('C:\\repo\\sub').props
+const folderTransfer = makeDataTransfer([])
+await act(async () => { folderRowProps.onDragStart({ dataTransfer: folderTransfer }) })
+check('a dropped directory is marked as one', folderTransfer.getData(dragMime) === 'dsub', folderTransfer.getData(dragMime))
+
+// Dragging over the composer must be claimed (preventDefault) so the browser
+// shows a copy affordance instead of refusing the drop.
+const dragOverEvent = makeEvent('dragover', { dataTransfer: makeDataTransfer([[dragMime, 'fa.js']]), target: composerInput })
+await act(async () => { dispatchDocument('dragover', dragOverEvent) })
+check('dragover over the composer is claimed with a copy affordance',
+  dragOverEvent.__prevented === true && dragOverEvent.dataTransfer.dropEffect === 'copy', dragOverEvent.dataTransfer.dropEffect)
+
+const bailCountBeforeDrop = calls.bailed.length
+const dropEvent = makeEvent('drop', { dataTransfer: makeDataTransfer([[dragMime, 'fa.js'], ['text/plain', 'a.js']]), target: composerInput })
+const ranForDrop = await act(async () => dispatchDocument('drop', dropEvent))
+check('the drop is claimed in the capture phase and stopped before Lexical sees it',
+  dropEvent.__prevented === true && dropEvent.__stoppedPropagation === true, { prevented: dropEvent.__prevented, stopped: dropEvent.__stoppedPropagation })
+check('a capture listener handled the drop, not a bubble one',
+  ranForDrop.length === 1 && ranForDrop[0].phase === 'capture', ranForDrop.map((row) => row.phase))
+const dropped = calls.bailed.at(-1)
+check('the drop produced exactly one reference insert', calls.bailed.length === bailCountBeforeDrop + 1, calls.bailed.length)
+check('the dropped row goes through the reference-insert channel',
+  dropped?.event === 'slash/input-insert-reference', dropped?.event)
+check('the chip carries a path-only reference for the dropped file',
+  dropped?.payload.reference.ref.path === 'a.js'
+  && dropped.payload.reference.ref.pathOnly === true
+  && dropped.payload.reference.ref.directory === false
+  && dropped.payload.reference.label === 'a.js', dropped?.payload.reference)
+check('the drop reuses the captured draft span', dropped?.payload.span?.draftRev === 1, dropped?.payload.span)
+check('status reports the dropped file', allText().includes('已添加到对话：a.js'), allText().slice(-80))
+
+// A directory drop carries the trailing-slash label so the chip reads as a folder.
+const folderDrop = makeEvent('drop', { dataTransfer: makeDataTransfer([[dragMime, 'dsub']]), target: composerInput })
+await act(async () => { dispatchDocument('drop', folderDrop) })
+const droppedDir = calls.bailed.at(-1)
+check('a dropped directory lands as a directory reference',
+  droppedDir?.payload.reference.ref.directory === true && droppedDir.payload.reference.label === 'sub/',
+  droppedDir?.payload.reference)
+
+// Narrowness: the interceptor must never swallow gestures that are not ours.
+const outsideDrop = makeEvent('drop', { dataTransfer: makeDataTransfer([[dragMime, 'fa.js']]), target: outsideInput })
+await act(async () => { dispatchDocument('drop', outsideDrop) })
+check('a drop outside the composer is left alone', outsideDrop.__prevented === false && outsideDrop.__stoppedPropagation === false)
+
+const fileDrop = makeDataTransfer([['Files', ''], [dragMime, 'fa.js']])
+const fileDropEvent = makeEvent('drop', { dataTransfer: fileDrop, target: composerInput })
+await act(async () => { dispatchDocument('drop', fileDropEvent) })
+check('a real OS file drop is left to the attachment pipeline',
+  fileDropEvent.__prevented === false && fileDropEvent.__stoppedPropagation === false)
+
+const foreignEvent = makeEvent('drop', { dataTransfer: makeDataTransfer([['text/plain', 'hello']]), target: composerInput })
+await act(async () => { dispatchDocument('drop', foreignEvent) })
+check('an unrelated same-shape text drag is left to Lexical', foreignEvent.__prevented === false)
+
+const bailCountBeforeBusy = calls.bailed.length
+const originalScope = props['sessions.scope']
+const insertCountBeforeBusy = calls.bailed.length
+await act(async () => {
+  // A composer still accepting events but with no resolvable scope: the drop
+  // must degrade with a message, not throw and not insert.
+  fakeActx.bail = () => false
+})
+const busyDrop = makeEvent('drop', { dataTransfer: makeDataTransfer([[dragMime, 'fa.js']]), target: composerInput })
+await act(async () => { dispatchDocument('drop', busyDrop) })
+check('a busy composer reports the failure instead of throwing',
+  allText().includes('添加失败'), allText().slice(-80))
+fakeActx.bail = (self, event, payload) => { calls.bailed.push({ event, payload }); return true }
+check('the busy path did not append a chip', calls.bailed.length === insertCountBeforeBusy, calls.bailed.length)
+props['sessions.scope'] = originalScope
+void bailCountBeforeBusy
 
 console.log('\ncompact sent reference')
 const Chat = registered.slots.find((row) => row.options.name === 'conversation.chat.node' && row.options.key === 'user')?.component

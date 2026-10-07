@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import * as disk from 'node:fs/promises'
 import path from 'node:path'
 import os from 'node:os'
-import { apply } from '../dsh-cursor-code/index.js'
+import { apply } from '../dsh-code-workbench/index.js'
 
 const root = await disk.mkdtemp(path.join(os.tmpdir(), 'workbench-test-'))
 const routes = []
@@ -21,7 +21,7 @@ const scope = {
 }
 apply({ inject: (names, callback) => callback(scope) })
 const route = routes.find((entry) => entry.path.endsWith('/file-operation'))
-const operation = async (kind, source, destination) => (await route.fetch(new Request('http://localhost/api/cursor-code/file-operation', { method: 'POST', body: JSON.stringify({ sessionId: 'test', operation: kind, path: source, destination }) }))).json()
+const operation = async (kind, source, destination) => (await route.fetch(new Request('http://localhost/api/code-workbench/file-operation', { method: 'POST', body: JSON.stringify({ sessionId: 'test', operation: kind, path: source, destination }) }))).json()
 try {
   const folder = path.join(root, 'folder')
   const original = path.join(folder, 'original.txt')

@@ -1,12 +1,12 @@
 export function serializeSnippet(anchor, language, code) {
   const runs = code.match(/`+/g) ?? []
   const fence = '`'.repeat(Math.max(3, ...runs.map((run) => run.length + 1)))
-  return `\n<!-- cursor-code-snippet ${JSON.stringify({ anchor, language })} -->\n${fence}${language}\n${code}\n${fence}\n<!-- /cursor-code-snippet -->\n`
+  return `\n<!-- code-workbench-snippet ${JSON.stringify({ anchor, language })} -->\n${fence}${language}\n${code}\n${fence}\n<!-- /code-workbench-snippet -->\n`
 }
 
 export function splitSnippets(text) {
   const parts = []
-  const pattern = /<!--\s*cursor-code-snippet\s+([\s\S]*?)\s*-->\s*\r?\n\s*(`{3,})[^\r\n]*\r?\n([\s\S]*?)\r?\n\s*\2\s*\r?\n\s*<!--\s*\/cursor-code-snippet\s*-->/g
+  const pattern = /<!--\s*code-workbench-snippet\s+([\s\S]*?)\s*-->\s*\r?\n\s*(`{3,})[^\r\n]*\r?\n([\s\S]*?)\r?\n\s*\2\s*\r?\n\s*<!--\s*\/code-workbench-snippet\s*-->/g
   let offset = 0
   for (const match of text.matchAll(pattern)) {
     let metadata
