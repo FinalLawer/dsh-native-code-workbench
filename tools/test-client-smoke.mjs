@@ -856,7 +856,10 @@ await act(async () => {
 })
 check('the row publishes its workspace-relative path under the private flavor',
   dragTransfer.getData(dragMime) === 'fa.js', dragTransfer.getData(dragMime))
-check('the drag advertises a copy operation', dragTransfer.effectAllowed === 'copy', dragTransfer.effectAllowed)
+// The drag serves two drop targets: the composer (a copy into the chat) and the
+// tree itself (a move into a folder). So it advertises both effects and lets
+// each target pick; advertising only `copy` would make the tree refuse a move.
+check('the drag advertises both copy and move', dragTransfer.effectAllowed === 'copyMove', dragTransfer.effectAllowed)
 check('a plain-text fallback rides along for non-composer targets',
   dragTransfer.getData('text/plain') === 'a.js', dragTransfer.getData('text/plain'))
 
@@ -1186,6 +1189,156 @@ await act(async () => { settingsRenderer.unmount() })
 
 console.log('\nshortcut rows published')
 check('editor shortcuts are in the shell catalog', registered.shortcuts.length >= 3, registered.shortcuts.map((row) => row.id))
+
+console.log('\nmulti-select')
+// The settings suite above left the left pane on its own view; every block from
+// here on drives tree rows, so bring the file tree back first.
+await act(async () => { findAll(tree(), (n) => n.type === 'button' && n.props['aria-label'] === '文件')[0].props.onClick() })
+await act(async () => {})
+// The tree's primary selection lives in `selected`, with the *additional* rows in
+// a separate set, so a plain click keeps meaning exactly what it always did.
+const treeBodyEl = () => findAll(tree(), (node) => node.props?.className === 'code-workbench-tree-body')[0]
+const rowNodeFor = (title) => findAll(tree(), (node) => node.props?.className === 'code-workbench-tree-row' && node.props.title === title)[0]
+const selectedTitles = () => findAll(tree(), (node) => node.props?.className === 'code-workbench-tree-row' && node.props['aria-selected'] === true).map((node) => node.props.title)
+await act(async () => { rowNodeFor('C:\\repo\\a.js').props.onClick({}) })
+await act(async () => {})
+await act(async () => { rowNodeFor('C:\\repo\\b.js').props.onClick({ ctrlKey: true }) })
+await act(async () => {})
+check('Ctrl-click adds a row to the selection',
+  selectedTitles().length === 2 && selectedTitles().includes('C:\\repo\\a.js') && selectedTitles().includes('C:\\repo\\b.js'),
+  selectedTitles())
+check('Ctrl-click keeps the primary selection on the first row',
+  rowNodeFor('C:\\repo\\a.js').props['data-selected'] === true && rowNodeFor('C:\\repo\\b.js').props['data-selected'] === false)
+await act(async () => { rowNodeFor('C:\\repo\\b.js').props.onClick({ ctrlKey: true }) })
+await act(async () => {})
+check('Ctrl-clicking a selected row removes it again',
+  selectedTitles().length === 1 && selectedTitles().includes('C:\\repo\\a.js'), selectedTitles())
+// Shift-click takes the visual range between the anchor and the clicked row.
+await act(async () => { rowNodeFor('C:\\repo\\a.js').props.onClick({}) })
+await act(async () => { rowNodeFor('C:\\repo\\sub').props.onClick({ shiftKey: true }) })
+await act(async () => {})
+check('Shift-click selects the whole range between the two rows',
+  selectedTitles().length === 3, selectedTitles())
+await act(async () => { rowNodeFor('C:\\repo\\b.js').props.onClick({}) })
+await act(async () => {})
+check('a plain click collapses back to a single row',
+  selectedTitles().length === 1 && selectedTitles().includes('C:\\repo\\b.js'), selectedTitles())
+// A modifier-click builds a selection; it must not also open the file or toggle
+// a folder, which is what a plain click does.
+await act(async () => { rowNodeFor('C:\\repo\\a.js').props.onClick({}) })
+await act(async () => {})
+const activeBeforeModifier = textOf(findAll(tree(), (node) => node.props?.className?.includes('code-workbench-tab') && node.props.className.includes('active'))[0])
+await act(async () => { rowNodeFor('C:\\repo\\sub').props.onClick({ ctrlKey: true }) })
+await act(async () => {})
+check('a modifier-click does not open a file or expand a folder',
+  rowNodeFor('C:\\repo\\sub').props['aria-expanded'] === false
+  && textOf(findAll(tree(), (node) => node.props?.className?.includes('code-workbench-tab') && node.props.className.includes('active'))[0]) === activeBeforeModifier,
+  { expanded: rowNodeFor('C:\\repo\\sub').props['aria-expanded'], before: activeBeforeModifier })
+
+// Deleting a multi-selection is one confirmation for the whole batch, and the
+// dialog names what is about to go so the user can still back out.
+await act(async () => { rowNodeFor('C:\\repo\\a.js').props.onClick({}) })
+await act(async () => {})
+await act(async () => { rowNodeFor('C:\\repo\\sub').props.onClick({ ctrlKey: true }) })
+await act(async () => {})
+check('the batch to delete is two rows', selectedTitles().length === 2, selectedTitles())
+const deletesBeforeBatch = calls.fetch.filter((call) => call.body?.operation === 'delete').length
+await act(async () => { treeBodyEl().props.onKeyDown({ key: 'Delete', preventDefault() {}, stopPropagation() {} }) })
+await act(async () => {})
+const batchDialog = textOf(findAll(tree(), (node) => node.props?.className === 'code-workbench-dialog-title')[0])
+check('a multi-delete asks once and names how many',
+  batchDialog.includes('2 个项目'), batchDialog)
+check('a multi-delete issues nothing before it is confirmed',
+  calls.fetch.filter((call) => call.body?.operation === 'delete').length === deletesBeforeBatch)
+
+console.log('\nindent guides show the selection ancestry')
+const railsOn = (title) => findAll(rowNodeFor(title), (node) => node.props?.className === 'code-workbench-tree-rail' && node.props['data-on'] === 'true').length
+const railsTotal = (title) => findAll(rowNodeFor(title), (node) => node.props?.className === 'code-workbench-tree-rail').length
+// A root-level row has no rails at all: there is no ancestry to draw.
+check('a root row has no indent rails', railsTotal('C:\\repo\\a.js') === 0, railsTotal('C:\\repo\\a.js'))
+// Open the folder so a depth-1 row exists to inspect.
+if (rowNodeFor('C:\\repo\\sub').props['aria-expanded'] !== true) {
+  await act(async () => { rowNodeFor('C:\\repo\\sub').props.onClick({}) })
+  await act(async () => {})
+}
+check('the child row exists once its folder is open', rowNodeFor('C:\\repo\\sub\\a.js') !== undefined)
+await act(async () => { treeBodyEl().props.onMouseEnter() })
+await act(async () => {})
+check('while the pointer is over the list a child row lights all its rails',
+  railsOn('C:\\repo\\sub\\a.js') === railsTotal('C:\\repo\\sub\\a.js') && railsTotal('C:\\repo\\sub\\a.js') === 1,
+  { on: railsOn('C:\\repo\\sub\\a.js'), total: railsTotal('C:\\repo\\sub\\a.js') })
+// Leaving the list keeps only the primary selection's ancestry lit.
+// Select the child directly: clicking the folder row would collapse it and take
+// the very row under test off screen.
+await act(async () => { rowNodeFor('C:\\repo\\sub\\a.js').props.onClick({}) })
+await act(async () => {})
+check('the child row survives the selection', rowNodeFor('C:\\repo\\sub\\a.js') !== undefined)
+await act(async () => { treeBodyEl().props.onMouseLeave() })
+await act(async () => {})
+check('a child of the selection keeps its ancestor rail lit after the pointer leaves',
+  railsOn('C:\\repo\\sub\\a.js') === 1, { on: railsOn('C:\\repo\\sub\\a.js'), total: railsTotal('C:\\repo\\sub\\a.js') })
+check('an unrelated sibling loses its rails once the pointer leaves',
+  railsOn('C:\\repo\\sub\\b.js') === 0, { on: railsOn('C:\\repo\\sub\\b.js'), total: railsTotal('C:\\repo\\sub\\b.js') })
+// Put the pointer back inside for the drag block, which expects the full tree.
+await act(async () => { treeBodyEl().props.onMouseEnter() })
+await act(async () => {})
+
+console.log('\ndrag a tree row onto a folder to move it')
+const moveTransfer = (entries = []) => makeDataTransfer(entries)
+await act(async () => { rowNodeFor('C:\\repo\\a.js').props.onClick({}) })
+await act(async () => {})
+const moveDrag = moveTransfer()
+await act(async () => { rowNodeFor('C:\\repo\\a.js').props.onDragStart({ dataTransfer: moveDrag }) })
+check('starting a drag on a selected row records the move',
+  moveDrag.effectAllowed === 'copyMove', moveDrag.effectAllowed)
+// A folder accepts the drop and issues a rename into itself.
+const overEvent = () => ({ dataTransfer: { dropEffect: 'unset' }, __prevented: false, preventDefault() { this.__prevented = true }, stopPropagation() {} })
+const over = overEvent()
+await act(async () => { rowNodeFor('C:\\repo\\sub').props.onDragOver(over) })
+check('a folder accepts a hovered drop', over.__prevented === true)
+const movesBefore = calls.fetch.filter((call) => call.body?.operation === 'rename').length
+const drop = overEvent()
+await act(async () => { rowNodeFor('C:\\repo\\sub').props.onDrop(drop) })
+await act(async () => {})
+const moveCalls = calls.fetch.filter((call) => call.body?.operation === 'rename').slice(movesBefore)
+check('dropping onto a folder moves the file into it',
+  moveCalls.length === 1 && moveCalls[0].body.path === 'C:\\repo\\a.js' && moveCalls[0].body.destination === 'C:\\repo\\sub\\a.js',
+  moveCalls.map((call) => call.body))
+// A file is not a drop target: it has no children to move into. The drop lands
+// on a FILE row here, so nothing should be issued.
+const fileDrag = moveTransfer()
+await act(async () => { rowNodeFor('C:\\repo\\b.js').props.onDragStart({ dataTransfer: fileDrag }) })
+const beforeFileDrop = calls.fetch.filter((call) => call.body?.operation === 'rename').length
+const fileDropEvent2 = overEvent()
+await act(async () => { rowNodeFor('C:\\repo\\a.js').props.onDrop(fileDropEvent2) })
+await act(async () => {})
+check('dropping a file onto another file does nothing',
+  calls.fetch.filter((call) => call.body?.operation === 'rename').length === beforeFileDrop
+  && fileDropEvent2.__prevented === false,
+  { prevented: fileDropEvent2.__prevented })
+// A folder cannot be dropped into itself or into its own descendants.
+const selfDrag = moveTransfer()
+await act(async () => { rowNodeFor('C:\\repo\\sub').props.onDragStart({ dataTransfer: selfDrag }) })
+const beforeSelf = calls.fetch.filter((call) => call.body?.operation === 'rename').length
+const selfDrop = overEvent()
+await act(async () => { rowNodeFor('C:\\repo\\sub').props.onDrop(selfDrop) })
+await act(async () => {})
+check('a folder refuses to drop into itself',
+  calls.fetch.filter((call) => call.body?.operation === 'rename').length === beforeSelf)
+
+console.log('\nrefreshing keeps the tree open and the user in place')
+// Collapse everything, then reopen a folder, then refresh: the open folder must
+// stay open. A refresh that collapsed the tree would make the button unusable.
+await act(async () => { findAll(tree(), (node) => node.type === 'button' && node.props['aria-label'] === '全部折叠')[0].props.onClick() })
+await act(async () => {})
+check('collapse-all closes every folder', rowNodeFor('C:\\repo\\sub').props['aria-expanded'] === false)
+await act(async () => { rowNodeFor('C:\\repo\\sub').props.onClick({}) })
+await act(async () => {})
+check('the folder is open again before the refresh', rowNodeFor('C:\\repo\\sub').props['aria-expanded'] === true)
+await act(async () => { findAll(tree(), (node) => node.type === 'button' && node.props['aria-label'] === '刷新文件树')[0].props.onClick() })
+await act(async () => {})
+check('refreshing keeps the folder open instead of collapsing it',
+  rowNodeFor('C:\\repo\\sub').props['aria-expanded'] === true)
 
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURE(S)`)
 await act(async () => { renderer.unmount() })

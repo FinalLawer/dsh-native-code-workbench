@@ -45,6 +45,21 @@
   outline: 2px solid var(--dsw-alias-brand-primary);
   outline-offset: -2px;
 }
+/* The indent rails that draw a row's ancestry. Each rail is an absolutely
+   positioned 1px column on the row, so the row must be `position: relative`
+   (set inline, next to `rowStyle`). Rails are always laid out and occupy no
+   flow space, which keeps indentation identical whether they paint or not.
+   `data-on` is what toggles them: every rail while the pointer is over the row
+   list, only the selection's ancestry once it leaves. */
+.code-workbench-tree-rail {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--dsw-alias-border-l2);
+  pointer-events: none;
+}
+.code-workbench-tree-rail[data-on="false"] { background: transparent; }
 /* The row scroller. It is focusable only as a programmatic landing spot, never
    a tab stop, so the keyboard path runs through the rows themselves. */
 .code-workbench-tree-body { outline: none; min-height: 0; }

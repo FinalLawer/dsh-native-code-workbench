@@ -233,6 +233,41 @@ const rowStyle = (depth) => ({
   textOverflow: 'ellipsis',
 })
 
+/** The indent step, in px, shared by `rowStyle`'s padding and the guide rails. */
+const INDENT = 12
+/** Left padding of a row before its depth indentation, mirroring `rowStyle`. */
+const ROW_PADDING = 8
+
+/**
+ * The indent rails that draw a row's ancestry.
+ *
+ * There is one rail per depth level to the row's left. A rail is a 1px column
+ * painted at the horizontal centre of the level it belongs to, which is where a
+ * VS Code-style guide sits. Rails are always laid out — they occupy real space so
+ * indentation is stable — but only the ones whose `data-on` is true are painted,
+ * which is what lets the tree show either the whole hierarchy (while the pointer
+ * is over the rows) or just the selected row's ancestry (once it leaves).
+ *
+ * @param depth - the row's depth; a root row (0) has no rails.
+ * @param onCount - how many rails, counting from the innermost, should paint.
+ * @returns an array of rail spans, outermost first.
+ */
+const guideRails = (depth, onCount) => {
+  const rails = []
+  for (let level = 0; level < depth; level++) {
+    // The innermost rail is `depth - 1`; a rail counts as on when it is within
+    // `onCount` of the innermost one.
+    const on = level >= depth - onCount
+    rails.push(h('span', {
+      key: `rail-${level}`,
+      className: 'code-workbench-tree-rail',
+      'data-on': on ? 'true' : 'false',
+      style: { left: `${ROW_PADDING + level * INDENT + INDENT / 2}px` },
+    }))
+  }
+  return rails
+}
+
 function icon(kind) {
   return kind === 'directory' ? '▸' : '·'
 }
@@ -268,6 +303,40 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
    */
   const [selected, setSelected] = useState(null)
   /**
+   * The extra rows a modifier-click has added to the selection.
+   *
+   * The tree's primary selection stays in `selected` so every existing caller —
+   * the toolbar's create target, the keyboard cursor, the context menu — keeps
+   * working unchanged. This set only ever holds the *additional* rows, so a
+   * plain click (which clears it) restores single-selection semantics exactly.
+   * Entries are `{path, isDir}` keyed by `path:isDir`, matching `selectedKey`.
+   */
+  const [extraSelection, setExtraSelection] = useState(() => new Set())
+  /** Where a Shift range starts from; see `selectRow`. */
+  const selectionAnchorRef = useRef(null)
+  /**
+   * Whether the pointer is currently over the row list.
+   *
+   * The indentation rails show either the whole hierarchy (pointer inside) or
+   * just the selected row's ancestry (pointer outside), so the tree needs to
+   * know which side of that line it is on. Tracked with React state rather than
+   * CSS `:hover` because the choice affects *sibling* rows: a rail on the
+   * selected row must stay painted while the pointer sits over a different row.
+   */
+  const [pointerInTree, setPointerInTree] = useState(false)
+  /** The folder a drag is currently hovering, so its row can show a drop hint. */
+  const [dropTarget, setDropTarget] = useState(null)
+  /**
+   * The in-flight drag, or null.
+   *
+   * `dataTransfer` is not readable during `dragover` for security, so the tree
+   * remembers what it is dragging in a ref. `path` drives the "cannot drop into
+   * yourself" check and `sources` is what a drop actually moves.
+   */
+  const dragRef = useRef(null)
+  /** The scrolling row list, so a refresh can hold the user's place. */
+  const scrollerRef = useRef(null)
+  /**
    * An in-tree name field, in place of a modal dialog.
    *
    * VS Code creates and renames *inside the tree*: the row itself becomes a
@@ -300,7 +369,25 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
   }, [list])
 
   useEffect(() => { load(cwd) }, [cwd, load])
-  useEffect(() => { for (const dir of expanded) load(dir) }, [refreshRevision, list])
+  /**
+   * Reload every open directory when the revision changes.
+   *
+   * `expanded` is deliberately *not* reset — a refresh must not collapse a tree
+   * the user opened. The scroller's offset is captured first and restored after
+   * the new rows paint, so a refresh that happens to finish while the user is
+   * scrolled down does not jump them back to the top.
+   */
+  useEffect(() => {
+    const scroller = scrollerRef.current
+    const offset = scroller?.scrollTop ?? 0
+    for (const dir of expanded) load(dir)
+    // Restore after paint, once the rebuilt list has its new height. Guarded
+    // because `requestAnimationFrame` does not exist in a bare Node test host.
+    const raf = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : (fn) => setTimeout(fn, 0)
+    const cancel = typeof cancelAnimationFrame === 'function' ? cancelAnimationFrame : clearTimeout
+    const frame = raf(() => { if (scroller) scroller.scrollTop = offset })
+    return () => cancel(frame)
+  }, [refreshRevision, list, expanded, load])
   useEffect(() => { setMenu(null) }, [closeMenuSignal])
   const contextMenu = (event, path, isDir) => {
     event.preventDefault()
@@ -315,6 +402,73 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
     if (!node) return
     node.focus?.()
     node.scrollIntoView?.({ block: 'nearest' })
+  }
+
+  /** A row's identity in the selection: the same path can never be both a file and a directory. */
+  const selectedKey = (row) => `${row.path}:${row.isDir ? 'd' : 'f'}`
+
+  /**
+   * Every row currently selected, primary first.
+   *
+   * Consumers that act on "the selection" (delete, drag, the toolbar target)
+   * read this instead of `selected`, so multi-select reaches them without each
+   * call site learning about `extraSelection`.
+   */
+  const selectionRows = () => {
+    if (selected === null) return []
+    const extras = flat.filter((row) => extraSelection.has(selectedKey(row)))
+    return [selected, ...extras]
+  }
+
+  /**
+   * Apply a click's selection intent, honouring the platform's modifiers.
+   *
+   * Plain click replaces the selection, Ctrl/Cmd-click toggles one row, and
+   * Shift-click takes everything between the anchor and the clicked row in
+   * *visual* order — `flat` is what the user sees, so it is what a range means.
+   */
+  const selectRow = (row, event) => {
+    const additive = event?.ctrlKey === true || event?.metaKey === true
+    const range = event?.shiftKey === true
+    if (range && selectionAnchorRef.current !== null) {
+      const from = flat.findIndex((item) => selectedKey(item) === selectionAnchorRef.current)
+      const to = flat.findIndex((item) => selectedKey(item) === selectedKey(row))
+      if (from >= 0 && to >= 0) {
+        const [low, high] = from <= to ? [from, to] : [to, from]
+        const span = flat.slice(low, high + 1)
+        setSelected(row)
+        setExtraSelection(new Set(span.filter((item) => selectedKey(item) !== selectedKey(row)).map(selectedKey)))
+        return
+      }
+    }
+    if (additive) {
+      setExtraSelection((prev) => {
+        const next = new Set(prev)
+        if (next.has(selectedKey(row))) next.delete(selectedKey(row))
+        else if (selected !== null) next.add(selectedKey(row))
+        return next
+      })
+      selectionAnchorRef.current = selectedKey(row)
+      return
+    }
+    // A plain click always collapses back to one row, which is what keeps the
+    // toolbar target and the keyboard cursor unambiguous.
+    setSelected(row)
+    setExtraSelection(new Set())
+    selectionAnchorRef.current = selectedKey(row)
+  }
+
+  /**
+   * How many rails to paint on a row, counting from the innermost outward.
+   *
+   * While the pointer is over the list every rail paints, which reads as the
+   * full hierarchy. Once it leaves, only the primary selection's ancestry stays
+   * — the row itself plus each of its ancestors — so the tree keeps showing
+   * where the selection came from without the rest of the noise.
+   */
+  const railCountFor = (depth, isAncestorOfSelection) => {
+    if (pointerInTree) return depth
+    return isAncestorOfSelection ? depth : 0
   }
 
   /**
@@ -494,12 +648,21 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
       // Renaming replaces the row: the field stands where the old name was.
       if (editor?.mode === 'rename' && editor.path === full) { pushEditorRow(depth) }
       else {
+        const row = { path: full, isDir }
+        const isPrimary = selected?.path === full && selected.isDir === isDir
+        const isExtra = extraSelection.has(selectedKey(row))
+        // An ancestor of the primary selection keeps its rails once the pointer
+        // leaves, which is what draws the chain from the selection back to the
+        // root. Files and directories both qualify: the chain is about position
+        // in the tree, not about what the row is.
+        const carriesChain = selected !== null && (isPrimary || selected.path.startsWith(`${full}/`) || selected.path.startsWith(`${full}\\`))
         pushRow({ key: full, path: full, isDir, isOpen, depth, parent })
         rows.push(h('div', {
           key: full,
           className: 'code-workbench-tree-row',
           'data-active': !isDir && full === activePath,
-          'data-selected': selected?.path === full && selected.isDir === isDir,
+          'data-selected': isPrimary,
+          'data-depth': depth,
           role: 'treeitem',
           tabIndex: 0,
           // The focus target for keyboard navigation. The callback ref files the
@@ -507,37 +670,90 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
           // holds rows that are on screen right now.
           ref: (node) => { if (node === null) nodesRef.current.delete(full); else nodesRef.current.set(full, node) },
           'aria-level': depth + 1,
-          'aria-selected': selected?.path === full && selected.isDir === isDir,
+          'aria-selected': isPrimary || isExtra,
           'aria-expanded': isDir ? isOpen : undefined,
           'aria-pressed': isDir ? undefined : full === activePath,
-          style: rowStyle(depth),
+          // The drop target for a drag-to-move. Only directories accept a drop --
+          // a file has no children to move into -- and the guard lives in the
+          // handler because the browser fires dragenter/dragover on every row.
+          onDragOver: (event) => {
+            if (!isDir || dragRef.current === null) return
+            // Dropping a folder into itself (or into its own descendant) would
+            // detach that subtree from the tree, so those targets stay inert.
+            if (full === dragRef.current.path) return
+            if (full.startsWith(`${dragRef.current.path}/`) || full.startsWith(`${dragRef.current.path}\\`)) return
+            event.preventDefault()
+            event.dataTransfer.dropEffect = 'move'
+            if (dropTarget !== full) setDropTarget(full)
+          },
+          onDragLeave: () => {
+            if (dropTarget === full) setDropTarget(null)
+          },
+          onDrop: (event) => {
+            if (!isDir || dragRef.current === null) return
+            const drag = dragRef.current
+            if (full === drag.path) return
+            if (full.startsWith(`${drag.path}/`) || full.startsWith(`${drag.path}\\`)) return
+            event.preventDefault()
+            event.stopPropagation()
+            dragRef.current = null
+            setDropTarget(null)
+            // The tree's own drop is a move into the folder. The composer's drop
+            // target reads the same drag but claims a different flavor, so both
+            // gestures share one drag source without colliding.
+            onAction('move', { path: drag.path, isDir: drag.isDir, sources: drag.sources, destination: full })
+          },
+          style: { ...rowStyle(depth), position: 'relative', ...(dropTarget === full ? { boxShadow: `inset 0 0 0 1px ${T.accent}` } : {}) },
           // Selecting and opening are separate concerns: a click both marks the
           // row (so the toolbar knows where to create) and does what the row
-          // normally does — expand a directory, or open a file.
-          onClick: () => { setSelected({ path: full, isDir }); isDir ? toggle(full) : onOpen(full) },
+          // normally does -- expand a directory, or open a file.
+          onClick: (event) => {
+            selectRow(row, event)
+            // A modifier-click is about building a selection, so it must not
+            // also toggle a folder or swap the open file out from under the user.
+            if (event?.ctrlKey || event?.metaKey || event?.shiftKey) return
+            isDir ? toggle(full) : onOpen(full)
+          },
           // Only Enter/space belong to the row itself. Movement keys bubble to the
-          // container handler, which is what makes ↑/↓ work while a row has focus.
+          // container handler, which is what makes the arrow keys work while a
+          // row has focus.
           onKeyDown: (event) => {
             if (event.key !== 'Enter' && event.key !== ' ') return
             event.preventDefault()
-            setSelected({ path: full, isDir })
+            selectRow(row, event)
             isDir ? toggle(full) : onOpen(full)
           },
-        onContextMenu: (event) => { setSelected({ path: full, isDir }); contextMenu(event, full, isDir) },
-        // Drag source: the row hands out its workspace-relative path so the
-        // composer drop target can turn it into a reference chip. The private
-        // flavor keeps this gesture disjoint from DSH's own file-drop pipeline.
-        draggable: true,
-        onDragStart: (event) => {
-          event.dataTransfer.effectAllowed = 'copy'
-          event.dataTransfer.setData(TREE_DRAG_MIME, treeDragPayload(full, cwd, isDir))
-          // A plain-text flavor as the universal fallback; Lexical would render
-          // this as raw text if our interceptor ever declined the drop.
-          event.dataTransfer.setData('text/plain', relativeToCwd(full, cwd) || full)
-        },
-        title: full,
-      }, h('span', { style: { color: T.fgMuted, width: '10px', display: 'inline-block' } }, isDir ? (isOpen ? '▾' : '▸') : ' '),
-        h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis' } }, entry.name)))
+          onContextMenu: (event) => {
+            // Right-clicking inside an existing multi-selection acts on all of
+            // it; right-clicking outside retargets to the row under the pointer.
+            if (!isExtra && !isPrimary) selectRow(row, event)
+            contextMenu(event, full, isDir)
+          },
+          // Drag source. The row hands out its workspace-relative path so the
+          // composer drop target can turn it into a reference chip, and the tree
+          // itself uses the same gesture to move the file into a folder. The
+          // private flavor keeps this disjoint from DSH's own file-drop pipeline.
+          draggable: true,
+          onDragStart: (event) => {
+            // Dragging a selected row carries the whole selection; dragging an
+            // unselected row carries just that row, as every file manager does.
+            const inSelection = isPrimary || isExtra
+            const sources = inSelection ? selectionRows().map((item) => item.path) : [full]
+            dragRef.current = { path: full, isDir, sources }
+            event.dataTransfer.effectAllowed = 'copyMove'
+            event.dataTransfer.setData(TREE_DRAG_MIME, treeDragPayload(full, cwd, isDir))
+            // A plain-text flavor as the universal fallback; Lexical would render
+            // this as raw text if our interceptor ever declined the drop.
+            event.dataTransfer.setData('text/plain', relativeToCwd(full, cwd) || full)
+          },
+          onDragEnd: () => {
+            dragRef.current = null
+            setDropTarget(null)
+          },
+          title: full,
+        }, guideRails(depth, railCountFor(depth, carriesChain)),
+          h('span', { style: { color: T.fgMuted, width: '10px', display: 'inline-block' } }, isDir ? (isOpen ? '▾' : '▸') : ' '),
+          h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis' } }, entry.name)))
       }
       if (isOpen) walk(full, depth + 1, full)
     }
@@ -551,7 +767,7 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
    * rows rebuild, which is what carries the selection from a directory into the
    * child it just expanded.
    */
-  const moveSelection = useCallback((step) => {
+  const moveSelection = useCallback((step, extend) => {
     const current = selected === null ? -1 : flat.findIndex((row) => row.path === selected.path && row.isDir === selected.isDir)
     if (current < 0) {
       const edge = step > 0 ? flat[0] : flat.at(-1)
@@ -561,7 +777,22 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
     const nextIndex = current + step
     if (nextIndex < 0 || nextIndex >= flat.length) return
     const next = flat[nextIndex]
+    // Shift+arrow grows the selection instead of replacing it, anchored where
+    // the plain-key navigation last started.
+    if (extend) {
+      if (selectionAnchorRef.current === null) selectionAnchorRef.current = selectedKey(flat[current])
+      setSelected({ path: next.path, isDir: next.isDir })
+      const anchor = flat.findIndex((row) => selectedKey(row) === selectionAnchorRef.current)
+      if (anchor >= 0) {
+        const [low, high] = anchor <= nextIndex ? [anchor, nextIndex] : [nextIndex, anchor]
+        setExtraSelection(new Set(flat.slice(low, high + 1).filter((row) => selectedKey(row) !== selectedKey(next)).map(selectedKey)))
+      }
+      focusRow(next.path)
+      return
+    }
     setSelected({ path: next.path, isDir: next.isDir })
+    setExtraSelection(new Set())
+    selectionAnchorRef.current = selectedKey(next)
     // The row's keys are stable, so the node can be focused directly instead of
     // waiting for the re-render that `setSelected` schedules.
     focusRow(next.path)
@@ -577,11 +808,11 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
       case 'ArrowDown':
         // Focus is about to move to another row; that is not a typing context.
         event.preventDefault()
-        moveSelection(1)
+        moveSelection(1, event.shiftKey)
         return
       case 'ArrowUp':
         event.preventDefault()
-        moveSelection(-1)
+        moveSelection(-1, event.shiftKey)
         return
       case 'ArrowRight': {
         event.preventDefault()
@@ -611,8 +842,14 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
       case 'Delete':
         event.preventDefault()
         // The workspace root is the only thing the tree refuses to delete; the
-        // dialog that guards the rest belongs to the action itself.
-        if (target && !(target.path === cwd && target.isDir)) onAction('delete', { path: target.path, isDir: target.isDir })
+        // dialog that guards the rest belongs to the action itself. Delete acts
+        // on the whole selection, so a multi-select is one confirmation.
+        if (target && !(target.path === cwd && target.isDir)) {
+          const rowsToDelete = selectionRows().filter((row) => !(row.path === cwd && row.isDir))
+          onAction('delete', rowsToDelete.length > 1
+            ? { path: target.path, isDir: target.isDir, sources: rowsToDelete.map((row) => row.path) }
+            : { path: target.path, isDir: target.isDir })
+        }
         return
       default:
     }
@@ -637,7 +874,21 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
    */
   const menuAction = (action, target) => {
     if (action === 'createFile' || action === 'createDirectory') return openCreate(action, target)
-    if (action === 'rename') return openRename(target)
+    if (action === 'rename') {
+      // Renaming several rows to one name is not a rename. The field edits a
+      // single name, so a multi-selection falls back to the row that was
+      // right-clicked and the rest of the selection stays untouched.
+      return openRename(target)
+    }
+    if (action === 'delete') {
+      // Right-clicking a row inside a multi-selection deletes the whole
+      // selection in one go; right-clicking outside it deletes just that row.
+      const rowsToDelete = selectionRows().filter((row) => !(row.path === cwd && row.isDir))
+      const inSelection = rowsToDelete.some((row) => row.path === target.path && row.isDir === target.isDir)
+      return onAction('delete', inSelection && rowsToDelete.length > 1
+        ? { ...target, sources: rowsToDelete.map((row) => row.path) }
+        : target)
+    }
     return onAction(action, target)
   }
   return h('div', {
@@ -662,11 +913,18 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
     // The keyboard handler sits on the scroller, not on each row: with focus on
     // a row, ↑/↓/←/→/F2/Delete bubble here, so every row shares one
     // implementation and there is no per-row listener to keep in sync.
+    //
+    // The pointer listeners live here too. "Inside the tree" means this row
+    // list, so the toolbar and the root label do not count as being in it —
+    // moving up to press a button swaps the rails back to the selection chain.
     h('div', {
       className: 'code-workbench-tree-body',
       role: 'tree',
       tabIndex: -1,
+      ref: scrollerRef,
       onKeyDown: handleTreeKeys,
+      onMouseEnter: () => setPointerInTree(true),
+      onMouseLeave: () => { setPointerInTree(false); setDropTarget(null) },
     }, rows),
     menu ? h('div', { role: 'menu', className: 'code-workbench-context-menu', style: { left: menu.x, top: menu.y }, onClick: (event) => event.stopPropagation() },
       items.map(([action, label]) => h('button', { key: action, type: 'button', role: 'menuitem', disabled: action === 'paste' && !clipboard || ['cut', 'rename', 'delete'].includes(action) && menu.path === cwd, onClick: () => { const target = menu; setMenu(null); menuAction(action, target) } }, label))) : null)
@@ -1274,6 +1532,46 @@ function CodePanel(props) {
         const relative = path.slice(cwd.length).replace(/^[\\/]+/, '') || '.'
         const reference = { source: 'code-workbench', ref: { path: relative, directory: target.isDir, pathOnly: true }, label: relative, appearance: 'file', clipboardText: relative }
         if (scope.bail(scope, 'slash/input-insert-reference', { reference, span: inputActions.captureInsertion() }) !== true) throw new Error('对话输入框正忙')
+      } else if (action === 'move') {
+        // Drag-to-move. Each source is a rename into the dropped folder, so it
+        // reuses the rename path the host already guards; doing them one at a
+        // time keeps a partial failure recoverable rather than all-or-nothing.
+        const folder = target.destination
+        const sources = target.sources ?? [path]
+        const moves = sources
+          .filter((item) => item !== folder && !folder.startsWith(`${item}/`) && !folder.startsWith(`${item}\\`))
+          .map((item) => ({ from: item, to: joinPath(folder, item.split(/[\\/]/).at(-1)) }))
+          .filter((item) => item.to !== item.from)
+        if (moves.length === 0) { setStatus('文件已经位于这个文件夹'); return { ok: true } }
+        const moved = []
+        for (const move of moves) {
+          const response = await fetch('/api/code-workbench/file-operation', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId, operation: 'rename', path: move.from, destination: move.to }) })
+          const result = await response.json()
+          if (!response.ok || !result.ok) { setStatus(`移动失败：${result.error?.message ?? `HTTP ${response.status}`}`); break }
+          moved.push(move)
+        }
+        if (moved.length === 0) return { ok: false, error: '移动失败' }
+        setTreeRevision((revision) => revision + 1)
+        // Follow the open file and the tabs to their new homes, exactly as a
+        // single rename does — a move is just a rename across folders.
+        for (const move of moved) {
+          for (const buffer of [...buffersRef.current.values()]) {
+            if (buffer.path !== move.from && !buffer.path.startsWith(`${move.from}/`) && !buffer.path.startsWith(`${move.from}\\`)) continue
+            buffersRef.current.delete(buffer.path)
+            buffer.model.dispose()
+          }
+          setOpenPaths((paths) => paths.map((item) => item === move.from || item.startsWith(`${move.from}/`) || item.startsWith(`${move.from}\\`) ? move.to + item.slice(move.from.length) : item))
+        }
+        const current = stateRef.current.path
+        const followed = moved.find((move) => current !== null && (current === move.from || current.startsWith(`${move.from}/`) || current.startsWith(`${move.from}\\`)))
+        if (followed) {
+          stateRef.current = { path: null, version: null, dirty: false, text: '' }
+          setActivePath(null)
+          setDirty(false)
+          await openFile(followed.to + current.slice(followed.from.length))
+        }
+        setStatus(moved.length === 1 ? '已移动' : `已移动 ${moved.length} 项`)
+        return { ok: true }
       } else {
         let operation = action
         let source = path
@@ -1301,7 +1599,42 @@ function CodePanel(props) {
             destination = joinPath(directory, name)
           }
         } else if (action === 'delete') {
-          if (!await askDialog(`确定删除 ${path}？此操作无法撤销。`)) return
+          // A multi-select deletes as one batch: a single confirmation naming
+          // everything, then one request per path. Deletion is not atomic on the
+          // host, so the loop stops at the first failure and says how far it got
+          // rather than reporting a success the tree cannot back up.
+          const sources = target.sources ?? [path]
+          const listing = sources.length === 1 ? path : `${sources.length} 个项目（${sources.map((item) => item.split(/[\\/]/).at(-1)).join('、')}）`
+          if (!await askDialog(`确定删除 ${listing}？此操作无法撤销。`)) return
+          if (sources.length > 1) {
+            const done = []
+            for (const item of sources) {
+              const response = await fetch('/api/code-workbench/file-operation', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId, operation: 'delete', path: item }) })
+              const result = await response.json()
+              if (!response.ok || !result.ok) { setStatus(`删除 ${item} 失败：${result.error?.message ?? `HTTP ${response.status}`}`); break }
+              done.push(item)
+            }
+            if (done.length === 0) return { ok: false, error: '删除失败' }
+            setTreeRevision((revision) => revision + 1)
+            for (const item of done) {
+              for (const buffer of [...buffersRef.current.values()]) {
+                if (buffer.path !== item && !buffer.path.startsWith(`${item}/`) && !buffer.path.startsWith(`${item}\\`)) continue
+                if (buffer === stateRef.current) editorRef.current?.setModel(null)
+                buffersRef.current.delete(buffer.path)
+                buffer.model.dispose()
+              }
+              setOpenPaths((paths) => paths.filter((path_) => path_ !== item && !path_.startsWith(`${item}/`) && !path_.startsWith(`${item}\\`)))
+            }
+            const stillOpen = stateRef.current.path
+            if (stillOpen !== null && done.some((item) => stillOpen === item || stillOpen.startsWith(`${item}/`) || stillOpen.startsWith(`${item}\\`))) {
+              editorRef.current?.setModel(null)
+              stateRef.current = { path: null, version: null, dirty: false, text: '' }
+              setActivePath(null)
+              setDirty(false)
+            }
+            setStatus(`已删除 ${done.length} 项`)
+            return { ok: true }
+          }
         } else {
           // createFile / createDirectory / rename: the name comes from the
           // in-tree field. `newName` is absent when another caller (the context
