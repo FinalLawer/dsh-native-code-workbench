@@ -257,6 +257,15 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
   const [expanded, setExpanded] = useState(() => new Set([cwd]))
   const [children, setChildren] = useState({}) // dir path -> entries | 'loading' | error string
   const [menu, setMenu] = useState(null)
+  /**
+   * The row the toolbar's create actions target.
+   *
+   * Distinct from `activePath`, which tracks the file a tab has open — a
+   * directory can be selected but never active. Kept as `{path, isDir}` so the
+   * target rule matches the context menu exactly: a directory creates inside
+   * itself, a file creates alongside it.
+   */
+  const [selected, setSelected] = useState(null)
   useEffect(() => {
     const close = () => setMenu(null)
     const keydown = (event) => { if (event.key === 'Escape') close() }
@@ -292,6 +301,18 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
     })
   }, [load])
 
+  /**
+   * Where a toolbar create action should land, mirroring the context menu's
+   * rule: a directory holds the new entry, a file shares its parent folder, and
+   * with no selection the workspace root is the fallback.
+   */
+  const createTarget = (() => {
+    if (selected === null) return { path: cwd, isDir: true }
+    if (selected.isDir) return { path: selected.path, isDir: true }
+    const parent = selected.path.slice(0, Math.max(selected.path.lastIndexOf('/'), selected.path.lastIndexOf('\\')))
+    return { path: parent === '' ? cwd : parent, isDir: true }
+  })()
+
   const rows = []
   const walk = (dir, depth) => {
     const entries = children[dir]
@@ -311,18 +332,23 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
         key: full,
         className: 'code-workbench-tree-row',
         'data-active': !isDir && full === activePath,
+        'data-selected': selected?.path === full && selected.isDir === isDir,
         role: 'button',
         tabIndex: 0,
         'aria-expanded': isDir ? isOpen : undefined,
         'aria-pressed': isDir ? undefined : full === activePath,
         style: rowStyle(depth),
-        onClick: () => (isDir ? toggle(full) : onOpen(full)),
+        // Selecting and opening are separate concerns: a click both marks the
+        // row (so the toolbar knows where to create) and does what the row
+        // normally does — expand a directory, or open a file.
+        onClick: () => { setSelected({ path: full, isDir }); isDir ? toggle(full) : onOpen(full) },
         onKeyDown: (event) => {
           if (event.key !== 'Enter' && event.key !== ' ') return
           event.preventDefault()
+          setSelected({ path: full, isDir })
           isDir ? toggle(full) : onOpen(full)
         },
-        onContextMenu: (event) => contextMenu(event, full, isDir),
+        onContextMenu: (event) => { setSelected({ path: full, isDir }); contextMenu(event, full, isDir) },
         // Drag source: the row hands out its workspace-relative path so the
         // composer drop target can turn it into a reference chip. The private
         // flavor keeps this gesture disjoint from DSH's own file-drop pipeline.
@@ -351,8 +377,16 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
   ] : []
   return h('div', { style: { overflow: 'auto', padding: '4px 0' }, onContextMenu: (event) => contextMenu(event, cwd, true) },
     h('div', { className: 'code-workbench-tree-toolbar' },
-      h('button', { title: '新建文件', 'aria-label': '新建文件', onClick: () => onAction('createFile', { path: cwd, isDir: true }) }, workbenchIcon('createFile')),
-      h('button', { title: '新建文件夹', 'aria-label': '新建文件夹', onClick: () => onAction('createDirectory', { path: cwd, isDir: true }) }, workbenchIcon('createDirectory')),
+      h('button', {
+        title: selected === null ? '新建文件' : `在 ${relativeToCwd(createTarget.path, cwd) || '工作区'} 中新建文件`,
+        'aria-label': '新建文件',
+        onClick: () => onAction('createFile', createTarget),
+      }, workbenchIcon('createFile')),
+      h('button', {
+        title: selected === null ? '新建文件夹' : `在 ${relativeToCwd(createTarget.path, cwd) || '工作区'} 中新建文件夹`,
+        'aria-label': '新建文件夹',
+        onClick: () => onAction('createDirectory', createTarget),
+      }, workbenchIcon('createDirectory')),
       h('button', { title: '刷新', 'aria-label': '刷新文件树', onClick: () => { for (const dir of expanded) load(dir) } }, workbenchIcon('refresh')),
       h('button', { title: '全部折叠', 'aria-label': '全部折叠', onClick: () => setExpanded(new Set([cwd])) }, workbenchIcon('collapse')),
     ),

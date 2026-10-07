@@ -543,6 +543,52 @@ await contextMenuFor('C:\\repo\\b.js')
 await menuAction('新建文件夹…')
 await submitName('new-folder')
 check('new folder submits its name', calls.fetch.some((call) => call.body.operation === 'createDirectory' && call.body.path === 'C:\\repo\\new-folder'))
+
+console.log('\ntoolbar create targets the selected row, not the workspace root')
+const toolbarButton = (label) => findAll(tree(), (node) => node.type === 'button' && node.props['aria-label'] === label)[0]
+const rowFor = (title) => findAll(tree(), (node) => node.props?.className === 'code-workbench-tree-row' && node.props.title === title)[0]
+const submittedCreate = (operation, path) => calls.fetch.some((call) => call.body.operation === operation && call.body.path === path)
+const createViaToolbar = async (label, name) => {
+  await act(async () => { toolbarButton(label).props.onClick() })
+  await submitName(name)
+}
+
+// Baseline: nothing selected yet in this tree, so the root remains the fallback.
+await createViaToolbar('新建文件夹', 'at-root')
+check('with no selection the toolbar falls back to the workspace root',
+  submittedCreate('createDirectory', 'C:\\repo\\at-root'))
+
+// Selecting a directory targets that directory itself.
+await act(async () => { rowFor('C:\\repo\\sub').props.onClick() })
+await act(async () => {})
+check('clicking a directory row marks it selected',
+  rowFor('C:\\repo\\sub').props['data-selected'] === true, rowFor('C:\\repo\\sub').props['data-selected'])
+check('the toolbar names the selected directory as its target',
+  toolbarButton('新建文件夹').props.title.includes('sub'), toolbarButton('新建文件夹').props.title)
+await createViaToolbar('新建文件夹', 'inside-sub')
+check('the new folder lands inside the selected directory, not the root',
+  submittedCreate('createDirectory', 'C:\\repo\\sub\\inside-sub')
+  && !submittedCreate('createDirectory', 'C:\\repo\\inside-sub'))
+
+// Selecting a file targets its sibling directory instead of the file itself.
+await act(async () => { rowFor('C:\\repo\\a.js').props.onClick() })
+await act(async () => {})
+check('selecting a file moves the selection off the directory',
+  rowFor('C:\\repo\\a.js').props['data-selected'] === true
+  && rowFor('C:\\repo\\sub').props['data-selected'] !== true)
+await createViaToolbar('新建文件', 'sibling.js')
+check('a file selection creates alongside it, not inside it',
+  submittedCreate('createFile', 'C:\\repo\\sibling.js'),
+  calls.fetch.filter((call) => call.body.operation === 'createFile').map((call) => call.body.path))
+
+// The right-click path must keep its own independent targeting.
+await contextMenuFor('C:\\repo\\sub')
+const contextSelectedTitle = toolbarButton('新建文件').props.title
+await menuAction('新建文件夹…')
+await submitName('via-menu')
+check('the context menu still creates in the right-clicked directory',
+  submittedCreate('createDirectory', 'C:\\repo\\sub\\via-menu'))
+check('the context menu does not disturb the toolbar target', contextSelectedTitle === toolbarButton('新建文件').props.title)
 await contextMenuFor('C:\\repo\\b.js')
 await menuAction('复制')
 await contextMenuFor('C:\\repo\\sub')
