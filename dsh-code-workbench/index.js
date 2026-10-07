@@ -23,7 +23,10 @@
  * @module dsh-code-workbench
  */
 
-import z from '@deepseek-ai/schemastery'
+// Vendored: @deepseek-ai/schemastery 3.18.4 (+ @deepseek-ai/cosmokit), both MIT.
+// Bundled by esbuild so the installed package has zero runtime dependencies —
+// no registry fetch can fail behind a restrictive network.
+import z from './vendor/schemastery.mjs'
 import * as disk from 'node:fs/promises'
 import { completionEndpoint, streamCompletionApi } from './completion-api.mjs'
 

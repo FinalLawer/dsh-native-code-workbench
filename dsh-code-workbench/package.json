@@ -1,12 +1,13 @@
 {
   "name": "dsh-code-workbench",
   "description": "Code Workbench for the DSH Web GUI: Monaco (the VS Code editor core) over workspace files in the right sidebar, with a version-guarded save path",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "type": "module",
   "main": "index.js",
   "scripts": {
     "build": "node build.mjs",
+    "build:vendor": "esbuild node_modules/@deepseek-ai/schemastery/lib/index.mjs --bundle --format=esm --outfile=vendor/schemastery.mjs --legal-comments=eof",
     "test": "node ../tools/test-client-contract.mjs && node ../tools/test-host-write.mjs && node ../tools/test-file-operations.mjs && node ../tools/test-host-search.mjs && node ../tools/test-host-tool.mjs && node ../tools/test-host-complete.mjs && node ../tools/test-completion-api.mjs && node ../tools/test-host-history.mjs && node ../tools/test-bundle-slim.mjs && node ../tools/test-client-smoke.mjs"
   },
   "exports": {
@@ -20,6 +21,7 @@
     "completion-api.mjs",
     "client.js",
     "src",
+    "vendor",
     "build.mjs",
     "cordis.patch.yml"
   ],
@@ -39,10 +41,8 @@
       ]
     }
   },
-  "dependencies": {
-    "@deepseek-ai/schemastery": "~3.18.4"
-  },
   "devDependencies": {
+    "@deepseek-ai/schemastery": "~3.18.4",
     "esbuild": "^0.28.2",
     "monaco-editor": "^0.57.0",
     "react": "^19.3.0",
