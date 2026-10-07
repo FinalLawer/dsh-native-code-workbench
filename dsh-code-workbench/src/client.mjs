@@ -1309,8 +1309,21 @@ function CodePanel(props) {
           const name = target.newName
           if (name === undefined) return
           if (!name.trim() || /[\\/]/.test(name) || ['.', '..'].includes(name.trim())) return { ok: false, error: '请输入有效名称，不能包含路径分隔符' }
-          if (action === 'rename') destination = joinPath(parent, name.trim())
-          else source = joinPath(directory, name.trim())
+          if (action === 'rename') {
+            destination = joinPath(parent, name.trim())
+            // A rename that changes nothing must not reach the host. `contains`
+            // is reflexive, so a destination equal to the source trips the
+            // host's "destination must not sit inside the source" clause and the
+            // user is told their no-op is illegal. Worse, the dirty-buffer guard
+            // below would answer with "请先保存受影响文件的修改", which misreports
+            // an unchanged name as a save problem. Committing the prefilled name
+            // is simply "nothing to do": report it and close the field.
+            if (destination === path) { setStatus('名称未改变'); return { ok: true } }
+            // A destination nested under the source is refused by the host too,
+            // but there it is a bare rejection. Catch it here so the field can
+            // explain itself and keep the typed name.
+            if (destination.startsWith(`${path}/`) || destination.startsWith(`${path}\\`)) return { ok: false, error: '名称不能嵌套在自身之下' }
+          } else source = joinPath(directory, name.trim())
         }
         const affected = [...buffersRef.current.values()].filter((buffer) => buffer.path === source || buffer.path.startsWith(`${source}/`) || buffer.path.startsWith(`${source}\\`))
         if (['rename', 'delete'].includes(operation) && affected.some((buffer) => buffer.dirty || buffer.saving)) throw new Error('请先保存受影响文件的修改，并等待保存完成')

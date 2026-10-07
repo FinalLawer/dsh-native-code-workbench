@@ -728,6 +728,41 @@ await act(async () => { findAll(tree(), (node) => node.type === 'form')[0].props
 check('delete requires confirmation and submits the selected file', calls.fetch.some((call) => call.body.operation === 'delete' && call.body.path === 'C:\\repo\\b.js'))
 await act(async () => { tabFor('a.js').props.onClick() })
 
+console.log('\nrenaming to a name the host would refuse')
+// --- Committing an unchanged name must not reach the host.
+//
+// The host rejects any rename whose destination sits inside its source, and
+// `contains` is reflexive — so `destination === source` is refused with
+// "目标必须在工作区内且不能位于源目录内". Re-submitting the prefilled name is a
+// no-op, not an error: the field should just close. This runs after the toolbar
+// suite because opening a rename marks its row selected, which that suite reads.
+const renameCallsSoFar = () => calls.fetch.filter((call) => call.body?.operation === 'rename')
+await contextMenuFor('C:\\repo\\a.js')
+await menuAction('重命名…')
+const beforeNoopRename = renameCallsSoFar().length
+// Exactly what the field is prefilled with — the user pressed Enter unchanged.
+check('the no-op rename field is prefilled with the unchanged name',
+  inlineInput().props.value === 'a.js', inlineInput().props.value)
+await act(async () => { inlineInput().props.onKeyDown({ key: 'Enter', preventDefault() {}, stopPropagation() {} }) })
+await act(async () => {})
+check('an unchanged name issues no rename operation',
+  renameCallsSoFar().length === beforeNoopRename, renameCallsSoFar().slice(beforeNoopRename).map((call) => call.body))
+check('an unchanged name closes the field instead of erroring',
+  inlineInput() === undefined, inlineInput()?.props.value)
+check('an unchanged name reports honestly instead of failing',
+  allText().includes('名称未改变') && !allText().includes('操作失败'), allText().slice(-90))
+
+// The guard must not over-trigger: a sibling that merely shares the folder-name
+// prefix is a perfectly legal rename and must stay submittable.
+await contextMenuFor('C:\\repo\\sub')
+await menuAction('重命名…')
+await act(async () => { inlineInput().props.onChange({ target: { value: 'sub.inner' } }) })
+await act(async () => {})
+check('a sibling sharing the folder name prefix is not refused',
+  inlineInput().props['aria-invalid'] === false, inlineInput().props['aria-invalid'])
+await act(async () => { inlineInput().props.onKeyDown({ key: 'Escape', preventDefault() {}, stopPropagation() {} }) })
+await act(async () => {})
+
 console.log('\nsearch + jump to a hit')
 const searchButton = findAll(tree(), (n) => n.type === 'button' && n.props['aria-label'] === '搜索')[0]
 await act(async () => {
