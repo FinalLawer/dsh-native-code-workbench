@@ -8,3 +8,10 @@ tmp-*.txt
 # Local agent working context (session logs, project conventions) — not project artifacts.
 .workbuddy/
 .workbuddy-ai/
+
+# Reference material unpacked from the installed desktop client. Kept locally for
+# API lookups, but it is not ours to redistribute: the Electron shell is not part
+# of the MIT-licensed `@deepseek-ai/dsh` package published on npm.
+ref/app-lib/
+ref/dsh/desktop-runtime.json
+ref/dsh/package.json
