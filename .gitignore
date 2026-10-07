@@ -10,8 +10,10 @@ tmp-*.txt
 .workbuddy-ai/
 
 # Reference material unpacked from the installed desktop client. Kept locally for
-# API lookups, but it is not ours to redistribute: the Electron shell is not part
-# of the MIT-licensed `@deepseek-ai/dsh` package published on npm.
+# API lookups, but it is not ours to redistribute: the Electron shell (main
+# process, preload scripts, and renderer documents) is not part of the
+# MIT-licensed `@deepseek-ai/dsh` package published on npm.
 ref/app-lib/
+ref/app-renderer/
 ref/dsh/desktop-runtime.json
 ref/dsh/package.json
