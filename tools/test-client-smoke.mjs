@@ -141,6 +141,7 @@ const calls = {
   selections: 0,
   list: [],
   read: [],
+  stat: 0,
   fetch: [],
   changes: [],
   watchSpecs: [],
@@ -154,7 +155,7 @@ const fakeActx = {
   },
 }
 // A controllable fake for `remote.stream`: the test pushes watch frames.
-const watchState = { queue: [], notify: null, disposed: 0 }
+const watchState = { queue: [], notify: null, disposed: 0, ends: false }
 function fakeWatchStream(spec) {
   calls.watchSpecs.push(spec)
   spec.open(new AbortController().signal)
@@ -162,6 +163,7 @@ function fakeWatchStream(spec) {
     async *[Symbol.asyncIterator]() {
       for (;;) {
         while (watchState.queue.length > 0) yield watchState.queue.shift()
+        if (watchState.ends) throw new Error('watch ended')
         await new Promise((resolve) => {
           watchState.notify = resolve
         })
@@ -174,6 +176,12 @@ function fakeWatchStream(spec) {
 }
 function pushWatch(frame) {
   watchState.queue.push({ value: frame, accept() {} })
+  watchState.notify?.()
+  watchState.notify = null
+}
+/** End the stream the way a dropped connection does: with an error. */
+function endWatch() {
+  watchState.ends = true
   watchState.notify?.()
   watchState.notify = null
 }
@@ -339,7 +347,7 @@ const SettingsPanel = registered.slots.find((row) => row.options?.name === 'sett
 // Recording Remote stubs and a fetch stub that answers each endpoint.
 // ---------------------------------------------------------------------------
 const files = {
-  stat: async () => ({ ok: true, value: { version: { v: 1 } } }),
+  stat: async () => { calls.stat++; return { ok: true, value: { version: { v: 1 } } } },
   list: async (sessionId, dir) => {
     calls.list.push(dir)
     return { ok: true, value: { entries: [{ name: 'a.js', type: 'file' }, { name: 'b.js', type: 'file' }, { name: 'sub', type: 'directory' }], truncated: false } }
@@ -467,10 +475,10 @@ check('opening a file marks only its tree row active',
 
 console.log('\nversion check fallback')
 const readsBeforePolling = calls.read.length
-files.stat = async () => ({ ok: true, value: { version: { v: 3 } } })
+files.stat = async () => { calls.stat++; return { ok: true, value: { version: { v: 3 } } } }
 await act(async () => { await new Promise((resolve) => setTimeout(resolve, 1600)) })
 check('changed disk version refreshes without a watch notification', calls.read.length > readsBeforePolling)
-files.stat = async () => ({ ok: true, value: { version: { v: 1 } } })
+files.stat = async () => { calls.stat++; return { ok: true, value: { version: { v: 1 } } } }
 
 console.log('\nAI completion provider')
 const originalFetch = globalThis.fetch
@@ -1362,6 +1370,29 @@ await act(async () => { findAll(tree(), (node) => node.type === 'button' && node
 await act(async () => {})
 check('refreshing keeps the folder open instead of collapsing it',
   rowNodeFor('C:\\repo\\sub').props['aria-expanded'] === true)
+
+console.log('\nthe version poll yields to the change stream')
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+// No block above has pushed a `ready` frame, so through the whole suite so far
+// the fallback was the only signal there was — which is exactly what the earlier
+// "version check fallback" block depends on. It must still be asking every tick.
+const beforeReady = calls.stat
+await act(async () => { await sleep(1700) })
+check('with no ready frame the poll asks on every tick', calls.stat > beforeReady, { before: beforeReady, after: calls.stat })
+// Now the stream says it is delivering. The fallback keeps its timer but stops
+// spending requests on it.
+await act(async () => { pushWatch({ kind: 'ready' }) })
+await act(async () => {})
+const afterReady = calls.stat
+await act(async () => { await sleep(1700) })
+check('a ready stream throttles the poll to a net', calls.stat === afterReady, { ready: afterReady, later: calls.stat })
+// And when the stream dies the next tick is a real request again. This is what
+// throttling the request rather than the timer buys: no long interval to wait out,
+// so a dropped connection cannot leave the editor showing a stale file.
+await act(async () => { endWatch() })
+await act(async () => {})
+await act(async () => { await sleep(1700) })
+check('a stream that ends puts the poll back on every tick', calls.stat > afterReady, { ready: afterReady, later: calls.stat })
 
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURE(S)`)
 await act(async () => { renderer.unmount() })

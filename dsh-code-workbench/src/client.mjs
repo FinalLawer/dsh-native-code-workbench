@@ -180,6 +180,22 @@ const HISTORY_PATH = '/api/code-workbench/history'
 const ROLLBACK_PATH = '/api/code-workbench/rollback'
 
 /**
+ * How often the version fallback ticks. The tick is local and free; what costs
+ * anything is the `stat` it issues, and that is what the rule below throttles.
+ */
+const POLL_INTERVAL_MS = 1500
+/**
+ * While the official change stream is delivering, the fallback is only a net
+ * under the case where it stays open but silent — the one failure that leaves no
+ * trace, since an error would put the fallback back on its own. So it is allowed
+ * one `stat` per this long (measured from the moment the stream reported ready)
+ * instead of one per tick. Throttling the request and not the timer is
+ * deliberate: the moment the stream stops, the very next tick is a real `stat`,
+ * so recovery does not have to wait out a long interval.
+ */
+const POLL_NET_MS = 15000
+
+/**
  * Ask the Host for one Tab completion.
  *
  * One request, one response — nothing is streamed. Ghost text is only ever
@@ -973,6 +989,10 @@ function CodePanel(props) {
   const openFileRef = useRef(null)  // latest openFile, for the change watch
   const addToChatRef = useRef(null) // latest Add-to-Chat, for the editor keybinding
   const inFlightRef = useRef(false) // one ghost-text request at a time
+  // Whether the official change stream for the open file is delivering, and since
+  // when. It decides how much the version fallback below is allowed to ask, so
+  // the two effects share it through a ref — a state update would re-render.
+  const watchHealthRef = useRef({ healthy: false, since: 0 })
   const inlineTriggerTimerRef = useRef(null)
   const openRequestRef = useRef(0)
   const buffersRef = useRef(new Map())
@@ -1294,6 +1314,7 @@ function CodePanel(props) {
           if (cancelled) break
           const frame = item.value
           if (frame?.kind === 'ready') {
+            watchHealthRef.current = { healthy: true, since: Date.now() }
             item.accept()
           } else if (frame?.kind === 'change') {
             if (stateRef.current.dirty) {
@@ -1304,12 +1325,17 @@ function CodePanel(props) {
             }
           }
         }
+        // Reaching here means the stream ended without an error. Either way the
+        // fallback below is on its own again, so it must go back to every tick.
+        watchHealthRef.current = { healthy: false, since: 0 }
       } catch {
         // watch-unsupported or the stream ended; external reload is best-effort
+        watchHealthRef.current = { healthy: false, since: 0 }
       }
     })()
     return () => {
       cancelled = true
+      watchHealthRef.current = { healthy: false, since: 0 }
       dispose?.()
     }
   }, [activePath, files, sessionId, watchStream])
@@ -1319,8 +1345,12 @@ function CodePanel(props) {
     if (!path || typeof files.stat !== 'function') return
     const controller = new AbortController()
     let checking = false
-    const checkVersion = async () => {
+    const checkVersion = async (force = false) => {
       if (checking || controller.signal.aborted || document.visibilityState === 'hidden') return
+      // A delivering stream means the fallback is only a net; an absent one means
+      // it is the only signal there is, so ask on every tick.
+      const watch = watchHealthRef.current
+      if (!force && watch.healthy && Date.now() - watch.since < POLL_NET_MS) return
       checking = true
       try {
         const metadata = await files.stat(sessionId, path, controller.signal)
@@ -1338,13 +1368,14 @@ function CodePanel(props) {
         checking = false
       }
     }
-    const timer = setInterval(checkVersion, 1500)
-    window.addEventListener?.('focus', checkVersion)
+    const onFocus = () => checkVersion(true)
+    const timer = setInterval(checkVersion, POLL_INTERVAL_MS)
+    window.addEventListener?.('focus', onFocus)
     checkVersion()
     return () => {
       controller.abort()
       clearInterval(timer)
-      window.removeEventListener?.('focus', checkVersion)
+      window.removeEventListener?.('focus', onFocus)
     }
   }, [activePath, files, sessionId])
 
