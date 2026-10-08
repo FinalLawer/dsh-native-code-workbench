@@ -12,6 +12,7 @@
 import fs from 'node:fs'
 import { createRequire } from 'node:module'
 import { splitSnippets } from '../dsh-code-workbench/src/snippets.mjs'
+import { COMPLETION_PREFIX_CHARS, COMPLETION_SUFFIX_CHARS } from '../dsh-code-workbench/src/completion-window.mjs'
 
 const requireFrom = createRequire(new URL('../dsh-code-workbench/package.json', import.meta.url))
 const React = requireFrom('react')
@@ -188,9 +189,11 @@ function endWatch() {
 let currentModel = null
 let selectionEmpty = true
 let modelText = 'const needle = 1\nconst b = 2\n'
+// The caret offset, movable so the completion window can be driven to its caps.
+let fakeOffset = 16
 
 const fakeModel = {
-  getOffsetAt: () => 16,
+  getOffsetAt: () => fakeOffset,
   getLineCount: () => 2,
   getLineMaxColumn: () => 20,
   getLanguageId: () => 'javascript',
@@ -1393,6 +1396,38 @@ await act(async () => { endWatch() })
 await act(async () => {})
 await act(async () => { await sleep(1700) })
 check('a stream that ends puts the poll back on every tick', calls.stat > afterReady, { ready: afterReady, later: calls.stat })
+
+console.log('\nthe caret window the client ships')
+// This belongs with the completion block above, but driving it needs a buffer
+// large enough to hit the caps, and re-setting the model marks it dirty — which
+// the external-change block depends on not having happened. So it runs here,
+// where nothing is left to disturb. The Host half pins the same two numbers from
+// the other side, by trimming an over-long prefix down to the shared window.
+globalThis.fetch = async (url, options) => {
+  calls.fetch.push({ url, body: JSON.parse(options.body) })
+  return new Response(JSON.stringify({ ok: true, text: '' }), { headers: { 'content-type': 'application/json' } })
+}
+// Position-encoded on purpose: a run of one repeated character makes the text at
+// the caret identical to the text elsewhere in the buffer, so an assertion that
+// compares content would pass no matter which end the slice kept.
+const caretBuffer = Array.from({ length: 5000 }, (_, index) => String.fromCharCode(97 + (index % 26))).join('')
+await act(async () => { currentModel.setValue(caretBuffer) })
+// Park the caret 4000 characters in, so both slices are cut by the caps: 4000 is
+// more than the prefix window and 1000 characters are left after it, more than
+// the suffix window. A shorter buffer would only prove the slice works.
+fakeOffset = 4000
+await act(async () => {
+  await calls.inlineCompletionProvider.provideInlineCompletions(currentModel, { lineNumber: 1, column: 1 }, {}, { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) })
+})
+const shipped = calls.fetch.at(-1)?.body
+// Compared against the exact expected slice, not its length: a length check
+// cannot tell the text at the caret from the text 4000 characters above it.
+check('the context before the caret is shipped exactly, anchored at the caret',
+  shipped?.prefix === caretBuffer.slice(fakeOffset - COMPLETION_PREFIX_CHARS, fakeOffset),
+  { sent: shipped?.prefix?.length, window: COMPLETION_PREFIX_CHARS })
+check('the context after the caret is shipped exactly, anchored at the caret',
+  shipped?.suffix === caretBuffer.slice(fakeOffset, fakeOffset + COMPLETION_SUFFIX_CHARS),
+  { sent: shipped?.suffix?.length, window: COMPLETION_SUFFIX_CHARS })
 
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURE(S)`)
 await act(async () => { renderer.unmount() })

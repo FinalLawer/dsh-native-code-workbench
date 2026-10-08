@@ -10,6 +10,7 @@
 import assert from 'node:assert/strict'
 import { ACCOUNT_TOKEN_HEADER, fimEndpoint, completeFim } from '../dsh-code-workbench/completion-api.mjs'
 import { Config, apply } from '../dsh-code-workbench/index.js'
+import { COMPLETION_PREFIX_CHARS, COMPLETION_SUFFIX_CHARS } from '../dsh-code-workbench/src/completion-window.mjs'
 
 // A bare origin carries no path, and the WHATWG URL setter turns an empty
 // pathname back into `/`. Deriving the endpoint by read-modify-write on that
@@ -177,6 +178,29 @@ try {
   assert.equal(hostBody.prompt, 'const double = xs')
   assert.equal(hostBody.suffix, '\nconsole.log(double)')
   assert.equal(hostBody.messages, undefined)
+
+  // An over-long request is trimmed to the shared caret window — the same number
+  // the client ships, pinned from the other side in the client smoke suite. A cap
+  // below the client's window would answer from less context than the request
+  // claimed, silently; a cap above it leaves the bound open to any client.
+  request = stubFetch(reply('trimmed'))
+  // Position-encoded so head and tail are distinguishable, and checked as such
+  // below: a run of one repeated character would make both slice directions equal
+  // and every assertion here would pass either way.
+  const encode = (length, seed) => Array.from({ length }, (_, index) => String.fromCharCode(97 + ((index + seed) % 26))).join('')
+  const longPrefix = encode(COMPLETION_PREFIX_CHARS + 500, 0)
+  const longSuffix = encode(COMPLETION_SUFFIX_CHARS + 500, 3)
+  assert.notEqual(longPrefix.slice(-COMPLETION_PREFIX_CHARS), longPrefix.slice(0, COMPLETION_PREFIX_CHARS), 'the prefix fixture must tell a head from a tail')
+  assert.notEqual(longSuffix.slice(-COMPLETION_SUFFIX_CHARS), longSuffix.slice(0, COMPLETION_SUFFIX_CHARS), 'the suffix fixture must tell a head from a tail')
+  await complete(route, { sessionId: 's1', path: 'a.js', prefix: longPrefix, suffix: longSuffix })
+  const trimmed = JSON.parse(request.init.body)
+  assert.equal(trimmed.prompt.length, COMPLETION_PREFIX_CHARS, 'the prefix must be cut to the shared window')
+  assert.equal(trimmed.suffix.length, COMPLETION_SUFFIX_CHARS, 'the suffix must be cut to the shared window')
+  // …and it cuts from the right end. The text nearest the caret is the part that
+  // tells the model where it is; keeping the head of the buffer would answer from
+  // code the caret has already left behind.
+  assert.equal(trimmed.prompt, longPrefix.slice(-COMPLETION_PREFIX_CHARS), 'the prefix must keep its tail')
+  assert.equal(trimmed.suffix, longSuffix.slice(0, COMPLETION_SUFFIX_CHARS), 'the suffix must keep its head')
 
   // The Host falls back to the credential store when no key is typed.
   request = stubFetch(reply('from store'))

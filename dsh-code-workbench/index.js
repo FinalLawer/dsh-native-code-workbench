@@ -29,6 +29,7 @@
 import z from './vendor/schemastery.mjs'
 import * as disk from 'node:fs/promises'
 import { fimEndpoint, completeFim } from './completion-api.mjs'
+import { COMPLETION_PREFIX_CHARS, COMPLETION_SUFFIX_CHARS } from './src/completion-window.mjs'
 
 /** The endpoint DeepSeek documents for fill-in-the-middle completion. */
 const DEFAULT_COMPLETION_BASE_URL = 'https://api.deepseek.com/beta'
@@ -119,8 +120,8 @@ function journalWrite(sessionId, path, note, outcome, text) {
 const COMPLETE_PATH = '/api/code-workbench/complete'
 /** The read-only route reporting which credential the completion route would use. */
 const COMPLETION_STATUS_PATH = '/api/code-workbench/completion-status'
-/** Caps on one completion request. */
-const COMPLETE_CAPS = { prefix: 3200, suffix: 900, maxTokens: 128 }
+/** Caps on one completion request. The window is shared with the client half. */
+const COMPLETE_CAPS = { prefix: COMPLETION_PREFIX_CHARS, suffix: COMPLETION_SUFFIX_CHARS, maxTokens: 128 }
 
 /**
  * The credential-store reference holding a DeepSeek platform key.

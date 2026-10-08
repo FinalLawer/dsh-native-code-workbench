@@ -19,6 +19,7 @@
 import React from 'react'
 import './workbench.css'
 import { serializeSnippet, splitSnippets } from './snippets.mjs'
+import { COMPLETION_PREFIX_CHARS, COMPLETION_SUFFIX_CHARS } from './completion-window.mjs'
 
 const { useCallback, useEffect, useMemo, useRef, useState } = React
 const h = React.createElement
@@ -1097,8 +1098,8 @@ function CodePanel(props) {
         if (st.path === null || model !== editor.getModel() || inFlightRef.current) return { items: [] }
         const value = model.getValue()
         const offset = model.getOffsetAt(position)
-        const prefix = value.slice(Math.max(0, offset - 3200), offset)
-        const suffix = value.slice(offset, offset + 900)
+        const prefix = value.slice(Math.max(0, offset - COMPLETION_PREFIX_CHARS), offset)
+        const suffix = value.slice(offset, offset + COMPLETION_SUFFIX_CHARS)
         if (prefix.trim() === '') return { items: [] }
         const cacheKey = `${sessionId}\u0000${st.path}\u0000${settings.completionBaseUrl}\u0000${settings.completionApiModel}\u0000${model.getLanguageId()}\u0000${prefix}\u0000${suffix}`
         const cached = completionCache.get(cacheKey)
