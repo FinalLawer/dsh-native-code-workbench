@@ -48,18 +48,31 @@ function stubFetch(payload) {
   return seen
 }
 
+/** Every `logger.warn` the Host half emitted during the current mount. */
+let warns = []
+
 /** Mount the plugin against a stub Host scope. */
 function mountHost(value, overrides = {}) {
   const routes = []
+  warns = []
   const scope = {
     effect: (callback) => callback(),
     settings: { configure: () => () => {}, describe: () => [{ ns: 'code-workbench', value }] },
     connection: { admit: () => ({}), fetch: { register: (route) => { routes.push(route); return () => {} } } },
     tools: { register: () => () => {} },
+    // A printf stand-in rather than a plain joiner: if the format string and its
+    // arguments ever disagree, the missing field shows up as an empty slot and
+    // the assertions below fail, instead of a literal `%s` sliding through.
+    logger: {
+      warn: (...args) => {
+        let next = 1
+        warns.push(String(args[0]).replace(/%s/g, () => String(args[next++] ?? '')))
+      },
+    },
     get: (name) => overrides[name],
   }
   apply({ fiber: {}, inject: (names, callback) => callback(scope) }, {})
-  return { route: routes.find((r) => r.path.endsWith('/complete')), statusRoute: routes.find((r) => r.path.endsWith('/completion-status')) }
+  return { route: routes.find((r) => r.path.endsWith('/complete')), statusRoute: routes.find((r) => r.path.endsWith('/completion-status')), warns }
 }
 
 /** POST one completion and return the parsed response body. */
@@ -220,13 +233,37 @@ try {
   assert.equal(request.init.headers[ACCOUNT_TOKEN_HEADER], 'grant-token')
 
   // With no credential the route still answers — and answers nothing.
+  const skippedPrefix = 'const x ='
   const empty = mountHost({ completionBaseUrl: 'https://api.deepseek.com/beta' }, { credentials: { resolve: async () => undefined } })
-  assert.deepEqual(await complete(empty.route, { sessionId: 's1', path: 'a.js', prefix: 'const x =' }), { ok: true, text: '' })
+  assert.deepEqual(await complete(empty.route, { sessionId: 's1', path: 'deep/inside/a.js', prefix: skippedPrefix, language: 'javascript' }), { ok: true, text: '' })
+
+  // The editor is told nothing, so the Host log is the only place a skipped
+  // completion is ever explained — and the last real bug here was diagnosed by
+  // hand from exactly this kind of context. It must name the file, the language
+  // the client claimed and the context sizes. It must carry none of the buffer,
+  // which is the person's code, and not the directories it sits in either.
+  const logged = empty.warns.join('\n')
+  assert.match(logged, /no completion credential is available/, `the reason belongs in the log: ${logged}`)
+  assert.match(logged, /a\.js/, `the file belongs in the log: ${logged}`)
+  assert.match(logged, /javascript/, `the language the client claimed belongs in the log: ${logged}`)
+  assert.match(logged, new RegExp(`${skippedPrefix.length}\\+0 chars`), `the context sizes belong in the log: ${logged}`)
+  assert.ok(!logged.includes(skippedPrefix), `the log must not carry the buffer text: ${logged}`)
+  assert.ok(!logged.includes('deep/inside'), `the log must not carry the directory: ${logged}`)
 
   // A provider failure answers the same empty body as "no credential", because
-  // the person typing cannot act on either. Only the Host log records which.
+  // the person typing cannot act on either: one body, two causes, and only the
+  // log distinguishes them. Reaching the provider needs a credential — without
+  // one the route skips earlier and this would be asserting the case above it.
+  const provider = mountHost({ completionBaseUrl: 'https://api.deepseek.com/beta' }, {
+    credentials: { resolve: async () => ({ value: 'sk-provider', source: 'file' }) },
+  })
   globalThis.fetch = async () => { throw new Error('socket hang up') }
-  assert.deepEqual(await complete(empty.route, { sessionId: 's1', path: 'a.js', prefix: 'const x =' }), { ok: true, text: '' })
+  assert.deepEqual(await complete(provider.route, { sessionId: 's1', path: 'deep/inside/a.js', prefix: skippedPrefix, language: 'javascript' }), { ok: true, text: '' })
+  const failureLine = provider.warns.at(-1) ?? ''
+  assert.match(failureLine, /the provider request failed/, `a provider failure must name itself: ${failureLine}`)
+  assert.ok(!failureLine.includes('no completion credential'), `the request must have reached the provider: ${failureLine}`)
+  assert.match(failureLine, /socket hang up/, `and carry the underlying error: ${failureLine}`)
+  assert.match(failureLine, /a\.js/, `and the same context: ${failureLine}`)
 
   // A malformed request is the one case that stays an error: it means our own
   // client half is broken, and silence would hide that.

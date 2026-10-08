@@ -317,15 +317,35 @@ async function handleWrite(scope, request) {
 
 /**
  * Record one skipped or failed completion in the Host log, never in the editor.
+ *
+ * This is the only place a skipped completion is ever explained: the route
+ * answers the editor with an empty success on purpose, so nothing in the GUI
+ * says why Tab did nothing. The context fields are what make the line worth
+ * having. They separate the ordinary causes — no credential, provider refusing —
+ * from the ones that are not ordinary, and the distinguishing detail for the
+ * last real bug here was exactly the context: a prompt of a few characters
+ * behaves differently from a full buffer, and knowing the client called the file
+ * plain text rather than code is most of the diagnosis.
+ *
+ * The file's name only, not its path: the name is what a person recognises in
+ * their own log, and dropping the directories keeps the line from carrying the
+ * shape of someone's disk when it is pasted into a report. The counts are
+ * counts — the buffer itself never reaches the log.
  * @param scope - injected Host services.
  * @param reason - why the attempt was skipped.
+ * @param context - the file, the claimed language, and the context sizes.
  * @param error - the underlying failure, when there is one.
  */
-function logCompletionFailure(scope, reason, error) {
+function logCompletionFailure(scope, reason, context, error) {
   const logger = scope?.logger
   if (logger === undefined || typeof logger.warn !== 'function') return
-  if (error === undefined) logger.warn('code-workbench: completion skipped — %s', reason)
-  else logger.warn('code-workbench: completion skipped — %s (%s)', reason, error?.message ?? String(error))
+  const detail = [
+    context?.file === '' ? undefined : context.file,
+    context?.language === '' ? undefined : context.language,
+    context === undefined ? undefined : `${context.prefixChars}+${context.suffixChars} chars`,
+  ].filter((field) => field !== undefined).join(' · ')
+  if (error === undefined) logger.warn('code-workbench: completion skipped — %s [%s]', reason, detail)
+  else logger.warn('code-workbench: completion skipped — %s (%s) [%s]', reason, error?.message ?? String(error), detail)
 }
 
 /**
@@ -339,11 +359,12 @@ function logCompletionFailure(scope, reason, error) {
  * instead of into the editor.
  * @param scope - injected Host services, used for the Host-side record.
  * @param reason - why the attempt was skipped.
+ * @param context - what was being completed, for the log line.
  * @param error - the underlying failure, when there is one.
  * @returns an empty completion response.
  */
-function silentCompletion(scope, reason, error) {
-  logCompletionFailure(scope, reason, error)
+function silentCompletion(scope, reason, context, error) {
+  logCompletionFailure(scope, reason, context, error)
   return json(200, { ok: true, text: '' })
 }
 
@@ -374,6 +395,16 @@ async function handleComplete(scope, request, config, settings) {
   if (typeof path !== 'string' || path === '') return json(400, { ok: false, error: { code: 'BAD_REQUEST', message: 'path is required' } })
   if (typeof prefix !== 'string' || prefix.trim() === '') return json(400, { ok: false, error: { code: 'BAD_REQUEST', message: 'prefix is required' } })
 
+  // What the client says it is completing. Nothing here changes the request —
+  // the model gets only the caret window — but a skipped completion is silent in
+  // the editor, so this is what the one log line has to say for itself.
+  const context = {
+    file: String(path).split(/[\\/]/).at(-1) ?? '',
+    language: typeof body?.language === 'string' ? body.language : '',
+    prefixChars: prefix.length,
+    suffixChars: typeof suffix === 'string' ? suffix.length : 0,
+  }
+
   const liveSettings = settings?.describe?.({ redactSecrets: false })
     ?.find((entry) => entry.ns === 'code-workbench')?.value
   const preference = (field) => liveSettings?.[field] ?? config?.[field]?.get?.() ?? config?.[field]
@@ -384,11 +415,11 @@ async function handleComplete(scope, request, config, settings) {
   try {
     endpoint = fimEndpoint(baseUrl)
   } catch (error) {
-    return silentCompletion(scope, 'the configured base URL is not a usable HTTP(S) address', error)
+    return silentCompletion(scope, 'the configured base URL is not a usable HTTP(S) address', context, error)
   }
 
   const credential = await resolveCompletionCredential(scope, preference, baseUrl)
-  if (credential === undefined) return silentCompletion(scope, 'no completion credential is available')
+  if (credential === undefined) return silentCompletion(scope, 'no completion credential is available', context)
 
   const upstream = credential.apiKey === undefined
     ? { baseUrl, accountToken: credential.accountToken }
@@ -404,7 +435,7 @@ async function handleComplete(scope, request, config, settings) {
     })
     return json(200, { ok: true, text })
   } catch (error) {
-    return silentCompletion(scope, `the provider request failed [${describe}]`, error)
+    return silentCompletion(scope, `the provider request failed [${describe}]`, context, error)
   }
 }
 
