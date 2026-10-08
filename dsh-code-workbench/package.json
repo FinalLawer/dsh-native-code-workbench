@@ -1,7 +1,7 @@
 {
   "name": "dsh-code-workbench",
   "description": "Code Workbench for the DSH Web GUI: Monaco (the VS Code editor core) over workspace files in the right sidebar, with a version-guarded save path",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "private": true,
   "type": "module",
   "main": "index.js",

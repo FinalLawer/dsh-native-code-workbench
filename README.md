@@ -15,16 +15,16 @@ https://github.com/FinalLawer/dsh-native-code-workbench#path:/dsh-code-workbench
 固定版本请把 tag 一起带上：
 
 ```
-https://github.com/FinalLawer/dsh-native-code-workbench#v0.4.1&path:/dsh-code-workbench
+https://github.com/FinalLawer/dsh-native-code-workbench#v0.4.2&path:/dsh-code-workbench
 ```
 
 命令行等价写法（需先完全退出 DSH）：
 
 ```
-dsh plugin --profile desktop add "https://github.com/FinalLawer/dsh-native-code-workbench#v0.4.1&path:/dsh-code-workbench"
+dsh plugin --profile desktop add "https://github.com/FinalLawer/dsh-native-code-workbench#v0.4.2&path:/dsh-code-workbench"
 ```
 
-也可以从压缩包安装：把 `dsh-code-workbench-<版本>.tgz` 放到任意位置，在同一个对话框里填它的**绝对路径**。两条路径装进 profile 的内容一致（按 `files` 白名单，12 个文件）。
+也可以从压缩包安装：把 `dsh-code-workbench-<版本>.tgz` 放到任意位置，在同一个对话框里填它的**绝对路径**。两条路径装进 profile 的内容一致（按 `files` 白名单，13 个文件）。
 
 安装需要目标机器有 **pnpm**；走 GitHub 链接还需要 **git**，压缩包不需要。包里的 `client.js` 是预构建产物，安装过程**不执行任何构建脚本**，所以不会触发 pnpm 的依赖脚本拦截。
 
