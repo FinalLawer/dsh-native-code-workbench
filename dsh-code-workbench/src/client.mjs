@@ -1010,8 +1010,36 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
     }
     return onAction(action, target)
   }
+  /**
+   * Clear the selection when a click lands on blank space.
+   *
+   * The empty area below the rows is not a control, so a click there means
+   * "nothing is selected" — which is also how the toolbar gets back to creating
+   * in the workspace root instead of inside whatever was last clicked. Rows, the
+   * in-tree name field and the toolbar's own buttons are excluded, because each
+   * of them owns its click.
+   *
+   * `selected` is the whole of the selection: `extraSelection` and the range
+   * anchor hang off it, so leaving either behind would make the next Shift-click
+   * measure a range from a row the user can no longer see as selected.
+   */
+  const clearSelection = (event) => {
+    const target = event?.target
+    // Spare the rows, the controls inside them, and the toolbar — including the
+    // toolbar's own empty space. Moving up to press "new file" is the common
+    // next move after selecting a folder, so a near miss has to keep the
+    // target rather than silently reset it to the workspace root.
+    if (typeof target?.closest === 'function'
+      && target.closest('.code-workbench-tree-row, button, input, .code-workbench-tree-toolbar') !== null) return
+    setSelected(null)
+    setExtraSelection(new Set())
+    selectionAnchorRef.current = null
+    setDropTarget(null)
+  }
   return h('div', {
+    className: 'code-workbench-tree',
     style: { overflow: 'auto', padding: '4px 0' },
+    onClick: clearSelection,
     onContextMenu: (event) => contextMenu(event, cwd, true),
   },
     h('div', { className: 'code-workbench-tree-toolbar' },
@@ -1121,6 +1149,16 @@ function CodePanel(props) {
   const [treeClipboard, setTreeClipboard] = useState(null)
   const [searchDirectory, setSearchDirectory] = useState(null)
   const [tabMenu, setTabMenu] = useState(null)
+  /**
+   * The tab strip's in-flight drag and where it would land.
+   *
+   * `dataTransfer` cannot be read during `dragover`, so the path being dragged
+   * lives in a ref; `tabDrop` is `{path, side}` for the tab under the pointer,
+   * which is what draws the insertion marker. Both are cleared on drag end,
+   * including a drag that ended over the composer instead of the strip.
+   */
+  const tabDragRef = useRef(null)
+  const [tabDrop, setTabDrop] = useState(null)
 
   // ---- published updates ---------------------------------------------------
   // Asked once per mount: the panel is opened constantly and a release is rare,
@@ -2105,10 +2143,80 @@ function CodePanel(props) {
     event.stopPropagation()
     setTabMenu({ path, x: Math.max(0, Math.min(event.clientX, window.innerWidth - 230)), y: Math.max(0, Math.min(event.clientY, window.innerHeight - 220)) })
   }
+  /**
+   * Move a tab to another tab's position.
+   *
+   * The positions are read inside the update, not from the render that drew the
+   * strip: a drop can arrive after a close has already shifted the indices, and
+   * a stale pair would silently move the wrong tab.
+   */
+  const moveTab = (from, to) => {
+    setOpenPaths((paths) => {
+      const fromIndex = paths.indexOf(from)
+      const toIndex = paths.indexOf(to)
+      if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) return paths
+      const next = [...paths]
+      next.splice(fromIndex, 1)
+      next.splice(toIndex, 0, from)
+      return next
+    })
+  }
   const tabs = openPaths.map((path) => {
     const name = path.split(/[\\/]/).at(-1)
     const tabDirty = buffersRef.current.get(path)?.dirty
-    return h('div', { key: path, className: `code-workbench-tab${path === activePath ? ' active' : ''}`, onClick: () => openFile(path), onContextMenu: (event) => showTabMenu(event, path) },
+    const side = tabDrop?.path === path ? tabDrop.side : null
+    return h('div', {
+      key: path,
+      className: `code-workbench-tab${path === activePath ? ' active' : ''}${side === null ? '' : ` code-workbench-tab-drop-${side}`}`,
+      onClick: () => openFile(path),
+      onContextMenu: (event) => showTabMenu(event, path),
+      // A tab is a drag source for the same two gestures a tree row offers: it
+      // carries a workspace path to the composer, and it reorders the strip.
+      // The private flavor is what keeps both disjoint from DSH's own file-drop
+      // pipeline, so the composer's interceptor claims the drop and nothing else
+      // does.
+      draggable: true,
+      onDragStart: (event) => {
+        tabDragRef.current = path
+        event.dataTransfer.effectAllowed = 'copyMove'
+        event.dataTransfer.setData(TREE_DRAG_MIME, treeDragPayload(path, cwd, false))
+        // The universal fallback, same as a tree row's: if the composer's
+        // interceptor ever declined the drop, the text is still the path.
+        event.dataTransfer.setData('text/plain', relativeToCwd(path, cwd) || path)
+      },
+      onDragOver: (event) => {
+        const from = tabDragRef.current
+        // A tree row's drag carries the same flavor but never sets this ref, so
+        // it passes over the strip without reordering anything.
+        if (from === null || from === path) return
+        event.preventDefault()
+        event.stopPropagation()
+        event.dataTransfer.dropEffect = 'move'
+        // Which edge the marker goes on is decided by direction: a tab dragged
+        // rightwards lands after the one it is over, and the other way round.
+        const nextSide = openPaths.indexOf(from) < openPaths.indexOf(path) ? 'after' : 'before'
+        if (tabDrop?.path !== path || tabDrop.side !== nextSide) setTabDrop({ path, side: nextSide })
+      },
+      onDragLeave: (event) => {
+        // Moving onto the tab's own name or close button fires `dragleave` too;
+        // only a departure from the whole tab clears its marker.
+        if (typeof event?.currentTarget?.contains === 'function' && event.currentTarget.contains(event.relatedTarget)) return
+        if (tabDrop?.path === path) setTabDrop(null)
+      },
+      onDrop: (event) => {
+        const from = tabDragRef.current
+        if (from === null || from === path) return
+        event.preventDefault()
+        event.stopPropagation()
+        tabDragRef.current = null
+        setTabDrop(null)
+        moveTab(from, path)
+      },
+      onDragEnd: () => {
+        tabDragRef.current = null
+        setTabDrop(null)
+      },
+    },
       h('span', { title: path }, `${name}${tabDirty ? ' ●' : ''}`),
       h('button', { title: `关闭 ${name}`, onClick: (event) => { event.stopPropagation(); closeFile(path) } }, '×'))
   })

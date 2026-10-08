@@ -15,13 +15,13 @@ https://github.com/FinalLawer/dsh-native-code-workbench#path:/dsh-code-workbench
 固定版本请把 tag 一起带上：
 
 ```
-https://github.com/FinalLawer/dsh-native-code-workbench#v0.5.0&path:/dsh-code-workbench
+https://github.com/FinalLawer/dsh-native-code-workbench#v0.5.1&path:/dsh-code-workbench
 ```
 
 命令行等价写法（需先完全退出 DSH）：
 
 ```
-dsh plugin --profile desktop add "https://github.com/FinalLawer/dsh-native-code-workbench#v0.5.0&path:/dsh-code-workbench"
+dsh plugin --profile desktop add "https://github.com/FinalLawer/dsh-native-code-workbench#v0.5.1&path:/dsh-code-workbench"
 ```
 
 也可以从压缩包安装：把 `dsh-code-workbench-<版本>.tgz` 放到任意位置，在同一个对话框里填它的**绝对路径**。两条路径装进 profile 的内容一致（按 `files` 白名单，13 个文件）。
@@ -34,6 +34,8 @@ dsh plugin --profile desktop add "https://github.com/FinalLawer/dsh-native-code-
 
 左侧图标栏切换文件、搜索和历史视图，再次点击当前视图可收起导航。文件树顶部提供新建文件、新建文件夹、刷新和全部折叠。编辑区显示多文件标签和当前文件的路径面包屑，配色与控件跟随 DSH 主题。
 
+文件树里单击空白处会清空选中；顶部的新建按钮于是回到「在工作区根目录创建」，选中某个目录时则改为在该目录中创建。编辑区的标签可以拖动：在标签条内左右拖可以换位，拖进主对话输入框则落成一枚引用胶囊（与拖文件树行同形）。
+
 每个打开的文件保留独立编辑内容、撤销记录和光标/滚动位置，切换标签不丢失未保存修改。标签上的圆点表示未保存；关闭时可确认放弃或取消后保存。开启自动保存后，切换文件也会保存原文件。重命名、移动或删除前必须先保存受影响的打开文件；标签随后同步更新。刷新文件树会重新加载已展开目录。
 
 工作台只渲染 UTF-8 文本，所以 PDF、Excel/CSV、Word/PPT、图片这类文件在这里没有可显示的内容：点击它们**不会开标签页**，而是把文件地址交给右栏的 DSH 官方文档预览打开（状态栏会说明文件去了哪里），右栏因此多出一个预览标签，可与「代码工作台」并排。若当前环境没有注册能认领该地址的预览实现，工作台退回自己的错误提示并注明该去哪看，不会假装打开过。
@@ -41,6 +43,8 @@ dsh plugin --profile desktop add "https://github.com/FinalLawer/dsh-native-code-
 ## 文件树右键菜单
 
 右键点击文件、目录或文件树空白处，可以新建文件和文件夹、在资源管理器中显示、添加路径引用到当前对话、剪切/复制/粘贴、复制路径、重命名及删除。新建和重命名使用工作台内的名称弹窗，删除使用确认弹窗。剪切和复制后，在目标文件夹右键选择粘贴；复制遇到同名文件会自动生成副本名称。「添加路径引用」或把文件树行拖进输入框会落成一枚引用胶囊，发送时展开为与官方 `@` 引用同形的 **`@路径` mention**（目录带尾斜杠）：聊天记录里因此渲染回同一个胶囊、点按在右栏预览，Agent 则按系统提示里那条 `@` 指引先读再下结论。文件操作要求会话允许工作区写入，禁止覆盖已有目标和修改工作区外路径；删除需要确认且不能撤销。
+
+**选中只由用户放下**：单击（左键）文件树的空白处会清空选中。落在行上、行内控件、工具栏（包括工具栏自己的空白）或输入框里的点击不算空白——否则「选中一行」和「清空选中」会重合成一个手势，而选中目录后往右上走点「新建文件」的擦边点击会先把目标打回根目录。清空后顶部新建按钮回到在工作区根目录创建；当前打开的文件不受影响（选中是「操作目标」，不是「正在看的文件」）。
 
 已移除「打开工作区终端」和「在文件夹中查找」。菜单不包含运行测试、调试测试、运行覆盖率测试，目前未加入「添加到新对话」。
 
@@ -116,6 +120,8 @@ API Key 通过 Host 设置服务保存，标记为秘密字段，设置页不会
 | **外部改动自动重载** | Agent/外部改了盘上文件 → 干净缓冲区**自动刷新**；有未保存修改时警告不覆盖 | 官方 `workspaceFiles.changes` 流（`ctx.remote.$stream`），按打开文件订阅 |
 | **加到对话（Add to Chat）** | 右栏**选中多行代码** → `Ctrl+L`/按钮 → 主对话输入框里出现**引用胶囊**（只显示 `文件:行号 · N 行`），**发送时才展开**成完整代码块给 Agent | 官方 chip 机制：`slash/input-insert-reference` 事件插 `ReferenceChipNode` + 自注册 reference codec（`inputTriggers.registerSource` 的 `codec.serialize` 做提交展开） |
 | **拖拽行到输入框** | 文件树行（文件或目录）拖进主对话输入框 → 落成引用胶囊；**发送时展开为共享 `@路径` mention**（目录带尾斜杠、含空格走 `@"…"`），聊天记录里渲染回同一个胶囊 | 私有 MIME「三重收窄」在 document 捕获阶段接管拖放 → 同一个官方 `slash/input-insert-reference` 通道；提交展开走同一个 reference codec（`clipboardText` 与展开文案逐字一致） |
+| **拖拽标签页** | 标签条上的标签同样可拖：拖进主对话输入框 → 与拖文件树行**完全相同的引用胶囊**；在标签条内左右拖 → **换位**，落点那一侧的边缘出现插入标记 | 复用同一个私有 MIME 和同一个官方通道，因此胶囊只有一个出处；条内换位由各自的 drag ref 分流——**两个手势互不认领**（树行拖过标签条不换位，标签拖到文件夹行也不移动文件） |
+| **点空白处取消选中** | 单击文件树空白处 → 清空选中；顶部新建按钮随之回到在工作区根目录创建 | 树的容器 `onClick`，用 `closest('.code-workbench-tree-row, button, input, .code-workbench-tree-toolbar')` 排除落在行、行内控件和工具栏上的点击：行点击本来就会冒泡到容器，而工具栏是右对齐的，**选中目录后的下一个动作就是往右上走点「新建文件」，擦边落在它的空白处**——没有这道守卫时，两个手势会重合成一个，近失手又会把目标悄悄打回根目录。清空 `selected` 的同时一并清掉 Shift 多选集合与锚点 |
 | 可追溯 | 每次保存记 Session 备注 | `sessionFeedback.record` |
 | 主题 | 跟随 DSH 明暗主题 | `body[data-ds-dark-theme]` MutationObserver → `monaco.editor.setTheme` |
 | 快捷键 | `Ctrl+S` 保存、`Ctrl+L` 将选中代码加入对话、`Tab` 接受补全（编辑器内） | `editor.addCommand` |
@@ -182,6 +188,8 @@ node tools/probe-completion-credential.mjs --live    # 再对每一路真实各�
 - 替换是**逐文件**的 `rename`：一个文件失败不影响已经落地的那些，失败时留下的是「逐个都合法但版本混合」的树，而不是写坏的文件。校验用的是发布方在清单里给出的摘要（用 `rename` 而不是直接写，是因为安装树里每个文件都是 pnpm 硬链接到内容库的，写穿会改到其他 profile 共用的那份）。
 - ⚠️ 若某次更新提示「重启 DSH 后生效」而用户没有重启就关掉了面板：**不会**再次提示——`installedVersion()` 读的是盘上的 `package.json`，而那时盘上已经是最新版了。这是刻意的（盘上版本就是已安装版本，不制造「永远提示有更新」的假信号），代价是这次提醒是一次性的；下次启动 DSH 会让新版本全面生效。要让「待重启」也持续提醒，需要在启动时快照当前版本再与盘上比对。
 - 免重启的判定只看 `client.js` / `package.json` 是否在改动之列；只要发布里动了 Host 半边加载过的文件（`index.js`、`completion-api.mjs`、`vendor/schemastery.mjs`、`src/completion-window.mjs`、`cordis.patch.yml`），就提示重启——那些代码进程已经加载在内存里，替换文件本身不足以让它们生效。
+- 拖放的两个手势共用同一个私有 MIME，靠各自的 drag ref 分流，所以**跨手势不生效**：把标签拖到文件树的文件夹行上不会移动文件，把文件树行拖过标签条也不会换位。要移动文件请用树内拖放或右键剪切/粘贴，要换位请在标签条内拖。
+- 文件树的「选中」和编辑区的「当前文件」是两件事：清空选中不会关闭任何标签，打开一个文件也不改变树里的选中（顶部新建按钮的落点始终跟着选中走）。选中的目录不会被自动展开。
 - Tab 补全采用 180ms 请求防抖、较小的前后文（前缀 3200 字符 / 后缀 900 字符）和 128 token 预算，并缓存最近 40 个光标上下文。
 
 

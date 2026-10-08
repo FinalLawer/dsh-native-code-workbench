@@ -2,17 +2,17 @@
   "files": {
     "LICENSE": "1d19a36206ef5ea6136f713dc5ea7200a4432290e369a24e43e91fc9b49257d5",
     "build.mjs": "c185c60a6f2cfdce3aceb9cf024d35a6fb83fd81c2457e120a4f11c0e3a9ee3c",
-    "client.js": "43d42e6bb5cf4b18847373cc5b4bf304b0cf13eab764c1320fc91dad02bad18b",
+    "client.js": "eaf1d9881b47221a08192c9ccc50af8dca32a7e771130d7fd754e9b9104185f8",
     "completion-api.mjs": "ca3b73e563449dfd0f8e49aac275107fa1ff2b390a5b417fddb9145d1babbc05",
     "cordis.patch.yml": "4ba0c560522cb7a2e49621db347e2224b422a5725c89d446f27310fe78d194c8",
     "index.js": "d2af3b7105d378eaa32604fbf06c520b0a9877183ea4148a521fefd8faff3aa5",
-    "package.json": "c098fd23bde66a4ffa1543ba7dbe967e28295ba923d6aeba8fdf986a3acc3fb6",
-    "src/client.mjs": "858934dad92c4f7a7a7b7e8b3b864aec2ed13acb81dd34268f9facbf920e6050",
+    "package.json": "2d2100f6507790ae1303aecc19c2b3575c2540acf700f2bc7b2b482fc86fb057",
+    "src/client.mjs": "64bbc207c6347990e68145ee7b4fb93f9c512afe967756e503ce0ee5dc464c04",
     "src/completion-window.mjs": "a9ee42a9ce38a11ee047ab2e8f7612a5c72d386b0b312947db9f917f3a844a53",
     "src/monaco-entry.mjs": "0f5d4b85a40ba7f49976cd2352e6df95057c83b9c02ddeeee0f5a8f07e780d53",
     "src/snippets.mjs": "6054e0957cf016cc92ea2aaa6074abda3475193f3d4f6dd67c5d751049b7c6d6",
-    "src/workbench.css": "00d6eb3b12dd8b37d30563a3ac3119cf4f4c4ef0e2a939fcc6aa0416d8280cf2",
+    "src/workbench.css": "cba03e1665d53904f43b07f8d41e87c8d58bfe54593a1e345c4c826cc4c9fc13",
     "vendor/schemastery.mjs": "2d7a054603361bd89569101afcf997ad00bd62cf8fa6aec43d49083ce0f5dac7"
   },
-  "version": "0.5.0"
+  "version": "0.5.1"
 }

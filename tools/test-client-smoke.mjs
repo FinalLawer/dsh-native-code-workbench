@@ -1575,6 +1575,170 @@ check('the panel did not claim to have opened anything',
 check('and it names the panel that can show the file',
   allText().includes('读取失败') && allText().includes('此类文件需在右栏「文档预览」中打开'), allText().slice(0, 200))
 
+console.log('\nclicking blank space clears the selection')
+// A fresh mount against a known listing: the blocks above re-pointed the tree at
+// a spreadsheet and mounted with a sidebar that throws.
+files.list = async (sessionId, dir) => {
+  calls.list.push(dir)
+  return { ok: true, value: { entries: [
+    { name: 'one.js', type: 'file' },
+    { name: 'two.js', type: 'file' },
+    { name: 'three.js', type: 'file' },
+    { name: 'sub', type: 'directory' },
+  ], truncated: false } }
+}
+await act(async () => { renderer.unmount() })
+await act(async () => { renderer = create(h(CodePanel, props), { createNodeMock: createMockNode }) })
+await act(async () => {})
+const treeRowIn = (title) => findAll(tree(), (n) => n.props?.className === 'code-workbench-tree-row' && n.props.title === title)[0]
+const treeRoot = () => findAll(tree(), (n) => n.props?.className === 'code-workbench-tree')[0]
+const selectedRowCount = () => findAll(tree(), (n) => n.props?.['data-selected'] === true).length
+
+check('the tree exposes the container a blank click lands on', treeRoot() !== undefined)
+check('a fresh tree has nothing selected', selectedRowCount() === 0)
+check('and the toolbar offers to create in the workspace root',
+  toolbarButton('新建文件').props.title === '新建文件', toolbarButton('新建文件').props.title)
+
+await act(async () => { treeRowIn('C:\\repo\\sub').props.onClick() })
+await act(async () => {})
+check('clicking a directory selects it and the toolbar targets that directory',
+  treeRowIn('C:\\repo\\sub').props['data-selected'] === true
+  && toolbarButton('新建文件').props.title.includes('sub'), toolbarButton('新建文件').props.title)
+
+// In a browser a row's click bubbles to this container, so the guard is what
+// keeps "select a row" and "clear the selection" from being the same gesture.
+const rowLikeTarget = { closest: (selector) => (selector.includes('tree-row') ? {} : null) }
+await act(async () => { treeRoot().props.onClick(makeEvent('click', { target: rowLikeTarget })) })
+check('a click that landed on a row is not blank space',
+  treeRowIn('C:\\repo\\sub').props['data-selected'] === true)
+
+// The near miss that matters: after selecting a folder the pointer travels up
+// to the toolbar, which is right-aligned, so most of it is empty space. A click
+// there must not drop the target the user is about to create into. The
+// directory is selected afresh first so this case stands on its own — read off
+// whatever the assertion above left behind, it would only be re-reporting that
+// one's conclusion, and the two clauses of the guard would look like a single
+// fact.
+await act(async () => { treeRowIn('C:\\repo\\sub').props.onClick() })
+await act(async () => {})
+const toolbarTarget = { closest: (selector) => (selector.includes('toolbar') ? {} : null) }
+await act(async () => { treeRoot().props.onClick(makeEvent('click', { target: toolbarTarget })) })
+check('and a click on the toolbar does not count as blank space',
+  treeRowIn('C:\\repo\\sub').props['data-selected'] === true
+  && toolbarButton('新建文件').props.title.includes('sub'), toolbarButton('新建文件').props.title)
+
+await act(async () => { treeRoot().props.onClick(makeEvent('click', { target: { closest: () => null } })) })
+await act(async () => {})
+check('a click on blank space clears the selection', selectedRowCount() === 0, selectedRowCount())
+check('and the toolbar is back to creating in the workspace root',
+  toolbarButton('新建文件').props.title === '新建文件', toolbarButton('新建文件').props.title)
+
+// Which is the whole point of getting back there: the next create lands at the root.
+await createViaToolbar('新建文件', 'at-root-again.js')
+check('with nothing selected the create lands in the workspace root',
+  submittedCreate('createFile', 'C:\\repo\\at-root-again.js'),
+  calls.fetch.filter((call) => call.body.operation === 'createFile').map((call) => call.body.path))
+
+console.log('\ntabs are draggable: to the composer, and sideways to reorder')
+// Creating a file also opens it, and the assertions below count positions in the
+// strip, so the extra tab goes first — through its own close button.
+await act(async () => {
+  findAll(tree(), (n) => n.type === 'button' && n.props.title === '关闭 at-root-again.js')[0].props.onClick({ stopPropagation() {} })
+})
+await act(async () => { treeRowIn('C:\\repo\\one.js').props.onClick() })
+await act(async () => { treeRowIn('C:\\repo\\two.js').props.onClick() })
+await act(async () => { treeRowIn('C:\\repo\\three.js').props.onClick() })
+await act(async () => {})
+const tabNodeFor = (path) => findAll(tree(), (n) => typeof n.props?.className === 'string'
+  && n.props.className.split(' ')[0] === 'code-workbench-tab'
+  && Array.isArray(n.children) && n.children[0]?.props?.title === path)[0]
+const tabOrder = () => findAll(tree(), (n) => typeof n.props?.className === 'string'
+  && n.props.className.split(' ')[0] === 'code-workbench-tab').map((n) => n.children[0].props.title)
+check('three files are open, in the order they were opened',
+  tabOrder().join() === 'C:\\repo\\one.js,C:\\repo\\two.js,C:\\repo\\three.js', tabOrder())
+check('every tab is a drag source', tabNodeFor('C:\\repo\\one.js').props.draggable === true)
+
+const tabTransfer = makeDataTransfer([])
+await act(async () => { tabNodeFor('C:\\repo\\one.js').props.onDragStart(makeEvent('dragstart', { dataTransfer: tabTransfer })) })
+check('a dragged tab publishes its path under the same private flavor a tree row uses',
+  tabTransfer.getData(dragMime) === 'fone.js', tabTransfer.getData(dragMime))
+check('with the plain-text fallback and both effects advertised',
+  tabTransfer.getData('text/plain') === 'one.js' && tabTransfer.effectAllowed === 'copyMove',
+  { text: tabTransfer.getData('text/plain'), effect: tabTransfer.effectAllowed })
+
+// One drop target is the composer, through the very same capture-phase channel
+// a dragged tree row uses — no second protocol, so the chip is identical. The
+// transfer is rebuilt with its entries, because `DataTransfer.types` is read by
+// the guard while `getData` is not: only a flavor declared up front is visible
+// to a `dragover`/`drop` listener, exactly as in a browser.
+const bailBeforeTabDrop = calls.bailed.length
+await act(async () => {
+  dispatchDocument('drop', makeEvent('drop', {
+    dataTransfer: makeDataTransfer([[dragMime, 'fone.js'], ['text/plain', 'one.js']]),
+    target: composerInput,
+  }))
+})
+const tabChip = calls.bailed.at(-1)
+check('a tab dropped on the composer lands as one path-only reference',
+  calls.bailed.length === bailBeforeTabDrop + 1
+  && tabChip?.payload.reference.ref.path === 'one.js'
+  && tabChip?.payload.reference.ref.pathOnly === true
+  && tabChip?.payload.reference.label === 'one.js', tabChip?.payload.reference)
+check('and the status says the reference went to the conversation',
+  allText().includes('已添加到对话：one.js'), allText().slice(-90))
+
+// The other is the strip itself, where a drop takes the target tab's position.
+const backTransfer = makeDataTransfer([[dragMime, 'fthree.js']])
+await act(async () => { tabNodeFor('C:\\repo\\three.js').props.onDragStart(makeEvent('dragstart', { dataTransfer: backTransfer })) })
+const overLeft = makeEvent('dragover', { dataTransfer: backTransfer })
+overLeft.currentTarget = { contains: () => false }
+await act(async () => { tabNodeFor('C:\\repo\\one.js').props.onDragOver(overLeft) })
+await act(async () => {})
+check('the drag is claimed so the browser allows the drop',
+  overLeft.__prevented === true && backTransfer.dropEffect === 'move', backTransfer.dropEffect)
+check('dragging leftwards marks the left edge of the tab under the pointer',
+  tabNodeFor('C:\\repo\\one.js').props.className.includes('code-workbench-tab-drop-before'),
+  tabNodeFor('C:\\repo\\one.js').props.className)
+await act(async () => { tabNodeFor('C:\\repo\\one.js').props.onDrop(makeEvent('drop', { dataTransfer: backTransfer })) })
+await act(async () => {})
+check('the dragged tab takes that position',
+  tabOrder().join() === 'C:\\repo\\three.js,C:\\repo\\one.js,C:\\repo\\two.js', tabOrder())
+check('and the marker is gone once the drop lands',
+  tabNodeFor('C:\\repo\\three.js').props.className.includes('drop') === false
+  && tabNodeFor('C:\\repo\\two.js').props.className.includes('drop') === false)
+
+const rightTransfer = makeDataTransfer([[dragMime, 'fthree.js']])
+await act(async () => { tabNodeFor('C:\\repo\\three.js').props.onDragStart(makeEvent('dragstart', { dataTransfer: rightTransfer })) })
+const overRight = makeEvent('dragover', { dataTransfer: rightTransfer })
+overRight.currentTarget = { contains: () => false }
+await act(async () => { tabNodeFor('C:\\repo\\two.js').props.onDragOver(overRight) })
+await act(async () => {})
+check('dragging rightwards marks the right edge instead',
+  tabNodeFor('C:\\repo\\two.js').props.className.includes('code-workbench-tab-drop-after'),
+  tabNodeFor('C:\\repo\\two.js').props.className)
+await act(async () => { tabNodeFor('C:\\repo\\two.js').props.onDrop(makeEvent('drop', { dataTransfer: rightTransfer })) })
+await act(async () => {})
+check('dropping there puts the strip back in its original order',
+  tabOrder().join() === 'C:\\repo\\one.js,C:\\repo\\two.js,C:\\repo\\three.js', tabOrder())
+
+// Both flavors are shared with the tree, so the two gestures have to stay
+// disjoint: only a drag that started in the strip may reorder it, and only one
+// that started in the tree may move a file.
+const foreignTransfer = makeDataTransfer([[dragMime, 'fa.js']])
+const foreignOver = makeEvent('dragover', { dataTransfer: foreignTransfer })
+foreignOver.currentTarget = { contains: () => false }
+await act(async () => { tabNodeFor('C:\\repo\\one.js').props.onDragOver(foreignOver) })
+check('a drag that did not start in the strip passes over it without reordering',
+  foreignOver.__prevented === false
+  && tabNodeFor('C:\\repo\\one.js').props.className.includes('drop') === false)
+
+const treeMovesBefore = calls.fetch.filter((call) => call.body.operation === 'move').length
+const foreignDrop = makeEvent('drop', { dataTransfer: makeDataTransfer([[dragMime, 'fone.js']]), target: { closest: () => null } })
+await act(async () => { treeRowIn('C:\\repo\\sub').props.onDrop(foreignDrop) })
+check('and a tab dragged over a folder row does not move the file',
+  foreignDrop.__prevented === false
+  && calls.fetch.filter((call) => call.body.operation === 'move').length === treeMovesBefore)
+
 console.log('\na published update is offered, and taking it is one click')
 // The panel is opened constantly and a release is rare, so the whole point of
 // this pair is that it costs one read per mount and nothing at all when there is

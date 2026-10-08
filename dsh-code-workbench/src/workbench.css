@@ -96,6 +96,11 @@
 .code-workbench-tab > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .code-workbench-tab.active { color: var(--dsw-alias-label-primary); background: var(--dsw-alias-bg-base); border-top: 2px solid var(--dsw-alias-brand-primary); }
 .code-workbench-tab button { border: 0; background: transparent; color: inherit; cursor: pointer; font-size: 16px; line-height: 1; }
+/* Where a dragged tab would land. The marker is an inset shadow rather than a
+   border so inserting it cannot change the strip's layout mid-drag: a tab that
+   shifted by a pixel would move the drop target out from under the pointer. */
+.code-workbench-tab-drop-before { box-shadow: inset 2px 0 0 var(--dsw-alias-brand-primary); }
+.code-workbench-tab-drop-after { box-shadow: inset -2px 0 0 var(--dsw-alias-brand-primary); }
 .code-workbench-breadcrumb { min-height: 30px; display: flex; align-items: center; padding: 0 14px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; border-bottom: 1px solid var(--dsw-alias-border-l2); color: var(--dsw-alias-label-secondary); font-size: 12px; }
 .code-workbench {
   position: relative;
