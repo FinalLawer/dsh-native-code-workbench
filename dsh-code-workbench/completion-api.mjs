@@ -1,20 +1,35 @@
 /**
- * The two wire shapes this plugin's independent completion route can speak.
+ * The one wire shape this plugin speaks: fill-in-the-middle completion.
  *
- * Both are OpenAI-compatible; they differ in what they ask the model for:
+ * `POST {base}/completions` with `prompt` + `suffix` — the provider receives
+ * the caret's two sides and returns what belongs between them. Because the FIM
+ * convention belongs to the model rather than to us, no framing and no
+ * instruction prompt are needed: the answer is already code.
  *
- *   - `chat`: `/chat/completions` with a framed `messages` array. The caret
- *     context travels as JSON inside one user message and the model answers
- *     with prose, so the Host has to instruct it to emit code only.
- *   - `fim`: `/completions` with `prompt` + `suffix` — fill-in-the-middle.
- *     The provider itself knows the prefix/suffix convention, so no framing
- *     and no instruction are needed; the model returns the missing middle.
+ * Both halves must be *present* on the wire. An empty `suffix` still travels as
+ * `suffix: ""`; omitting the key entirely silently downgrades the request to
+ * plain continuation and the model answers with training-data prose instead of
+ * code. See the note in {@link completeFim} for the measurement.
+ *
+ * The call is **not streamed**, deliberately. Ghost text is only ever shown as
+ * a finished suggestion — Monaco's inline-completions provider answers once and
+ * cannot revise an item it has already returned — so streaming would buy
+ * nothing while costing an SSE parser and a frame protocol. Measured against
+ * the live endpoint, the two are indistinguishable inside network jitter.
+ * What actually dominates the wait is time-to-first-token (400–800 ms of
+ * network and server queueing), not the length of the generated text.
  *
  * FIM providers disagree on the response field: OpenAI and DeepSeek legacy
- * completions answer with `choices[0].text`, chat-shaped streams carry
- * `choices[0].delta.content`, and Mistral's FIM endpoint documents a
- * chat-shaped `choices[0].message.content`. The reader accepts all three, so
+ * completions answer with `choices[0].text`, chat-shaped replies carry
+ * `choices[0].message.content`, and a few proxies still answer with the
+ * streaming shape `choices[0].delta.content`. The reader accepts all three, so
  * one code path serves every documented provider.
+ *
+ * Authentication has two shapes. A DeepSeek platform key travels as
+ * `Authorization: Bearer`, which is what the public FIM endpoint documents. A
+ * DSH account grant travels as the private `x-dsh-auth-token` header instead:
+ * it is a platform grant rather than an API key, and the account service only
+ * releases one for the inference origin it trusts.
  */
 
 /** Refuse a base URL that is not an HTTP(S) address without embedded credentials. */
@@ -24,12 +39,21 @@ function parseEndpoint(baseUrl) {
   return endpoint
 }
 
-/** The `/chat/completions` endpoint for one base URL; a full endpoint is kept as typed. */
-export function completionEndpoint(baseUrl) {
-  const endpoint = parseEndpoint(baseUrl)
-  endpoint.pathname = endpoint.pathname.replace(/\/+$/, '')
-  if (!endpoint.pathname.endsWith('/chat/completions')) endpoint.pathname += '/chat/completions'
-  return endpoint.toString()
+/**
+ * Append one endpoint suffix to a base path, tolerating a bare origin.
+ *
+ * The path is normalised in a local variable rather than by writing back to
+ * `url.pathname`. Assigning an empty string to that setter is silently undone
+ * by the WHATWG URL parser, which stores it as `/` — so a read-modify-write
+ * (`url.pathname += suffix`) would reintroduce the slash and yield
+ * `//completions` for a base URL that carries no path at all.
+ * @param endpoint - the parsed base URL, mutated in place.
+ * @param suffix - the endpoint suffix to guarantee, e.g. `/completions`.
+ */
+function appendEndpoint(endpoint, suffix) {
+  let path = endpoint.pathname.replace(/\/+$/, '')
+  if (!path.endsWith(suffix)) path += suffix
+  endpoint.pathname = path
 }
 
 /**
@@ -37,134 +61,114 @@ export function completionEndpoint(baseUrl) {
  * `/completions` is kept as typed — that covers the plain OpenAI shape
  * (`…/v1/completions`), DeepSeek's `…/beta/completions`, and Mistral's
  * distinct `…/fim/completions`, which no suffix rule could derive from the
- * host alone. Anything else gains `/completions`, so entering just the
- * service root (`https://api.deepseek.com/beta`) is enough.
+ * host alone. Anything else gains `/completions`, so entering just the service
+ * root (`https://api.deepseek.com/beta`) is enough.
  * @param baseUrl - the configured address, root or full endpoint.
  * @returns the absolute FIM endpoint URL.
  * @throws For a non-HTTP(S) address, or one carrying user credentials.
  */
 export function fimEndpoint(baseUrl) {
   const endpoint = parseEndpoint(baseUrl)
-  endpoint.pathname = endpoint.pathname.replace(/\/+$/, '')
-  if (!endpoint.pathname.endsWith('/completions')) endpoint.pathname += '/completions'
+  appendEndpoint(endpoint, '/completions')
   return endpoint.toString()
 }
 
-/** The text of one streamed frame, read from whichever field the provider uses. */
-function frameText(frame) {
-  const choice = frame?.choices?.[0]
-  if (choice === undefined || choice === null) return undefined
-  if (typeof choice.text === 'string') return choice.text
-  const delta = choice.delta?.content
-  if (typeof delta === 'string') return delta
-  const message = choice.message?.content
-  return typeof message === 'string' ? message : undefined
-}
-
-/**
- * Split one response body into the payloads of its SSE `data:` events.
- * Comments, other fields and the `[DONE]` sentinel are dropped here, so each
- * caller only has to read frames.
- * @param body - the response body stream.
- * @yields each non-empty data payload, in order.
- */
-async function* ssePayloads(body) {
-  const reader = body.getReader()
-  const decoder = new TextDecoder()
-  let buffer = ''
-  let eventData = []
-  try {
-    for (;;) {
-      const { done, value } = await reader.read()
-      buffer += done ? decoder.decode() : decoder.decode(value, { stream: true })
-      if (done) buffer += '\n\n'
-      let newline
-      while ((newline = buffer.indexOf('\n')) >= 0) {
-        const line = buffer.slice(0, newline).replace(/\r$/, '')
-        buffer = buffer.slice(newline + 1)
-        if (line.startsWith('data:')) eventData.push(line.slice(5).trimStart())
-        else if (line === '') {
-          const data = eventData.join('\n')
-          eventData = []
-          if (data !== '' && data !== '[DONE]') yield data
-        }
-      }
-      if (done) break
-    }
-  } finally {
-    await reader.cancel().catch(() => {})
-    reader.releaseLock()
-  }
-}
-
-/** The status-specific guidance on a non-OK response, shared by both shapes. */
-function httpFailure(response) {
-  const hint = response.status === 429 ? '：请求被限流，请稍后重试'
-    : response.status === 401 ? '：请检查 API Key'
-      : response.status === 404 ? '：请检查 API 地址（FIM 模式需要该服务的补全端点）'
-        : '：请检查 API 地址、模型 ID 和接口参数'
-  return new Error(`独立补全 API 返回 HTTP ${response.status}${hint}`)
-}
-
-/**
- * Stream one Chat Completions call as text deltas.
- * @param config - `baseUrl` and optional `apiKey`.
- * @param options - `model`, `messages` (one user message carrying the framed
- *   context), `system`, `maxTokens`, `signal`.
- * @yields `{type:'text-delta',text}` frames, then one `{type:'finish'}`.
- */
-export async function* streamCompletionApi(config, options) {
-  const response = await fetch(completionEndpoint(config.baseUrl), {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', ...(config.apiKey ? { authorization: `Bearer ${config.apiKey}` } : {}) },
-    body: JSON.stringify({ model: options.model, messages: [{ role: 'system', content: options.system }, { role: 'user', content: options.messages[0].content[0].text }], stream: true, max_tokens: options.maxTokens }),
-    signal: options.signal,
-  })
-  if (!response.ok) throw httpFailure(response)
-  if (!response.body) throw new Error('独立补全 API 返回空响应')
-  for await (const data of ssePayloads(response.body)) {
-    const frame = JSON.parse(data)
-    if (frame.error) throw new Error('独立补全 API 返回错误，请检查模型和接口配置')
-    const text = frame.choices?.[0]?.delta?.content
-    if (typeof text === 'string' && text !== '') yield { type: 'text-delta', text }
-  }
-  yield { type: 'finish', reason: { kind: 'stop' } }
-}
+/** How long one completion may take before it is abandoned. */
+const COMPLETION_TIMEOUT_MS = 10_000
 
 /** Sampling temperature for completion: predicting code is not a creative task. */
 const FIM_TEMPERATURE = 0.2
 
 /**
- * Stream one fill-in-the-middle completion as text deltas. The prefix and
- * suffix reach the provider as-is — no framing, which is the whole point of
+ * The header carrying a DSH account grant. The account service issues a
+ * platform grant rather than a DeepSeek platform key, and the official
+ * provider sends it under this private header instead of `Authorization`.
+ */
+export const ACCOUNT_TOKEN_HEADER = 'x-dsh-auth-token'
+
+/**
+ * The completion text inside one successful response, read from whichever
+ * field the provider uses.
+ * @param frame - the parsed response body.
+ * @returns the text, or undefined when the body carries none.
+ */
+function completionText(frame) {
+  const choice = frame?.choices?.[0]
+  if (choice === undefined || choice === null) return undefined
+  if (typeof choice.text === 'string') return choice.text
+  const message = choice.message?.content
+  if (typeof message === 'string') return message
+  const delta = choice.delta?.content
+  return typeof delta === 'string' ? delta : undefined
+}
+
+/** The status-specific guidance on a non-OK response. */
+function httpFailure(response) {
+  const hint = response.status === 429 ? '：请求被限流，请稍后重试'
+    : response.status === 401 ? '：请检查 API Key'
+      : response.status === 403 ? '：凭据被拒绝，请确认它有权访问补全接口'
+        : response.status === 404 ? '：请检查 API 地址（需要该服务的补全端点）'
+          : '：请检查 API 地址、模型 ID 和接口参数'
+  return new Error(`补全 API 返回 HTTP ${response.status}${hint}`)
+}
+
+/**
+ * The authentication headers for one call, preferring an explicit key.
+ * @param config - `apiKey` (bearer) or `accountToken` (private header).
+ * @returns the header fragment, empty when neither is present.
+ */
+function authHeaders(config) {
+  if (typeof config.apiKey === 'string' && config.apiKey !== '') return { authorization: `Bearer ${config.apiKey}` }
+  if (typeof config.accountToken === 'string' && config.accountToken !== '') return { [ACCOUNT_TOKEN_HEADER]: config.accountToken }
+  return {}
+}
+
+/**
+ * One fill-in-the-middle completion, answered in a single response. The prefix
+ * and suffix reach the provider as-is — no framing, which is the whole point of
  * the FIM shape.
- * @param config - `baseUrl` and optional `apiKey`.
+ *
+ * The caller's `signal` is combined with a hard timeout: a completion is a
+ * short auxiliary call, so one that has not answered in {@link
+ * COMPLETION_TIMEOUT_MS} is not going to be useful even if it eventually does.
+ * @param config - `baseUrl`, plus exactly one of `apiKey` or `accountToken`.
  * @param options - `model`, `prompt` (code before the caret), optional
  *   `suffix` (code after it), `maxTokens`, `signal`.
- * @yields `{type:'text-delta',text}` frames, then one `{type:'finish'}`.
+ * @returns the completion text, possibly empty.
+ * @throws When the address is unusable, the request fails, or the provider
+ *   answers with an error.
  */
-export async function* streamCompletionFim(config, options) {
+export async function completeFim(config, options) {
   const body = {
     model: options.model,
     prompt: options.prompt,
+    // The `suffix` key must ALWAYS be present, even when it is empty. DeepSeek
+    // routes on the shape of the body: drop the key and the request stops
+    // reading as fill-in-the-middle and degrades to plain continuation, so a
+    // prompt like `# 写一个函数，判断一个数是否是素数` comes back as the Chinese
+    // tutorial page the model was trained on ("时间: … 浏览: …", markdown
+    // fences, the lot) instead of Python. Measured 0/4 clean with the key
+    // omitted against 8/8 clean with an explicit empty string.
+    suffix: typeof options.suffix === 'string' ? options.suffix : '',
     max_tokens: options.maxTokens,
     temperature: FIM_TEMPERATURE,
-    stream: true,
+    stream: false,
   }
-  if (typeof options.suffix === 'string' && options.suffix !== '') body.suffix = options.suffix
+
+  const signal = options.signal === undefined
+    ? AbortSignal.timeout(COMPLETION_TIMEOUT_MS)
+    : AbortSignal.any([options.signal, AbortSignal.timeout(COMPLETION_TIMEOUT_MS)])
+
   const response = await fetch(fimEndpoint(config.baseUrl), {
     method: 'POST',
-    headers: { 'content-type': 'application/json', ...(config.apiKey ? { authorization: `Bearer ${config.apiKey}` } : {}) },
+    headers: { 'content-type': 'application/json', ...authHeaders(config) },
     body: JSON.stringify(body),
-    signal: options.signal,
+    signal,
   })
   if (!response.ok) throw httpFailure(response)
-  if (!response.body) throw new Error('独立补全 API 返回空响应')
-  for await (const data of ssePayloads(response.body)) {
-    const frame = JSON.parse(data)
-    if (frame.error) throw new Error('独立补全 API 返回错误，请检查模型和接口配置')
-    const text = frameText(frame)
-    if (typeof text === 'string' && text !== '') yield { type: 'text-delta', text }
-  }
-  yield { type: 'finish', reason: { kind: 'stop' } }
+
+  const payload = await response.json().catch(() => undefined)
+  if (payload === undefined) throw new Error('补全 API 返回的不是 JSON')
+  if (payload.error) throw new Error(`补全 API 返回错误：${payload.error.message ?? '请检查模型和接口配置'}`)
+  return completionText(payload) ?? ''
 }

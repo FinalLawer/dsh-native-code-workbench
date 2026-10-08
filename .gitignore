@@ -5,6 +5,14 @@ __pycache__/
 tmp-*.txt
 .DS_Store
 
+# Packaged release artifacts (tarball / zip produced by `npm pack`).
+outputs/
+
+# Scratch diagnostics live under a leading underscore: one-off probes and
+# fault-injection scripts kept locally to reproduce a measurement. They are not
+# part of the suite and never ship.
+tools/_*
+
 # Local agent working context (session logs, project conventions) — not project artifacts.
 .workbuddy/
 .workbuddy-ai/

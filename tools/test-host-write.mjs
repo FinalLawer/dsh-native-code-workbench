@@ -116,10 +116,13 @@ function mount(options = {}) {
 console.log('wiring')
 {
   const { route, calls } = mount()
-  check('injects connection, fs, sessions, llm, tools',
-    JSON.stringify(calls.injectNames) === JSON.stringify(['connection', 'fs', 'sessions', 'llm', 'tools']), calls.injectNames)
+  check('injects connection, fs, sessions, tools',
+    JSON.stringify(calls.injectNames) === JSON.stringify(['connection', 'fs', 'sessions', 'tools']), calls.injectNames)
+  // The completion route speaks FIM over its own transport, so the plugin no
+  // longer depends on the Host LLM service and must not require it to load.
+  check('does not require the Host LLM service', !calls.injectNames.includes('llm'), calls.injectNames)
   check('registers every route', ['/api/code-workbench/write', '/api/code-workbench/file-operation', '/api/code-workbench/search',
-    '/api/code-workbench/complete', '/api/code-workbench/history', '/api/code-workbench/rollback']
+    '/api/code-workbench/complete', '/api/code-workbench/completion-status', '/api/code-workbench/history', '/api/code-workbench/rollback']
     .every((p) => calls.routes.some((r) => r.path === p)), calls.routes.map((r) => r.path))
   check('removed inline editing route is not registered',
     !calls.routes.some((r) => r.path === '/api/code-workbench/rewrite'), calls.routes.map((r) => r.path))

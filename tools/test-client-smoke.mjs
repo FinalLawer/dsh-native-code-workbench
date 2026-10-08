@@ -256,7 +256,7 @@ const fakeMonaco = {
       { id: 'plaintext', extensions: [], filenames: [] },
     ],
     registerInlineCompletionsProvider: (selector, provider) => {
-      calls.completionProvider = provider
+      calls.inlineCompletionProvider = provider
       return { dispose() {} }
     },
   },
@@ -286,7 +286,7 @@ const bundle = globalThis.__factory((specifier) => {
 })
 
 const registered = { slots: [], shortcuts: [], sources: [] }
-let settingsSnapshot = { status: 'ready', writable: true, revision: 1, value: { autoSave: false, completionProvider: '', completionModel: '' } }
+let settingsSnapshot = { status: 'ready', writable: true, revision: 1, value: { autoSave: false, completionEnabled: true, completionBaseUrl: 'https://api.deepseek.com/beta', completionApiModel: 'deepseek-flash' } }
 const settingsObservers = new Set()
 const settingsWrites = []
 const settingsForm = {
@@ -368,7 +368,11 @@ globalThis.fetch = async (url, options) => {
       }
     : url.includes('/history')
       ? { ok: true, entries: [] }
-      : { ok: true, version: { v: 2 }, operation: 'update' }
+      : url.includes('/completion-status')
+        ? { ok: true, mode: 'fim', endpoint: 'https://api.deepseek.com/beta/completions', addressValid: true, model: 'deepseek-flash', source: 'store' }
+        : url.includes('/complete')
+          ? { ok: true, text: '' }
+          : { ok: true, version: { v: 2 }, operation: 'update' }
   return { ok: true, status: 200, json: async () => payload }
 }
 
@@ -473,20 +477,30 @@ const originalFetch = globalThis.fetch
 const completionToken = { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) }
 globalThis.fetch = async (url, options) => {
   calls.fetch.push({ url, body: JSON.parse(options.body) })
-  return new Response('{"t":"delta","text":" + 1"}\n{"t":"done"}\n', { headers: { 'content-type': 'application/x-ndjson' } })
+  return new Response(JSON.stringify({ ok: true, text: ' + 1' }), { headers: { 'content-type': 'application/json' } })
 }
 let suggestions
 await act(async () => {
-  suggestions = await calls.completionProvider.provideInlineCompletions(currentModel, { lineNumber: 1, column: 17 }, {}, completionToken)
+  suggestions = await calls.inlineCompletionProvider.provideInlineCompletions(currentModel, { lineNumber: 1, column: 17 }, {}, completionToken)
 })
-check('provider implements the installed Monaco disposal API', typeof calls.completionProvider.disposeInlineCompletions === 'function')
+check('provider implements the installed Monaco disposal API', typeof calls.inlineCompletionProvider.disposeInlineCompletions === 'function')
+check('the provider debounces long enough to skip mid-word requests, but no more', calls.inlineCompletionProvider.debounceDelayMs === 180, calls.inlineCompletionProvider.debounceDelayMs)
 check('provider sends caret context to the completion route', calls.fetch.at(-1)?.url === '/api/code-workbench/complete' && calls.fetch.at(-1)?.body.prefix.length === 16)
-check('streamed completion becomes an insertion suggestion', suggestions?.items?.[0]?.insertText === ' + 1', suggestions)
+check('the completion becomes an insertion suggestion', suggestions?.items?.[0]?.insertText === ' + 1', suggestions)
 check('completion status is visible', allText().includes('Tab 接受 AI 建议'))
-globalThis.fetch = async () => new Response(JSON.stringify({ error: { message: 'model unavailable' } }), { status: 409 })
+// The Host answers an empty completion instead of an error when it declines to
+// try, so an empty result must read as "no suggestion", not as a failure.
+globalThis.fetch = async () => new Response(JSON.stringify({ ok: true, text: '' }), { headers: { 'content-type': 'application/json' } })
 await act(async () => { currentModel.setValue(currentModel.getValue() + '\n// force a distinct completion context\n') })
 await act(async () => {
-  suggestions = await calls.completionProvider.provideInlineCompletions(currentModel, { lineNumber: 1, column: 17 }, {}, completionToken)
+  suggestions = await calls.inlineCompletionProvider.provideInlineCompletions(currentModel, { lineNumber: 1, column: 17 }, {}, completionToken)
+})
+check('an empty completion yields no suggestion and no error', suggestions?.items?.length === 0 && allText().includes('AI 未返回补全'), allText().slice(-200))
+// A transport failure is the one path that still surfaces in the editor.
+globalThis.fetch = async () => new Response(JSON.stringify({ error: { message: 'model unavailable' } }), { status: 409 })
+await act(async () => { currentModel.setValue(currentModel.getValue() + '\n// force another distinct completion context\n') })
+await act(async () => {
+  suggestions = await calls.inlineCompletionProvider.provideInlineCompletions(currentModel, { lineNumber: 1, column: 17 }, {}, completionToken)
 })
 check('failed completion returns no suggestion and exposes the failure', suggestions?.items?.length === 0 && allText().includes('AI 补全失败'))
 globalThis.fetch = originalFetch
@@ -1162,28 +1176,24 @@ await act(async () => {
 })
 await act(async () => { await new Promise((resolve) => setTimeout(resolve, 1050)) })
 check('automatic save writes the edited buffer after a pause', calls.fetch.filter((call) => call.url.includes('/write')).length > previousWrites)
-await act(async () => {
-  const inputs = findAll(settingsRenderer.toJSON(), (node) => node.type === 'input' && node.props.placeholder)
-  inputs.find((node) => node.props.placeholder === '例如 deepseek').props.onChange({ target: { value: 'fast-provider' } })
-  inputs.find((node) => node.props.placeholder === '例如 deepseek-chat').props.onChange({ target: { value: 'fast-model' } })
-})
-await act(async () => {
-  findAll(settingsRenderer.toJSON(), (node) => node.type === 'button' && textOf(node) === '保存补全模型')[0].props.onClick()
-})
-check('dedicated provider and model are persisted together', settingsSnapshot.value.completionProvider === 'fast-provider' && settingsSnapshot.value.completionModel === 'fast-model')
-await act(async () => {
-  findAll(settingsRenderer.toJSON(), (node) => node.type === 'input' && node.props.type === 'checkbox')[0].props.onChange({ target: { checked: true } })
-})
+check('the settings page asks the Host which credential is in play',
+  calls.fetch.some((call) => call.url.includes('/completion-status')), calls.fetch.map((call) => call.url).slice(-3))
+check('the settings page reports the live completion chain',
+  textOf(settingsRenderer.toJSON()).includes('https://api.deepseek.com/beta/completions')
+  && textOf(settingsRenderer.toJSON()).includes('DSH 凭据库'), textOf(settingsRenderer.toJSON()).slice(0, 240))
 await act(async () => {
   const inputs = findAll(settingsRenderer.toJSON(), (node) => node.type === 'input')
-  inputs.find((node) => node.props.placeholder === 'https://api.example.com/v1').props.onChange({ target: { value: 'https://example.com/v1' } })
-  inputs.find((node) => node.props.placeholder === '接口提供的模型 ID').props.onChange({ target: { value: 'api-model' } })
+  inputs.find((node) => node.props.placeholder === 'https://api.deepseek.com/beta').props.onChange({ target: { value: 'https://example.com/beta' } })
+  inputs.find((node) => node.props.placeholder === 'deepseek-flash').props.onChange({ target: { value: 'api-model' } })
   inputs.find((node) => node.props.type === 'password').props.onChange({ target: { value: 'test-secret' } })
 })
 await act(async () => {
-  findAll(settingsRenderer.toJSON(), (node) => node.type === 'button' && textOf(node) === '保存补全模型')[0].props.onClick()
+  findAll(settingsRenderer.toJSON(), (node) => node.type === 'button' && textOf(node) === '保存补全设置')[0].props.onClick()
 })
-check('independent API preferences are saved', settingsSnapshot.value.completionApiEnabled === true && settingsSnapshot.value.completionApiModel === 'api-model' && settingsSnapshot.value.completionApiKey === 'test-secret')
+check('the FIM endpoint, model and key are persisted together',
+  settingsSnapshot.value.completionBaseUrl === 'https://example.com/beta'
+  && settingsSnapshot.value.completionApiModel === 'api-model'
+  && settingsSnapshot.value.completionApiKey === 'test-secret', settingsSnapshot.value)
 check('saved API key is cleared from the input', findAll(settingsRenderer.toJSON(), (node) => node.props?.type === 'password')[0].props.value === '')
 await act(async () => { settingsRenderer.unmount() })
 

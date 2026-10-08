@@ -23,7 +23,7 @@ import { serializeSnippet, splitSnippets } from './snippets.mjs'
 const { useCallback, useEffect, useMemo, useRef, useState } = React
 const h = React.createElement
 const SETTINGS_NS = 'code-workbench'
-const defaultSettings = { autoSave: false, completionEnabled: true, completionProvider: '', completionModel: '' }
+const defaultSettings = { autoSave: false, completionEnabled: true, completionBaseUrl: 'https://api.deepseek.com/beta', completionApiModel: 'deepseek-flash' }
 function usePluginSettings(form) {
   const [snapshot, setSnapshot] = useState(() => form?.getSnapshot?.() ?? { value: defaultSettings, writable: false })
   useEffect(() => {
@@ -142,15 +142,33 @@ function monacoTheme() {
 const SEARCH_PATH = '/api/code-workbench/search'
 /** The host half's Tab-completion endpoint (ghost text at the caret). */
 const COMPLETE_PATH = '/api/code-workbench/complete'
+/** Host route reporting which credential a completion would use (values never leave the Host). */
+const COMPLETION_STATUS_PATH = '/api/code-workbench/completion-status'
+/** How each credential source is described to the person configuring the plugin. */
+const CREDENTIAL_SOURCE_LABELS = {
+  manual: '设置页填写的 API Key',
+  store: 'DSH 凭据库 · DEEPSEEK_API_KEY',
+  account: 'DSH 登录账号',
+  none: '未找到可用凭据',
+}
 /** The save journal endpoints (checkpoints: list and roll back saves). */
 const HISTORY_PATH = '/api/code-workbench/history'
 const ROLLBACK_PATH = '/api/code-workbench/rollback'
 
 /**
- * Read the Tab-completion NDJSON stream.
+ * Ask the Host for one Tab completion.
+ *
+ * One request, one response — nothing is streamed. Ghost text is only ever
+ * shown as a finished suggestion, so progressive rendering would buy nothing;
+ * the wait is dominated by the provider's time-to-first-token, which no client
+ * change can shorten.
+ *
+ * A configuration problem answers `{ok:true,text:''}` rather than an error, so
+ * the empty string here is the normal "nothing to suggest" case and not a
+ * failure. Only a malformed request or a transport problem throws.
  * @param body - the framed caret-context request.
  * @param signal - cancellation when typing invalidates the suggestion.
- * @returns the final completion text.
+ * @returns the completion text, possibly empty.
  */
 async function streamCompletion(body, signal) {
   const response = await fetch(COMPLETE_PATH, {
@@ -159,35 +177,11 @@ async function streamCompletion(body, signal) {
     body: JSON.stringify(body),
     signal,
   })
-  if (!response.ok || !response.body) {
-    const detail = await response.json().catch(() => ({}))
-    throw new Error(detail.error?.message ?? detail.error?.code ?? `HTTP ${response.status}`)
+  const payload = await response.json().catch(() => undefined)
+  if (!response.ok || payload === undefined) {
+    throw new Error(payload?.error?.message ?? payload?.error?.code ?? `HTTP ${response.status}`)
   }
-  const reader = response.body.getReader()
-  const decoder = new TextDecoder()
-  let buffer = ''
-  let text = ''
-  for (;;) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
-    let nl
-    while ((nl = buffer.indexOf('\n')) >= 0) {
-      const line = buffer.slice(0, nl).trim()
-      buffer = buffer.slice(nl + 1)
-      if (line === '') continue
-      const frame = JSON.parse(line)
-      if (frame.t === 'delta') {
-        text += frame.text
-      } else if (frame.t === 'done') {
-        return text
-      } else if (frame.t === 'error') {
-        const route = frame.provider && frame.model ? `（${frame.provider} / ${frame.model}）` : ''
-        throw new Error(`${frame.message ?? frame.code ?? 'completion failed'}${route}`)
-      }
-    }
-  }
-  return text
+  return typeof payload.text === 'string' ? payload.text : ''
 }
 
 /** Models occasionally fence despite instructions; strip one wrapping fence. */
@@ -1053,9 +1047,10 @@ function CodePanel(props) {
     // Tab-completion ghost text: Monaco renders the preview and accepts on Tab;
     // this provider only answers "what should be inserted at the caret".
     const completions = monaco.languages.registerInlineCompletionsProvider('*', {
-      debounceDelayMs: 300,
+      debounceDelayMs: 180,
       async provideInlineCompletions(model, position, context, token) {
-        if (settingsRef.current.completionEnabled === false) return { items: [] }
+        const settings = settingsRef.current
+        if (settings.completionEnabled === false) return { items: [] }
         const st = stateRef.current
         if (st.path === null || model !== editor.getModel() || inFlightRef.current) return { items: [] }
         const value = model.getValue()
@@ -1063,8 +1058,7 @@ function CodePanel(props) {
         const prefix = value.slice(Math.max(0, offset - 3200), offset)
         const suffix = value.slice(offset, offset + 900)
         if (prefix.trim() === '') return { items: [] }
-        const settings = settingsRef.current
-        const cacheKey = `${sessionId}\u0000${st.path}\u0000${settings.completionProvider}\u0000${settings.completionModel}\u0000${settings.completionApiEnabled}\u0000${settings.completionApiStyle}\u0000${settings.completionBaseUrl}\u0000${settings.completionApiModel}\u0000${model.getLanguageId()}\u0000${prefix}\u0000${suffix}`
+        const cacheKey = `${sessionId}\u0000${st.path}\u0000${settings.completionBaseUrl}\u0000${settings.completionApiModel}\u0000${model.getLanguageId()}\u0000${prefix}\u0000${suffix}`
         const cached = completionCache.get(cacheKey)
         if (cached !== undefined) {
           setCompletionStatus('Tab 接受 AI 建议')
@@ -1945,26 +1939,31 @@ function CodeWorkbenchSettings({ form }) {
   const value = snapshot.value ?? defaultSettings
   const [autoSave, setAutoSave] = useState(value.autoSave === true)
   const [completionEnabled, setCompletionEnabled] = useState(value.completionEnabled !== false)
-  const [provider, setProvider] = useState(value.completionProvider)
-  const [model, setModel] = useState(value.completionModel)
-  const [apiEnabled, setApiEnabled] = useState(value.completionApiEnabled === true)
-  const [apiStyle, setApiStyle] = useState(value.completionApiStyle === 'fim' ? 'fim' : 'chat')
-  const [baseUrl, setBaseUrl] = useState(value.completionBaseUrl ?? '')
-  const [apiModel, setApiModel] = useState(value.completionApiModel ?? '')
+  const [baseUrl, setBaseUrl] = useState(value.completionBaseUrl ?? defaultSettings.completionBaseUrl)
+  const [apiModel, setApiModel] = useState(value.completionApiModel ?? defaultSettings.completionApiModel)
   const [apiKey, setApiKey] = useState('')
   const [clearApiKey, setClearApiKey] = useState(false)
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState('')
+  const [status, setStatus] = useState(null)
+  const [statusTick, setStatusTick] = useState(0)
   useEffect(() => {
     setAutoSave(value.autoSave === true)
     setCompletionEnabled(value.completionEnabled !== false)
-    setProvider(value.completionProvider ?? '')
-    setModel(value.completionModel ?? '')
-    setApiEnabled(value.completionApiEnabled === true)
-    setApiStyle(value.completionApiStyle === 'fim' ? 'fim' : 'chat')
-    setBaseUrl(value.completionBaseUrl ?? '')
-    setApiModel(value.completionApiModel ?? '')
-  }, [value.autoSave, value.completionEnabled, value.completionProvider, value.completionModel, value.completionApiEnabled, value.completionApiStyle, value.completionBaseUrl, value.completionApiModel])
+    setBaseUrl(value.completionBaseUrl ?? defaultSettings.completionBaseUrl)
+    setApiModel(value.completionApiModel ?? defaultSettings.completionApiModel)
+  }, [value.autoSave, value.completionEnabled, value.completionBaseUrl, value.completionApiModel])
+  // The credential lives Host-side only, so the editor cannot tell which source
+  // a completion would use — it has to ask. Showing the Host's answer is the
+  // only way to explain a quiet editor without handling a secret here.
+  useEffect(() => {
+    let live = true
+    fetch(COMPLETION_STATUS_PATH, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
+      .then((response) => (response.ok ? response.json() : null))
+      .then((payload) => { if (live) setStatus(payload?.ok === true ? payload : null) })
+      .catch(() => { if (live) setStatus(null) })
+    return () => { live = false }
+  }, [snapshot.revision, statusTick])
   const persist = async (operation) => {
     if (busy) return
     setBusy(true)
@@ -2023,45 +2022,34 @@ function CodeWorkbenchSettings({ form }) {
         h('p', { id: 'code-workbench-completion-description' }, '输入停顿后显示 AI 代码预览，按 Tab 接受。')),
       h('button', { type: 'button', role: 'switch', 'aria-checked': completionEnabled, 'aria-labelledby': 'code-workbench-completion-label', 'aria-describedby': 'code-workbench-completion-description', className: 'code-workbench-switch', disabled, onClick: toggleCompletion },
         h('span', { className: 'code-workbench-switch-thumb' }))),
-    h('label', null, '补全模型 Provider', h('input', { style: input, value: provider, placeholder: '例如 deepseek', disabled, onChange: (event) => setProvider(event.target.value) })),
-    h('label', null, '补全模型 Model', h('input', { style: input, value: model, placeholder: '例如 deepseek-chat', disabled, onChange: (event) => setModel(event.target.value) })),
-    h('p', { style: { color: T.fgMuted, fontSize: '12px' } }, '填写 DSH 已配置的 Provider 和模型 ID；两项留空跟随 Agent。'),
-    h('label', null, h('input', { type: 'checkbox', checked: apiEnabled, disabled, onChange: (event) => setApiEnabled(event.target.checked) }), '使用独立补全 API'),
-    apiEnabled ? h('div', { style: { display: 'grid', gap: '12px', marginTop: '12px' } },
-      h('div', { style: { display: 'grid', gap: '6px' } },
-        h('div', { className: 'code-workbench-setting-title' }, '接口类型'),
-        h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '16px', fontSize: '12px', color: T.fg } },
-          h('label', { style: { display: 'flex', alignItems: 'center', gap: '6px' } },
-            h('input', { type: 'radio', name: 'code-workbench-api-style', checked: apiStyle === 'chat', disabled, onChange: () => setApiStyle('chat') }),
-            'Chat Completions'),
-          h('label', { style: { display: 'flex', alignItems: 'center', gap: '6px' } },
-            h('input', { type: 'radio', name: 'code-workbench-api-style', checked: apiStyle === 'fim', disabled, onChange: () => setApiStyle('fim') }),
-            'FIM 补全')),
-        h('p', { style: { color: T.fgMuted, fontSize: '12px', margin: 0 } }, apiStyle === 'fim'
-          ? '把光标前后的代码直接交给补全接口，由服务端补出中间部分。代码补全专用，无需提示词，贴合度更高；Base URL 例如 https://api.deepseek.com/beta（会自动补 /completions）。'
-          : '把光标上下文包成 JSON 交给对话接口。任何 OpenAI 兼容的 Chat Completions 服务都能用。')),
-      h('p', { style: { color: T.fgMuted, fontSize: '12px', margin: 0 } }, '独立 API 优先于上方 Provider。'),
-      h('label', null, 'API Base URL', h('input', { style: input, value: baseUrl, placeholder: apiStyle === 'fim' ? 'https://api.deepseek.com/beta' : 'https://api.example.com/v1', disabled, onChange: (event) => setBaseUrl(event.target.value) })),
-      h('label', null, '补全模型 ID', h('input', { style: input, value: apiModel, placeholder: apiStyle === 'fim' ? '例如 deepseek-v4-pro 或 codestral-latest' : '接口提供的模型 ID', disabled, onChange: (event) => setApiModel(event.target.value) })),
-      h('label', null, 'API Key', h('input', { type: 'password', autoComplete: 'new-password', style: input, value: apiKey, placeholder: '留空保留已保存密钥；本地接口可不填', disabled, onChange: (event) => { setApiKey(event.target.value); setClearApiKey(false) } })),
+    h('div', { style: { display: 'grid', gap: '12px', marginTop: '12px' } },
+      h('p', { style: { color: T.fgMuted, fontSize: '12px', margin: 0 } }, '补全走 FIM（fill-in-the-middle）接口：把光标前后的代码直接交给服务端，由它补出中间部分，不需要提示词。'),
+      h('label', null, 'API Base URL', h('input', { style: input, value: baseUrl, placeholder: 'https://api.deepseek.com/beta', disabled, onChange: (event) => setBaseUrl(event.target.value) })),
+      h('label', null, '补全模型 ID', h('input', { style: input, value: apiModel, placeholder: 'deepseek-flash', disabled, onChange: (event) => setApiModel(event.target.value) })),
+      h('label', null, 'API Key', h('input', { type: 'password', autoComplete: 'new-password', style: input, value: apiKey, placeholder: '留空则自动取用 DSH 凭据库或登录账号', disabled, onChange: (event) => { setApiKey(event.target.value); setClearApiKey(false) } })),
       h('label', null, h('input', { type: 'checkbox', checked: clearApiKey, disabled, onChange: (event) => { setClearApiKey(event.target.checked); setApiKey('') } }), '清除已保存的 API Key'),
-      h('p', { style: { color: T.fgMuted, fontSize: '12px', margin: 0 } }, '密钥由 DSH Host 保存和使用，不回显到设置页。')) : null,
+      h('p', { style: { color: T.fgMuted, fontSize: '12px', margin: 0 } }, '留空时依次尝试：DSH 凭据库的 DEEPSEEK_API_KEY → 已登录的 DSH 账号。密钥由 Host 保存和使用，不回显到设置页。'),
+      h('div', { style: { display: 'grid', gap: '4px', paddingTop: '6px', borderTop: `1px solid ${T.border}` } },
+        h('div', { className: 'code-workbench-setting-title' }, '当前补全链路'),
+        h('dl', { style: { margin: 0, fontSize: '12px', color: T.fgMuted, display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '2px 10px' } },
+          h('dt', null, '接口'), h('dd', { style: { margin: 0, wordBreak: 'break-all' } }, status?.addressValid === false ? '地址无效' : (status?.endpoint || '读取中…')),
+          h('dt', null, '模型'), h('dd', { style: { margin: 0 } }, status?.model || '—'),
+          h('dt', null, '凭据'), h('dd', { style: { margin: 0, color: status !== null && status.source === 'none' ? T.danger : T.fg } }, status === null ? '读取中…' : (CREDENTIAL_SOURCE_LABELS[status.source] ?? status.source)))),
+      h('p', { style: { color: T.fgMuted, fontSize: '12px', margin: 0 } }, '凭据缺失或接口不可用时，Tab 补全会静默停用，不弹错误提示。')),
     h('button', { disabled, onClick: () => {
       if (form === undefined || snapshot.status === 'unavailable') { setNotice('设置服务尚未同步，请重新打开设置页后重试'); return }
-      if (apiEnabled) {
-        try {
-          const endpoint = new URL(baseUrl.trim())
-          if (!['http:', 'https:'].includes(endpoint.protocol) || endpoint.username || endpoint.password || !apiModel.trim()) throw new Error()
-        } catch { setNotice('请填写有效的 HTTP(S) API 地址和补全模型 ID'); return }
-      } else if (Boolean(provider.trim()) !== Boolean(model.trim())) { setNotice('Provider 和 Model 必须同时填写，或同时留空'); return }
-      const ops = Object.entries({ completionEnabled, completionProvider: provider.trim(), completionModel: model.trim(), completionApiEnabled: apiEnabled, completionApiStyle: apiStyle, completionBaseUrl: baseUrl.trim(), completionApiModel: apiModel.trim() }).map(([field, setting]) => ({ op: 'set', path: [field], value: setting }))
+      try {
+        const endpoint = new URL(baseUrl.trim())
+        if (!['http:', 'https:'].includes(endpoint.protocol) || endpoint.username || endpoint.password || !apiModel.trim()) throw new Error()
+      } catch { setNotice('请填写有效的 HTTP(S) API 地址和补全模型 ID'); return }
+      const ops = Object.entries({ completionEnabled, completionBaseUrl: baseUrl.trim(), completionApiModel: apiModel.trim() }).map(([field, setting]) => ({ op: 'set', path: [field], value: setting }))
       if (clearApiKey || apiKey.trim()) ops.push({ op: 'set', path: ['completionApiKey'], value: clearApiKey ? '' : apiKey.trim() })
       persist(async () => {
         const saved = await form.mutate(ops, snapshot.revision)
-        if (saved) { setApiKey(''); setClearApiKey(false); completionCache.clear() }
+        if (saved) { setApiKey(''); setClearApiKey(false); completionCache.clear(); setStatusTick((tick) => tick + 1) }
         return saved
       })
-    } }, busy ? '保存中…' : '保存补全模型'),
+    } }, busy ? '保存中…' : '保存补全设置'),
     h('div', { role: 'status', style: { fontSize: '12px', marginTop: '8px', color: notice && notice !== '设置已保存' ? T.danger : T.fgMuted } }, notice || (form === undefined || snapshot.status === 'unavailable' ? '设置服务同步中，保存按钮将在同步后生效' : '')),
   )
 }

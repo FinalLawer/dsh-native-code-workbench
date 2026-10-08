@@ -28,18 +28,19 @@
 // no registry fetch can fail behind a restrictive network.
 import z from './vendor/schemastery.mjs'
 import * as disk from 'node:fs/promises'
-import { completionEndpoint, fimEndpoint, streamCompletionApi, streamCompletionFim } from './completion-api.mjs'
+import { fimEndpoint, completeFim } from './completion-api.mjs'
+
+/** The endpoint DeepSeek documents for fill-in-the-middle completion. */
+const DEFAULT_COMPLETION_BASE_URL = 'https://api.deepseek.com/beta'
+/** One of the two models that endpoint accepts. */
+const DEFAULT_COMPLETION_MODEL = 'deepseek-flash'
 
 export const Config = z.object({
   autoSave: z.boolean().default(false).volatile(),
   completionEnabled: z.boolean().default(true).volatile(),
-  completionProvider: z.string().default('').volatile(),
-  completionModel: z.string().default('').volatile(),
-  completionApiEnabled: z.boolean().default(false).volatile(),
-  completionApiStyle: z.string().default('chat').volatile(),
-  completionBaseUrl: z.string().default('').volatile(),
+  completionBaseUrl: z.string().default(DEFAULT_COMPLETION_BASE_URL).volatile(),
   completionApiKey: z.string().default('').role('secret').volatile(),
-  completionApiModel: z.string().default('').volatile(),
+  completionApiModel: z.string().default(DEFAULT_COMPLETION_MODEL).volatile(),
 })
 
 /** Refuse absurd payloads early; the editor sends ordinary source files. */
@@ -78,18 +79,19 @@ function journalWrite(sessionId, path, note, outcome, text) {
 }
 /** The Tab-completion route: short ghost-text continuations at the caret. */
 const COMPLETE_PATH = '/api/code-workbench/complete'
+/** The read-only route reporting which credential the completion route would use. */
+const COMPLETION_STATUS_PATH = '/api/code-workbench/completion-status'
 /** Caps on one completion request. */
 const COMPLETE_CAPS = { prefix: 3200, suffix: 900, maxTokens: 128 }
 
 /**
- * The Tab-completion contract: a minimal continuation at the caret, never a
- * restatement of what is already there.
+ * The credential-store reference holding a DeepSeek platform key.
+ *
+ * `credentialRef` from `@deepseek-ai/dsh-credentials` is an identity function at
+ * runtime — it validates the name and returns the same string — so passing the
+ * literal keeps this package free of a runtime dependency on that package.
  */
-const COMPLETE_SYSTEM = [
-  'The user is typing code in an editor. Given the code before the caret and the code after it, output ONLY the code to insert exactly at the caret to continue naturally.',
-  'Usually finish the current line or a small block — a few lines at most. Match the surrounding style and indentation.',
-  'Output no explanations, no Markdown fences, and never repeat code that is already present before or after the caret.',
-].join('\n')
+const DEEPSEEK_API_KEY_REF = 'DEEPSEEK_API_KEY'
 /** Caps keeping one search bounded on a pathological tree. */
 const SEARCH_CAPS = {
   files: 4000,
@@ -207,56 +209,48 @@ async function handleWrite(scope, request) {
 }
 
 /**
- * Stream one auxiliary LLM call as NDJSON frames the client half consumes:
- * `{"t":"delta","text":…}`, `{"t":"done"}`, `{"t":"error","code","message"}`.
- * @param llm - the Host LLM service.
- * @param options - the GenerateOptions to stream.
- * @param label - subject used in abort messages.
- * @returns the streaming response.
+ * Record one skipped or failed completion in the Host log, never in the editor.
+ * @param scope - injected Host services.
+ * @param reason - why the attempt was skipped.
+ * @param error - the underlying failure, when there is one.
  */
-function llmNdjsonStream(llm, options, label) {
-  const encoder = new TextEncoder()
-  const stream = new ReadableStream({
-    async start(controller) {
-      let settled = false
-      const send = (frame) => {
-        try {
-          controller.enqueue(encoder.encode(`${JSON.stringify(frame)}\n`))
-        } catch { /* consumer went away */ }
-      }
-      try {
-        for await (const chunk of llm.stream(options)) {
-          if (chunk?.type === 'text-delta' && typeof chunk.text === 'string' && chunk.text !== '') {
-            send({ t: 'delta', text: chunk.text })
-          } else if (chunk?.type === 'finish') {
-            settled = true
-            const kind = chunk.reason?.kind
-            if (kind === 'stop') send({ t: 'done' })
-            else if (kind === 'aborted') send({ t: 'error', code: 'ABORTED', message: `${label} aborted` })
-            else send({ t: 'error', code: `LLM_${String(kind ?? 'error').toUpperCase().replace(/-/g, '_')}`, message: chunk.reason?.failure?.message ?? String(kind), model: options.model, provider: options.provider })
-          }
-        }
-        if (!settled) send({ t: 'done' })
-      } catch (error) {
-        send({ t: 'error', code: typeof error?.code === 'string' ? error.code : 'LLM_ERROR', message: error?.message ?? String(error), model: options.model, provider: options.provider })
-      } finally {
-        try {
-          controller.close()
-        } catch { /* already closed */ }
-      }
-    },
-  })
-
-  return new Response(stream, { status: 200, headers: { 'content-type': 'application/x-ndjson; charset=utf-8' } })
+function logCompletionFailure(scope, reason, error) {
+  const logger = scope?.logger
+  if (logger === undefined || typeof logger.warn !== 'function') return
+  if (error === undefined) logger.warn('code-workbench: completion skipped — %s', reason)
+  else logger.warn('code-workbench: completion skipped — %s (%s)', reason, error?.message ?? String(error))
 }
 
 /**
- * Handle one Tab-completion request: the ghost-text continuation at the
- * caret, streamed as NDJSON frames. One short auxiliary call per user pause,
- * cancelled the moment the user keeps typing.
+ * The response for a completion this Host declines to attempt: an ordinary
+ * success carrying no text, so the editor shows no suggestion and no error.
+ *
+ * Deliberately the same shape as a real answer rather than an error. This
+ * plugin speaks only FIM, so a failure here has no alternative route to fall
+ * back to — it is a configuration state rather than something the person
+ * typing can act on. The reason goes to the Host log and the settings page
+ * instead of into the editor.
+ * @param scope - injected Host services, used for the Host-side record.
+ * @param reason - why the attempt was skipped.
+ * @param error - the underlying failure, when there is one.
+ * @returns an empty completion response.
+ */
+function silentCompletion(scope, reason, error) {
+  logCompletionFailure(scope, reason, error)
+  return json(200, { ok: true, text: '' })
+}
+
+/**
+ * Handle one Tab-completion request: the ghost-text continuation at the caret,
+ * answered in a single response.
+ *
+ * Only a malformed request is rejected with JSON, because only that means our
+ * own client half is broken. Everything that depends on configuration — an
+ * unusable address, no usable credential, the provider refusing — answers with
+ * {@link silentCompletion}, leaving the editor quiet.
  * @param scope - injected Host services.
  * @param request - the buffered Fetch request the Connection dispatched.
- * @returns the streaming response, or a JSON rejection.
+ * @returns the completion text, or a JSON rejection.
  */
 async function handleComplete(scope, request, config, settings) {
   const admission = scope.connection.admit(request)
@@ -268,7 +262,7 @@ async function handleComplete(scope, request, config, settings) {
   } catch {
     return json(400, { ok: false, error: { code: 'BAD_REQUEST', message: 'body must be JSON' } })
   }
-  const { sessionId, path, language, prefix, suffix } = body ?? {}
+  const { sessionId, path, prefix, suffix } = body ?? {}
   if (typeof sessionId !== 'string' || sessionId === '') return json(400, { ok: false, error: { code: 'BAD_REQUEST', message: 'sessionId is required' } })
   if (typeof path !== 'string' || path === '') return json(400, { ok: false, error: { code: 'BAD_REQUEST', message: 'path is required' } })
   if (typeof prefix !== 'string' || prefix.trim() === '') return json(400, { ok: false, error: { code: 'BAD_REQUEST', message: 'prefix is required' } })
@@ -276,68 +270,110 @@ async function handleComplete(scope, request, config, settings) {
   const liveSettings = settings?.describe?.({ redactSecrets: false })
     ?.find((entry) => entry.ns === 'code-workbench')?.value
   const preference = (field) => liveSettings?.[field] ?? config?.[field]?.get?.() ?? config?.[field]
-  const completionProvider = liveSettings?.completionProvider ?? config?.completionProvider?.get?.() ?? config?.completionProvider
-  const completionModel = liveSettings?.completionModel ?? config?.completionModel?.get?.() ?? config?.completionModel
-  const selected = scope.get('agentDefaultModel')?.currentSelection()
-  const independentApi = preference('completionApiEnabled') === true
-  // The independent route has two wire shapes: the framed chat call this
-  // plugin started with, and a fill-in-the-middle call that hands the
-  // provider the caret's two sides directly. `chat` stays the default so an
-  // existing configuration keeps behaving exactly as before.
-  const useFim = independentApi && preference('completionApiStyle') === 'fim'
-  const route = independentApi
-    ? { provider: useFim ? '独立 FIM API' : '独立 API', model: preference('completionApiModel') }
-    : completionProvider && completionModel
-    ? { provider: completionProvider, model: completionModel }
-    : selected
-  if (typeof route?.provider !== 'string' || route.provider === '' || typeof route?.model !== 'string' || route.model === '') {
-    return json(409, { ok: false, error: { code: 'MODEL_UNAVAILABLE', message: 'no default model is configured' } })
+  const baseUrl = preference('completionBaseUrl') || DEFAULT_COMPLETION_BASE_URL
+  const model = preference('completionApiModel') || DEFAULT_COMPLETION_MODEL
+
+  let endpoint
+  try {
+    endpoint = fimEndpoint(baseUrl)
+  } catch (error) {
+    return silentCompletion(scope, 'the configured base URL is not a usable HTTP(S) address', error)
   }
 
-  if (independentApi) {
-    try { (useFim ? fimEndpoint : completionEndpoint)(preference('completionBaseUrl')) }
-    catch { return json(400, { ok: false, error: { code: 'INVALID_API_URL', message: '请在插件设置中填写有效的补全 API Base URL' } }) }
+  const credential = await resolveCompletionCredential(scope, preference, baseUrl)
+  if (credential === undefined) return silentCompletion(scope, 'no completion credential is available')
+
+  const upstream = credential.apiKey === undefined
+    ? { baseUrl, accountToken: credential.accountToken }
+    : { baseUrl, apiKey: credential.apiKey }
+  const describe = `${endpoint} · ${model} · 凭据 ${credential.source}`
+  try {
+    const text = await completeFim(upstream, {
+      model,
+      prompt: prefix.slice(-COMPLETE_CAPS.prefix),
+      suffix: typeof suffix === 'string' ? suffix.slice(0, COMPLETE_CAPS.suffix) : '',
+      maxTokens: COMPLETE_CAPS.maxTokens,
+      signal: request.signal,
+    })
+    return json(200, { ok: true, text })
+  } catch (error) {
+    return silentCompletion(scope, `the provider request failed [${describe}]`, error)
   }
-  const before = prefix.slice(-COMPLETE_CAPS.prefix)
-  const after = typeof suffix === 'string' ? suffix.slice(0, COMPLETE_CAPS.suffix) : ''
-  // A fill-in-the-middle call needs neither the framing nor the instruction:
-  // the provider receives the caret's two sides and returns what belongs
-  // between them. The chat shape still frames them as JSON for a model that
-  // only understands messages.
-  const framed = [
-    `File: ${path}${typeof language === 'string' && language !== '' ? ` (${language})` : ''}`,
-    '',
-    'Context JSON: { before, after }. "before" ends at the caret and "after" starts at it. Output the code to insert between them.',
-    JSON.stringify({ before, after }),
-  ].join('\n')
+}
 
-  const options = useFim
-    ? {
-        provider: route.provider,
-        model: route.model,
-        prompt: before,
-        suffix: after,
-        maxTokens: COMPLETE_CAPS.maxTokens,
-        sessionId,
-        signal: request.signal,
-      }
-    : {
-        provider: route.provider,
-        model: route.model,
-        messages: [{ role: 'user', content: [{ type: 'text', text: framed }] }],
-        system: COMPLETE_SYSTEM,
-        reasoningEffort: 'off',
-        maxTokens: COMPLETE_CAPS.maxTokens,
-        sessionId,
-        signal: request.signal,
-      }
+/**
+ * Resolve the credential for one FIM call, in preference order: the key the
+ * person pasted into the settings form, then `DEEPSEEK_API_KEY` in the DSH
+ * credential store, then the signed-in account's grant.
+ *
+ * Every source is optional and none of them is an error — a machine with none
+ * simply gets no suggestion. The account half is the interesting one: that
+ * service is Host-only, and `resolveToken` returns a value only for the
+ * inference origin it trusts, so passing the configured base URL is what
+ * performs that check.
+ * @param scope - injected Host services.
+ * @param preference - reads one live setting.
+ * @param baseUrl - the configured endpoint, used for the account origin check.
+ * @returns `{source, apiKey}` or `{source, accountToken}`, or undefined.
+ */
+async function resolveCompletionCredential(scope, preference, baseUrl) {
+  const manual = preference('completionApiKey')
+  if (typeof manual === 'string' && manual.trim() !== '') return { source: 'manual', apiKey: manual.trim() }
 
-  const llm = useFim
-    ? { stream: (requestOptions) => streamCompletionFim({ baseUrl: preference('completionBaseUrl'), apiKey: preference('completionApiKey') }, requestOptions) }
-    : independentApi
-    ? { stream: (requestOptions) => streamCompletionApi({ baseUrl: preference('completionBaseUrl'), apiKey: preference('completionApiKey') }, requestOptions) }
-    : scope.llm
-  return llmNdjsonStream(llm, options, `补全模型 ${route.provider} / ${route.model}`)
+  const credentials = scope.get('credentials')
+  if (credentials !== undefined) {
+    try {
+      const resolved = await credentials.resolve(DEEPSEEK_API_KEY_REF)
+      if (typeof resolved?.value === 'string' && resolved.value !== '') return { source: 'store', apiKey: resolved.value }
+    } catch { /* an unreadable store must not block the account route */ }
+  }
+
+  const account = scope.get('deepseekAccount')
+  if (account !== undefined) {
+    try {
+      const token = await account.resolveToken(baseUrl)
+      if (typeof token === 'string' && token !== '') return { source: 'account', accountToken: token }
+    } catch { /* signed out, or a destination the account service does not trust */ }
+  }
+
+  return undefined
+}
+
+/**
+ * Where a completion would be sent, and with which credential. The value is
+ * never included — only which source it came from — so the settings page can
+ * explain a quiet editor without ever handling a secret.
+ * @param scope - injected Host services.
+ * @param preference - reads one live setting.
+ * @returns the status payload the client half renders.
+ */
+async function completionStatus(scope, preference) {
+  const baseUrl = preference('completionBaseUrl') || DEFAULT_COMPLETION_BASE_URL
+  const model = preference('completionApiModel') || DEFAULT_COMPLETION_MODEL
+  let endpoint = ''
+  try {
+    endpoint = fimEndpoint(baseUrl)
+  } catch {
+    return { mode: 'fim', endpoint: '', addressValid: false, model, source: 'none' }
+  }
+  const credential = await resolveCompletionCredential(scope, preference, baseUrl)
+  return { mode: 'fim', endpoint, addressValid: true, model, source: credential?.source ?? 'none' }
+}
+
+/**
+ * Answer one completion-status read. Read-only: it resolves a credential in
+ * order to name its source, and never returns the value.
+ * @param scope - injected Host services.
+ * @param request - the buffered Fetch request the Connection dispatched.
+ * @returns the status payload as JSON.
+ */
+async function handleCompletionStatus(scope, request, config, settings) {
+  const admission = scope.connection.admit(request)
+  if ('rejection' in admission) return json(admission.rejection, { ok: false, error: { code: 'UNAUTHORIZED' } })
+  const liveSettings = settings?.describe?.({ redactSecrets: false })
+    ?.find((entry) => entry.ns === 'code-workbench')?.value
+  const preference = (field) => liveSettings?.[field] ?? config?.[field]?.get?.() ?? config?.[field]
+  return json(200, { ok: true, ...await completionStatus(scope, preference) })
 }
 
 /**
@@ -731,7 +767,7 @@ export function apply(ctx, config) {
       scope.effect(() => scope.settings.configure({ auto: false }, ctx.fiber), 'code-workbench: settings')
     })
   }
-  ctx.inject(['connection', 'fs', 'sessions', 'llm', 'tools'], (scope) => {
+  ctx.inject(['connection', 'fs', 'sessions', 'tools'], (scope) => {
     scope.effect(() => scope.connection.fetch.register({
       path: '/api/code-workbench/file-operation', methods: ['POST'], requestBody: 'buffered',
       fetch: (request) => handleFileOperation(scope, request),
@@ -748,6 +784,12 @@ export function apply(ctx, config) {
       requestBody: 'buffered',
       fetch: (request) => handleComplete(scope, request, config, runtime.settings),
     }), 'code-workbench: POST /api/code-workbench/complete')
+    scope.effect(() => scope.connection.fetch.register({
+      path: COMPLETION_STATUS_PATH,
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: (request) => handleCompletionStatus(scope, request, config, runtime.settings),
+    }), 'code-workbench: POST /api/code-workbench/completion-status')
     scope.effect(() => scope.connection.fetch.register({
       path: SEARCH_PATH,
       methods: ['POST'],
