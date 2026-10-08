@@ -52,19 +52,53 @@ const SEARCH_PATH = '/api/code-workbench/search'
 /** The save journal (save checkpoints): list and roll back saves. */
 const HISTORY_PATH = '/api/code-workbench/history'
 const ROLLBACK_PATH = '/api/code-workbench/rollback'
-/** Journal caps: entries retained per file and bytes retained per side. */
-const JOURNAL_CAPS = { perFile: 20, sideChars: 200_000 }
+/**
+ * Journal caps: entries retained per file, bytes retained per side, and the
+ * bounds on the journal as a whole.
+ *
+ * The whole-journal bounds are not decoration: a session that edits thousands
+ * of files would otherwise keep every one of them — 20 entries of up to 200k
+ * characters each, per file — for the life of the Host, since nothing here
+ * expires on its own.
+ */
+const JOURNAL_CAPS = { perFile: 20, sideChars: 200_000, files: 64, chars: 4_000_000 }
+/** Characters currently retained across the whole journal. */
+let journalChars = 0
 /** In-memory save journal: every accepted write keeps its before/after for rollback. */
 const journal = new Map() // `${sessionId}\0${path}` -> entries, newest first
+
+/** The characters one journal entry retains. */
+function journalEntryChars(entry) {
+  return entry.before === null ? 0 : entry.before.length
+}
+
+/**
+ * Drop the oldest entry of the least recently written file. The map iterates in
+ * write order, so its first key is the coldest file, and re-inserting a key on
+ * every write is what keeps that ordering meaningful.
+ * @returns whether an entry was dropped.
+ */
+function journalDropColdest() {
+  const coldest = journal.keys().next().value
+  if (coldest === undefined) return false
+  const entries = journal.get(coldest)
+  journalChars -= journalEntryChars(entries.pop())
+  if (entries.length === 0) journal.delete(coldest)
+  return true
+}
 
 /** Record one accepted write in the journal. */
 function journalWrite(sessionId, path, note, outcome, text) {
   const key = `${sessionId}\u0000${path}`
-  const entries = journal.get(key) ?? []
+  // Re-insert rather than update in place: this moves the key to the end, which
+  // is what marks the file as most recently written for the eviction above.
+  const existing = journal.get(key)
+  if (existing !== undefined) journal.delete(key)
+  const entries = existing ?? []
   const before = outcome.before === null || outcome.before === undefined
     ? null
     : String(outcome.before).slice(0, JOURNAL_CAPS.sideChars)
-  entries.unshift({
+  const entry = {
     id: `${Date.now()}-${entries.length}-${Math.random().toString(36).slice(2, 8)}`,
     at: Date.now(),
     operation: outcome.operation,
@@ -73,9 +107,13 @@ function journalWrite(sessionId, path, note, outcome, text) {
     before,
     beforeTruncated: before !== null && String(outcome.before).length > JOURNAL_CAPS.sideChars,
     lines: text.split('\n').length,
-  })
-  while (entries.length > JOURNAL_CAPS.perFile) entries.pop()
+  }
+  entries.unshift(entry)
+  journalChars += journalEntryChars(entry)
+  while (entries.length > JOURNAL_CAPS.perFile) journalChars -= journalEntryChars(entries.pop())
   journal.set(key, entries)
+  while (journal.size > JOURNAL_CAPS.files) if (!journalDropColdest()) break
+  while (journalChars > JOURNAL_CAPS.chars) if (!journalDropColdest()) break
 }
 /** The Tab-completion route: short ghost-text continuations at the caret. */
 const COMPLETE_PATH = '/api/code-workbench/complete'
@@ -125,6 +163,79 @@ function json(status, data) {
     status,
     headers: { 'content-type': 'application/json' },
   })
+}
+
+/** An error this layer answers with a chosen status and code rather than a default. */
+function requestFailure(status, code, message) {
+  const error = new Error(message)
+  error.status = status
+  error.code = code
+  return error
+}
+
+/** Status for every failure the official service can raise. Anything else is a 500. */
+const FILE_FAILURE_STATUS = {
+  FS_STALE_VERSION: 409,
+  FS_NOT_OBSERVED: 409,
+  FS_AMBIGUOUS_EDIT: 409,
+  FS_EDIT_NOT_FOUND: 404,
+  FS_NOT_FOUND: 404,
+  FS_SANDBOX_DENIED: 403,
+  FS_PERMISSION_DENIED: 403,
+  FS_TOO_LARGE: 413,
+  FS_NOT_TEXT: 413,
+  FS_NOT_REGULAR_FILE: 400,
+  FS_NOT_DIRECTORY: 400,
+  FS_ABORTED: 408,
+  FS_IO_ERROR: 500,
+}
+
+/**
+ * The answer for each POSIX failure the name-level operations can raise.
+ *
+ * These errno come from `node:fs/promises` — see {@link handleFileOperation} —
+ * and are translated rather than passed through, so this route speaks one
+ * vocabulary: a destination that exists is `ALREADY_EXISTS` whether the check
+ * refused it or `mkdir` raised `EEXIST`. A raw `ENOENT` beside the route's own
+ * codes would leave the editor matching two spellings of the same event, and
+ * the native text — `ENOENT: no such file or directory, rm 'C:/…'` — is not
+ * something to show a person.
+ */
+const NODE_FAILURE = {
+  ENOENT: { status: 404, code: 'NOT_FOUND', message: '目标不存在（可能已被移动或删除）' },
+  EEXIST: { status: 409, code: 'ALREADY_EXISTS', message: '目标已存在，禁止覆盖' },
+  ENOTEMPTY: { status: 409, code: 'NOT_EMPTY', message: '目录非空，无法删除' },
+  EACCES: { status: 403, code: 'PERMISSION_DENIED', message: '没有权限修改这个路径' },
+  EPERM: { status: 403, code: 'PERMISSION_DENIED', message: '没有权限修改这个路径' },
+  EROFS: { status: 403, code: 'READ_ONLY_DISK', message: '所在磁盘是只读的' },
+  ENOTDIR: { status: 400, code: 'BAD_REQUEST', message: '路径中有一级不是目录' },
+  EISDIR: { status: 400, code: 'BAD_REQUEST', message: '这是一个目录，不能当作文件处理' },
+  EINVAL: { status: 400, code: 'BAD_REQUEST', message: '路径不合法' },
+  ENAMETOOLONG: { status: 400, code: 'BAD_REQUEST', message: '路径过长' },
+  ENOSPC: { status: 507, code: 'NO_SPACE', message: '磁盘空间不足' },
+}
+
+/**
+ * Read one failure into the status, code and message to answer with.
+ *
+ * Three sources arrive here and they must not produce three different answers
+ * for the same event: this layer's own refusals (which carry `status`
+ * already), the official service's typed `FS_*` codes, and POSIX errno. Before
+ * this existed each route mapped its own subset, so a missing file was a 404 on
+ * one route and a 500 on another.
+ * @param error - the thrown error, optionally carrying `status` and `code`.
+ * @returns the status, code and message to answer with.
+ */
+function fileFailure(error) {
+  if (typeof error?.status === 'number') {
+    return { status: error.status, code: error.code ?? 'BAD_REQUEST', message: error.message }
+  }
+  const code = typeof error?.code === 'string' ? error.code : 'IO_ERROR'
+  return NODE_FAILURE[code] ?? {
+    status: FILE_FAILURE_STATUS[code] ?? 500,
+    code,
+    message: error?.message ?? String(error),
+  }
 }
 
 /**
@@ -198,13 +309,8 @@ async function handleWrite(scope, request) {
 
     return json(200, { ok: true, version: outcome.version, operation: outcome.operation })
   } catch (error) {
-    const code = typeof error?.code === 'string' ? error.code : 'FS_IO_ERROR'
-    const status = code === 'FS_STALE_VERSION' ? 409
-      : code === 'FS_SANDBOX_DENIED' ? 403
-        : code === 'FS_NOT_FOUND' ? 404
-          : code === 'FS_TOO_LARGE' || code === 'FS_NOT_TEXT' ? 413
-            : 500
-    return json(status, { ok: false, error: { code, message: error?.message ?? String(error) } })
+    const failure = fileFailure(error)
+    return json(failure.status, { ok: false, error: { code: failure.code, message: failure.message } })
   }
 }
 
@@ -376,15 +482,74 @@ async function handleCompletionStatus(scope, request, config, settings) {
   return json(200, { ok: true, ...await completionStatus(scope, preference) })
 }
 
+/** Unbounded quantifiers — a `{n,}` with no upper bound repeats forever. */
+const UNBOUNDED_QUANTIFIER = /^\{\d+,\}/
+
+/**
+ * Whether a pattern can backtrack exponentially, letting one line of input hold
+ * the Host's event loop for minutes inside a single `exec`.
+ *
+ * No budget check can interrupt a regex once the engine is inside it, so the
+ * only place to stop this is before the first match. The shape is a quantified
+ * group whose body is itself unbounded — `(a+)+`, `(.*)*`, `(\w+\s?)*`: every
+ * further character multiplies the ways to split it, so measured against this
+ * engine a 24-character line already costs ~142 ms and 26 characters ~575 ms —
+ * doubling with each character added, while the line cap permits 4000.
+ *
+ * This is a scan rather than a parse: it flags an unbounded quantifier inside a
+ * group that is itself quantified, which is the accident a person actually
+ * types. An overlapping alternation like `(a|a)*` grows just as fast without
+ * nesting and is not caught here, which is why {@link searchWorkspace} also
+ * re-checks its time budget inside the line loop.
+ * @param source - the pattern text, as typed, without delimiters.
+ * @returns whether the pattern is refused.
+ */
+function canBacktrackExponentially(source) {
+  /** One flag per open group: does its body hold an unbounded quantifier? */
+  const open = []
+  let escaped = false
+  let inClass = false
+  for (let i = 0; i < source.length; i++) {
+    const character = source[i]
+    if (escaped) { escaped = false; continue }
+    if (character === '\\') { escaped = true; continue }
+    if (inClass) { if (character === ']') inClass = false; continue }
+    if (character === '[') { inClass = true; continue }
+    if (character === '(') { open.push(false); continue }
+    if (character === '*' || character === '+') {
+      if (open.length > 0) open[open.length - 1] = true
+      continue
+    }
+    if (character === '{' && UNBOUNDED_QUANTIFIER.test(source.slice(i))) {
+      if (open.length > 0) open[open.length - 1] = true
+      continue
+    }
+    if (character !== ')') continue
+    const inner = open.pop() ?? false
+    const tail = source.slice(i + 1)
+    const repeated = tail.startsWith('*') || tail.startsWith('+') || UNBOUNDED_QUANTIFIER.test(tail)
+    if (inner && repeated) return true
+    // A quantified group is itself an unbounded quantifier to its parent.
+    if (open.length > 0 && (inner || repeated)) open[open.length - 1] = true
+  }
+  return false
+}
+
 /**
  * Build the line matcher for one search request.
  * @param query - user query text.
  * @param regex - whether `query` is a regular expression.
  * @param caseSensitive - matching case-sensitively.
  * @returns a global RegExp over single lines.
- * @throws SyntaxError when a user regex does not compile.
+ * @throws SyntaxError when a user regex does not compile, or an error carrying
+ *   `code: 'REGEX_UNSAFE'` when it would backtrack exponentially.
  */
 function buildMatcher(query, regex, caseSensitive) {
+  if (regex && canBacktrackExponentially(query)) {
+    const error = new Error('这个正则存在指数回溯风险（量词套在含量词的分组上），会长时间占住 Host；请改写为等价的线性写法，例如把 (a+)+ 改成 a+')
+    error.code = 'REGEX_UNSAFE'
+    throw error
+  }
   const source = regex ? query : query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   return new RegExp(source, caseSensitive ? 'g' : 'gi')
 }
@@ -458,6 +623,14 @@ async function searchWorkspace(scope, workspaceRoot, params, signal) {
     filesScanned++
     const lines = text.split(/\r?\n/)
     for (let i = 0; i < lines.length; i++) {
+      // The budget is re-checked inside the file, not only between files: a
+      // user regex can be slow without being catastrophic, and one pathological
+      // line used to be able to run past every check. Sampled every 64 lines,
+      // because `Date.now()` per line would cost more than the match itself.
+      if ((i & 63) === 0 && Date.now() - started > SEARCH_CAPS.budgetMs) {
+        truncated = true
+        break
+      }
       const line = lines[i]
       if (line.length > SEARCH_CAPS.lineChars) continue
       let hit = null
@@ -510,7 +683,8 @@ async function handleSearch(scope, request) {
   try {
     buildMatcher(query, regex === true, caseSensitive === true)
   } catch (error) {
-    return json(400, { ok: false, error: { code: 'REGEX_INVALID', message: error?.message ?? 'invalid regular expression' } })
+    const code = error?.code === 'REGEX_UNSAFE' ? 'REGEX_UNSAFE' : 'REGEX_INVALID'
+    return json(400, { ok: false, error: { code, message: error?.message ?? 'invalid regular expression' } })
   }
 
   const session = scope.sessions.get(sessionId)
@@ -722,41 +896,99 @@ async function handleRollback(scope, request) {
     } catch { /* remark is best-effort */ }
     return json(200, { ok: true, version: outcome.version, operation: outcome.operation })
   } catch (error) {
-    const code = typeof error?.code === 'string' ? error.code : 'FS_IO_ERROR'
-    const status = code === 'FS_STALE_VERSION' ? 409 : code === 'FS_SANDBOX_DENIED' ? 403 : 500
-    return json(status, { ok: false, error: { code, message: error?.message ?? String(error) } })
+    const failure = fileFailure(error)
+    return json(failure.status, { ok: false, error: { code: failure.code, message: failure.message } })
   }
 }
 
-/** Host plugin body: mount the routes and the retrieval tool for the plugin's lifetime. */
+/**
+ * Handle one name-level filesystem operation: create, rename, copy, delete.
+ *
+ * This is the only place the plugin touches the disk itself, and deliberately
+ * so. The official filesystem service offers reads, listings and text writes —
+ * `resolve`, `contains`, `stat`, `lstat`, `readText`, `listDir`, `writeText`,
+ * `editText` — and no operation that creates a directory, deletes, renames or
+ * copies; the sandboxing backend adds none either. So there is nothing to
+ * compose here, and what the official path would have supplied is owed
+ * explicitly instead:
+ *
+ *  - containment, checked against the session workspace root after `resolve`
+ *    has followed symlinks, and refused for the root itself;
+ *  - the session's standing sandbox mode, which gates every operation before
+ *    dispatch; file *contents* are still written through `ctx.fs.writeText`,
+ *    which stamps the policy per call;
+ *  - no silent overwrite: a destination that exists is refused rather than
+ *    replaced;
+ *  - a copy can never land inside its own source.
+ *
+ * `createFile` is the exception that proves the rule — it is a text write, so
+ * it goes through `ctx.fs.writeText` with a `createIfAbsent` intent like every
+ * other write, and `writeText` creates any missing parent directories itself.
+ * @param scope - injected Host services.
+ * @param request - the buffered Fetch request the Connection dispatched.
+ * @returns the JSON outcome.
+ */
 async function handleFileOperation(scope, request) {
   const admission = scope.connection.admit(request)
   if ('rejection' in admission) return json(admission.rejection, { ok: false })
   try {
     const body = await request.json()
-    if (!['createFile', 'createDirectory', 'rename', 'copy', 'delete'].includes(body.operation) || typeof body.path !== 'string' || typeof body.sessionId !== 'string') return json(400, { ok: false, error: { message: '无效的文件操作' } })
+    if (!['createFile', 'createDirectory', 'rename', 'copy', 'delete'].includes(body?.operation)
+      || typeof body.path !== 'string' || body.path === ''
+      || typeof body.sessionId !== 'string' || body.sessionId === '') {
+      throw requestFailure(400, 'BAD_REQUEST', '无效的文件操作')
+    }
+
     const session = scope.sessions.get(body.sessionId)
     const cwd = session?.header?.cwd
-    if (!cwd) throw new Error('会话没有工作区')
+    if (typeof cwd !== 'string' || cwd === '') throw requestFailure(404, 'UNKNOWN_SESSION', '会话没有工作区')
     const policy = scope.get('sandboxPolicy')?.resolve({ session })
-    if (!['workspace-write', 'danger-full-access'].includes(policy?.mode)) return json(403, { ok: false, error: { message: '当前会话为只读，无法修改文件；请在对话区将文件权限切换为允许工作区写入后重试' } })
+    if (!['workspace-write', 'danger-full-access'].includes(policy?.mode)) {
+      throw requestFailure(403, 'READ_ONLY_SESSION', '当前会话为只读，无法修改文件；请在对话区将文件权限切换为允许工作区写入后重试')
+    }
+
     const root = await scope.fs.resolve(cwd)
     const target = await scope.fs.resolve(body.path, { cwd })
-    if (!scope.fs.contains(root, target) || target.targetKey === root.targetKey || target.displayPath === root.displayPath) throw new Error('不允许操作工作区外路径或工作区根目录')
-    if (body.operation === 'createFile') await scope.fs.writeText(target, '', { kind: 'createIfAbsent' }, request.signal, policy)
-    else if (body.operation === 'createDirectory') await disk.mkdir(target.displayPath)
-    else if (body.operation === 'delete') await disk.rm(target.displayPath, { recursive: true })
-    else {
-      if (typeof body.destination !== 'string') throw new Error('缺少目标路径')
-      const destination = await scope.fs.resolve(body.destination, { cwd })
-      if (!scope.fs.contains(root, destination) || scope.fs.contains(target, destination)) throw new Error('目标必须在工作区内且不能位于源目录内')
-      try { await disk.lstat(destination.displayPath); throw new Error('目标已存在，禁止覆盖') }
-      catch (error) { if (error.code !== 'ENOENT') throw error }
-      if (body.operation === 'rename') await disk.rename(target.displayPath, destination.displayPath)
-      else await disk.cp(target.displayPath, destination.displayPath, { recursive: true, force: false, errorOnExist: true, dereference: false })
+    if (!scope.fs.contains(root, target) || target.targetKey === root.targetKey || target.displayPath === root.displayPath) {
+      throw requestFailure(403, 'OUTSIDE_WORKSPACE', '不允许操作工作区外路径或工作区根目录')
     }
+
+    if (body.operation === 'createFile') {
+      await scope.fs.writeText(target, '', { kind: 'createIfAbsent' }, request.signal, policy)
+      return json(200, { ok: true })
+    }
+    if (body.operation === 'createDirectory') {
+      // Not recursive: a missing parent is a mistake worth reporting, not one
+      // worth silently papering over with a whole chain of directories.
+      await disk.mkdir(target.displayPath)
+      return json(200, { ok: true })
+    }
+    if (body.operation === 'delete') {
+      await disk.rm(target.displayPath, { recursive: true })
+      return json(200, { ok: true })
+    }
+
+    if (typeof body.destination !== 'string' || body.destination === '') throw requestFailure(400, 'BAD_REQUEST', '缺少目标路径')
+    const destination = await scope.fs.resolve(body.destination, { cwd })
+    if (!scope.fs.contains(root, destination) || scope.fs.contains(target, destination)) {
+      throw requestFailure(403, 'OUTSIDE_WORKSPACE', '目标必须在工作区内且不能位于源目录内')
+    }
+    // `lstat`, not `stat`: a dangling symlink still occupies the destination
+    // name, and publishing over it is exactly what must not happen. Written as
+    // a refusal result rather than a throw, so the check reads as a question.
+    const taken = await disk.lstat(destination.displayPath).then(() => true, (error) => {
+      if (error?.code === 'ENOENT') return false
+      throw error
+    })
+    if (taken) throw requestFailure(409, 'ALREADY_EXISTS', '目标已存在，禁止覆盖')
+
+    if (body.operation === 'rename') await disk.rename(target.displayPath, destination.displayPath)
+    else await disk.cp(target.displayPath, destination.displayPath, { recursive: true, force: false, errorOnExist: true, dereference: false })
     return json(200, { ok: true })
-  } catch (error) { return json(400, { ok: false, error: { message: error.message ?? String(error) } }) }
+  } catch (error) {
+    const failure = fileFailure(error)
+    return json(failure.status, { ok: false, error: { code: failure.code, message: failure.message } })
+  }
 }
 
 export function apply(ctx, config) {

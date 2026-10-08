@@ -54,6 +54,8 @@ const FILES = {
  */
 function makeScope(options = {}) {
   const calls = { routes: [] }
+  const tree = options.tree ?? TREE
+  const texts = options.files ?? FILES
   const scope = {
     effect: (callback) => callback(),
     llm: { async *stream() { /* unused in search tests */ } },
@@ -73,13 +75,13 @@ function makeScope(options = {}) {
       contains: () => true,
       stat: async () => undefined,
       writeText: async () => ({ operation: 'update', version: {}, before: '', after: '' }),
-      listDir: async (target) => (TREE[target.displayPath] ?? []).map((entry) => ({
+      listDir: async (target) => (tree[target.displayPath] ?? []).map((entry) => ({
         ...entry,
         target: { displayPath: `${target.displayPath}\\${entry.name}`, targetKey: `${target.displayPath}\\${entry.name}` },
       })),
       readText: async (target) => {
         if (options.readFail === target.displayPath) throw new Error('unreadable')
-        return FILES[target.displayPath] ?? ''
+        return texts[target.displayPath] ?? ''
       },
     },
     get(name) {
@@ -135,6 +137,55 @@ console.log('\nrequest gating')
 {
   const { status, body } = await search({}, { query: '(unclosed', regex: true })
   check('an invalid regex is 400 REGEX_INVALID', status === 400 && body.error?.code === 'REGEX_INVALID', body)
+}
+
+console.log('\na pattern that would stall the Host is refused, not run')
+{
+  // A quantified group whose body is itself unbounded grows exponentially: the
+  // engine cannot be interrupted once it is inside `exec`, so no budget check
+  // can help and the only safe moment to refuse it is before the first match.
+  for (const pattern of ['(a+)+$', '(.*)*', '(\\w+\\s?)*', '(a+){2,}', '((a+))+', '(\\w+ )+\\w+']) {
+    const { status, body } = await search({}, { query: pattern, regex: true })
+    check(`${pattern} is 400 REGEX_UNSAFE`, status === 400 && body.error?.code === 'REGEX_UNSAFE', { status, ...body })
+  }
+  // The guard must not cost anyone a legitimate pattern.
+  for (const pattern of ['a+', '(a+)', '(?:a|b)+', '(a|b)+', '[+*]+', '(a{1,2})+', '(\\d{1,3}\\.){3}', 'function\\s+\\w+\\(']) {
+    const { status, body } = await search({}, { query: pattern, regex: true })
+    check(`${pattern} is still allowed`, status === 200, { status, ...body })
+  }
+}
+{
+  // Escaped parentheses are literals, and a class is not a group: neither can
+  // form the nested-quantifier shape, so neither may be refused.
+  const { status } = await search({}, { query: '\\(a+\\)+', regex: true })
+  check('an escaped group is not mistaken for a group', status === 200, status)
+}
+
+console.log('\nthe time budget is enforced inside a file, not only between files')
+{
+  // One long file, one match past the point where the budget expires. A stub
+  // clock lets the walk overrun deterministically instead of sleeping 4s: the
+  // first three reads (start, the pre-file check, the i=0 check) stay at T, so
+  // only the in-loop check at i=64 can stop the scan. Without that check the
+  // whole file is scanned and the match at line 100 is reported.
+  const longFile = `${ROOT}\\long.js`
+  const body = Array.from({ length: 200 }, (_, i) => (i === 99 ? 'needle here' : `line ${i + 1}`)).join('\n')
+  const options = {
+    tree: { [ROOT]: [{ name: 'long.js', type: 'file', size: 100 }] },
+    files: { [longFile]: `${body}\n` },
+  }
+  const realNow = Date.now
+  let reads = 0
+  Date.now = () => (++reads > 3 ? realNow() + 10_000 : realNow())
+  let result
+  try {
+    result = await search(options, { query: 'needle' })
+  } finally {
+    Date.now = realNow
+  }
+  check('the walk reports truncation rather than running on', result.body.truncated === true, result.body)
+  check('the match past the budget is not reported', result.body.matches.length === 0, result.body.matches)
+  check('the search still answers 200', result.status === 200, result.status)
 }
 
 console.log('\nmatching')
