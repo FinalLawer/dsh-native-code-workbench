@@ -77,6 +77,35 @@ function relativeToCwd(path, cwd) {
   return path.startsWith(cwd) ? path.slice(cwd.length).replace(/^[\\/]+/, '') : path
 }
 
+/**
+ * The `@path` mention a workspace-path chip becomes, in the spelling the shared
+ * reference grammar defines (`@deepseek-ai/dsh-file-reference`): a trailing
+ * slash marks a directory, and whitespace switches to the quoted `@"…"` form.
+ *
+ * Spelling it once, for both the chip's clipboard text and its submit-time
+ * expansion, keeps the logged message identical to what the composer showed —
+ * which matters because the transcript decorates that same text back into a
+ * chip, and because the committed-draft suffix rule compares the two verbatim.
+ *
+ * The leading space is deliberate. The grammar only opens a mention at the start
+ * of the text or after whitespace, while a dragged chip lands wherever the caret
+ * happens to be and the official insert path guarantees only a *trailing* space
+ * (`insertReference`); opening the token here is what keeps a row dropped after
+ * a typed word a mention instead of a dead `word@path` run.
+ *
+ * @param path - workspace-relative path.
+ * @param directory - whether the path names a directory.
+ * @returns the mention, or the bare path when the grammar cannot represent it.
+ */
+function referenceMention(path, directory) {
+  const raw = typeof path === 'string' ? path : ''
+  const spelled = directory === true ? `${raw}/` : raw
+  // Control characters and an embedded quote have no quoted spelling; a bare
+  // path still reads correctly to the model and simply is not a chip.
+  if (/[\u0000-\u001f\u007f-\u009f"]/u.test(spelled)) return spelled
+  return ` ${/\s/u.test(spelled) ? `@"${spelled}"` : `@${spelled}`}`
+}
+
 /** The drag payload for one tree row. */
 function treeDragPayload(path, cwd, isDir) {
   return `${isDir ? 'd' : 'f'}${relativeToCwd(path, cwd) || '.'}`
@@ -1585,7 +1614,7 @@ function CodePanel(props) {
         ref: { path: parsed.path, directory: parsed.directory, pathOnly: true },
         label,
         appearance: 'file',
-        clipboardText: parsed.path,
+        clipboardText: referenceMention(parsed.path, parsed.directory === true),
       }
       const span = inputActions.captureInsertion()
       const applied = scope.bail(scope, 'slash/input-insert-reference', { reference, span }) === true
@@ -1619,7 +1648,7 @@ function CodePanel(props) {
         const scope = sessionsScope?.(sessionId)
         if (!scope || !inputActions?.captureInsertion) throw new Error('对话输入框尚未就绪')
         const relative = path.slice(cwd.length).replace(/^[\\/]+/, '') || '.'
-        const reference = { source: 'code-workbench', ref: { path: relative, directory: target.isDir, pathOnly: true }, label: relative, appearance: 'file', clipboardText: relative }
+        const reference = { source: 'code-workbench', ref: { path: relative, directory: target.isDir, pathOnly: true }, label: relative, appearance: 'file', clipboardText: referenceMention(relative, target.isDir === true) }
         if (scope.bail(scope, 'slash/input-insert-reference', { reference, span: inputActions.captureInsertion() }) !== true) throw new Error('对话输入框正忙')
       } else if (action === 'move') {
         // Drag-to-move. Each source is a rename into the dropped folder, so it
@@ -2251,6 +2280,17 @@ function apply(ctx) {
   // The reference codec: what a `code-workbench` chat chip expands to when the
   // draft is submitted. Registered under the `@` trigger so the input pipeline
   // can route serialization to it (`inputTriggers.serializeReference`).
+  //
+  // A workspace path answers with the shared `@path` mention rather than a
+  // self-authored instruction block. That one spelling settles three things:
+  // the transcript projects it back into the chip the composer showed (the
+  // mention is the only thing `projectUserText` decorates), the model reads a
+  // path it can hand to `read`, and the guidance for exactly this token is
+  // already in the system prompt (`dsh-file-reference`'s `FILE_REFERENCE_PROMPT`,
+  // installed by the local provider): relative from the workspace root, a
+  // trailing slash marking a directory, read before claiming to have inspected.
+  // Spelling a bespoke paragraph here only bought a duplicate of that guidance,
+  // charged it to every message, and left the log with no chip to render.
   ctx.inject(['inputTriggers'], (scope) => {
     scope.effect(() => {
       try {
@@ -2260,7 +2300,7 @@ function apply(ctx) {
           label: () => '选中代码',
           codec: {
             serialize: async (ref) => {
-              if (ref?.pathOnly) return `\n工作区${ref.directory ? '目录' : '文件'}引用：${ref.path}\n请根据需要读取该路径下的代码。\n`
+              if (ref?.pathOnly) return referenceMention(ref.path, ref.directory === true)
               const startLine = ref?.startLine ?? 1
               const endLine = ref?.endLine ?? startLine
               const anchor = endLine === startLine

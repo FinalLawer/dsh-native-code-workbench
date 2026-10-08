@@ -964,6 +964,42 @@ check('a dropped directory lands as a directory reference',
   droppedDir?.payload.reference.ref.directory === true && droppedDir.payload.reference.label === 'sub/',
   droppedDir?.payload.reference)
 
+// What a submission carries decides two things at once: the transcript's
+// projector only decorates a `@token` (start of text or after whitespace) into
+// the same capsule the composer showed, and the standing `@` guidance in the
+// system prompt already tells the model how to read one. A self-authored
+// instruction block satisfies neither — it lands in the log as a paragraph,
+// which is what a dropped file used to read as.
+const dropCodec = registered.sources.find((source) => source.name === 'code-workbench')?.codec
+const mentionOf = (ref) => dropCodec?.serialize(ref)
+const fileMention = await mentionOf(dropped?.payload.reference.ref)
+check('a dropped file expands to the shared @path mention', fileMention === ' @a.js', fileMention)
+const dirMention = await mentionOf(droppedDir?.payload.reference.ref)
+check('a dropped directory keeps the trailing slash that marks it a folder', dirMention === ' @sub/', dirMention)
+check('the chip clipboard text matches its submit-time expansion verbatim',
+  dropped?.payload.reference.clipboardText === fileMention, dropped?.payload.reference.clipboardText)
+const spacedMention = await mentionOf({ path: 'my file.js', pathOnly: true, directory: false })
+check('a spaced path takes the quoted mention spelling', spacedMention === ' @"my file.js"', spacedMention)
+const unquotableMention = await mentionOf({ path: 'we"ird.js', pathOnly: true, directory: false })
+check('a path the grammar cannot quote degrades to a bare path',
+  unquotableMention === 'we"ird.js', unquotableMention)
+const selectionRef = { path: 'a.js', startLine: 3, endLine: 5, language: 'javascript', code: 'const needle = 1' }
+check('a code selection still expands to its anchored snippet, not a mention',
+  (await mentionOf(selectionRef))?.includes('```javascript'), await mentionOf(selectionRef))
+
+// The transcript decorates the logged text itself: `projectUserText` in
+// `@deepseek-ai/dsh-client-ui-primitives` scans it with this grammar and turns
+// each hit into the chip. Asserting against the same grammar is what keeps a
+// future spelling from silently degrading back into an undecorated run.
+const USER_TEXT_TOKEN_RE = /(^|\s)(\/[\w-]+(?=\s|$)|@"[^"\n]+"|@[^\s]+)/u
+const decoratedTokenOf = (text) => USER_TEXT_TOKEN_RE.exec(text)?.[2]
+check('the file mention is a token the transcript decorates',
+  decoratedTokenOf(`${fileMention} tail`) === '@a.js', fileMention)
+check('a spaced path stays one quoted token instead of splitting at the space',
+  decoratedTokenOf(`${spacedMention} tail`) === '@"my file.js"', spacedMention)
+check('the mention carries its own opening whitespace, so it decorates even behind a typed word',
+  decoratedTokenOf(`word${fileMention}`) === '@a.js', `word${fileMention}`)
+
 // Narrowness: the interceptor must never swallow gestures that are not ours.
 const outsideDrop = makeEvent('drop', { dataTransfer: makeDataTransfer([[dragMime, 'fa.js']]), target: outsideInput })
 await act(async () => { dispatchDocument('drop', outsideDrop) })
