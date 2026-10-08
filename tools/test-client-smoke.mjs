@@ -514,6 +514,35 @@ await act(async () => {
   suggestions = await calls.inlineCompletionProvider.provideInlineCompletions(currentModel, { lineNumber: 1, column: 17 }, {}, completionToken)
 })
 check('failed completion returns no suggestion and exposes the failure', suggestions?.items?.length === 0 && allText().includes('AI 补全失败'))
+// Two asks for the same caret are one round trip, and the second one has to
+// receive the answer rather than "no suggestion". Monaco stores an empty answer
+// as a verdict against that model version and then refuses to ask again for it
+// (`UpdateRequest.satisfies` short-circuits the retry), so answering empty while
+// a request was already in flight left the caret with no ghost text until the
+// next keystroke — the "I have to press space or backspace to wake it up"
+// report. A slow fetch makes the overlap deterministic instead of a race.
+let slowFetches = 0
+globalThis.fetch = async (url, options) => {
+  calls.fetch.push({ url, body: JSON.parse(options.body) })
+  slowFetches++
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  return new Response(JSON.stringify({ ok: true, text: ' + 1' }), { headers: { 'content-type': 'application/json' } })
+}
+await act(async () => { currentModel.setValue(currentModel.getValue() + '\n// concurrent context\n') })
+const concurrentToken = { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) }
+const fetchesBeforeAsk = slowFetches
+const firstAsk = calls.inlineCompletionProvider.provideInlineCompletions(currentModel, { lineNumber: 1, column: 17 }, {}, concurrentToken)
+const fetchesAfterFirst = slowFetches
+const secondAsk = calls.inlineCompletionProvider.provideInlineCompletions(currentModel, { lineNumber: 1, column: 17 }, {}, concurrentToken)
+const fetchesAfterSecond = slowFetches
+let joined = null
+await act(async () => { joined = await Promise.all([firstAsk, secondAsk]) })
+check('the first ask actually leaves a request in flight',
+  fetchesAfterFirst === fetchesBeforeAsk + 1, { fetchesBeforeAsk, fetchesAfterFirst })
+check('a second ask for the same caret joins the round trip instead of starting one',
+  fetchesAfterSecond === fetchesAfterFirst, { fetchesAfterFirst, fetchesAfterSecond })
+check('the joined ask receives the answer instead of "no suggestion"',
+  joined?.[1]?.items?.[0]?.insertText === ' + 1', joined?.[1])
 globalThis.fetch = originalFetch
 
 console.log('\nedit + save with the version guard')
@@ -522,7 +551,15 @@ await act(async () => {
   await new Promise((resolve) => setTimeout(resolve, 720))
 })
 check('the dirty indicator appears', allText().includes('● 未保存'))
-check('editing schedules a visible inline preview request', calls.inlineTriggers > 0, calls.inlineTriggers)
+// Monaco asks on its own for every typed character, for backspace and delete
+// (they sit in its `triggerCommands` list precisely because they never reach
+// `onDidType`), and for Tab and paste. Nudging it from here arrives as an
+// *Explicit* trigger, which never satisfies the automatic request already on the
+// wire — Monaco drops that one and starts over. So each completion paid a second
+// round trip plus a fixed 400ms of extra wait, and each extra keystroke pushed
+// the ghost text another 400ms away. Asserting the count is zero pins that the
+// plugin leaves the driving to Monaco.
+check('editing never makes the plugin drive the editor itself', (calls.inlineTriggers ?? 0) === 0, calls.inlineTriggers ?? 0)
 const saveButton = findAll(tree(), (n) => n.type === 'button' && textOf(n).includes('保存'))[0]
 await act(async () => {
   saveButton.props.onClick()

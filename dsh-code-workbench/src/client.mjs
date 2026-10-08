@@ -989,12 +989,15 @@ function CodePanel(props) {
   const saveRef = useRef(null)      // latest save, for the editor keybinding
   const openFileRef = useRef(null)  // latest openFile, for the change watch
   const addToChatRef = useRef(null) // latest Add-to-Chat, for the editor keybinding
-  const inFlightRef = useRef(false) // one ghost-text request at a time
+  // The ghost-text round trips currently on the wire, keyed by completion
+  // context. A second ask for the same caret joins the first instead of
+  // answering "no suggestion": Monaco records an empty answer as the verdict for
+  // that model version, so a busy moment would cost the user another keystroke.
+  const inFlightRef = useRef(new Map())
   // Whether the official change stream for the open file is delivering, and since
   // when. It decides how much the version fallback below is allowed to ask, so
   // the two effects share it through a ref — a state update would re-render.
   const watchHealthRef = useRef({ healthy: false, since: 0 })
-  const inlineTriggerTimerRef = useRef(null)
   const openRequestRef = useRef(0)
   const buffersRef = useRef(new Map())
   const dialogResolveRef = useRef(null)
@@ -1095,50 +1098,84 @@ function CodePanel(props) {
         const settings = settingsRef.current
         if (settings.completionEnabled === false) return { items: [] }
         const st = stateRef.current
-        if (st.path === null || model !== editor.getModel() || inFlightRef.current) return { items: [] }
+        if (st.path === null || model !== editor.getModel()) return { items: [] }
         const value = model.getValue()
         const offset = model.getOffsetAt(position)
         const prefix = value.slice(Math.max(0, offset - COMPLETION_PREFIX_CHARS), offset)
         const suffix = value.slice(offset, offset + COMPLETION_SUFFIX_CHARS)
         if (prefix.trim() === '') return { items: [] }
         const cacheKey = `${sessionId}\u0000${st.path}\u0000${settings.completionBaseUrl}\u0000${settings.completionApiModel}\u0000${model.getLanguageId()}\u0000${prefix}\u0000${suffix}`
-        const cached = completionCache.get(cacheKey)
-        if (cached !== undefined) {
+        // Monaco only needs the text at the caret; the range is a caret insert.
+        const ghostText = (text) => ({
+          items: [{
+            insertText: text,
+            range: new monaco.Range(position.lineNumber, position.column, position.lineNumber, position.column),
+          }],
+        })
+        const known = completionCache.get(cacheKey)
+        if (known !== undefined) {
           setCompletionStatus('Tab 接受 AI 建议')
-          return { items: [{ insertText: cached, range: new monaco.Range(position.lineNumber, position.column, position.lineNumber, position.column) }] }
+          return ghostText(known)
+        }
+        // Join the round trip already running for this exact caret rather than
+        // reporting "no suggestion". To Monaco an empty answer is not "I don't
+        // know" — it is the verdict for this model version, and
+        // `UpdateRequest.satisfies` then short-circuits every later explicit ask
+        // for that version. So answering empty while busy left the caret with no
+        // ghost text until the next keystroke.
+        const joined = inFlightRef.current.get(cacheKey)
+        if (joined !== undefined) {
+          await joined
+          if (token.isCancellationRequested) return { items: [] }
+          const answered = completionCache.get(cacheKey)
+          if (answered !== undefined) {
+            setCompletionStatus('Tab 接受 AI 建议')
+            return ghostText(answered)
+          }
+          // The request we joined was abandoned before it answered; fall through
+          // and ask again under this request's own cancellation.
         }
         const controller = new AbortController()
         const onCancel = token.onCancellationRequested?.(() => controller.abort())
-        inFlightRef.current = true
         setCompletionStatus('AI 补全生成中…')
+        // Never rejects, so a joined ask can await it bare, and the text reaches
+        // the cache no matter which ask happened to own the connection.
+        const pending = (async () => {
+          try {
+            const text = await streamCompletion({
+              sessionId,
+              path: st.path,
+              language: model.getLanguageId(),
+              prefix,
+              suffix,
+            }, controller.signal)
+            const insertText = stripFences(text, true).slice(0, 2000)
+            if (insertText !== '') {
+              completionCache.set(cacheKey, insertText)
+              while (completionCache.size > 40) completionCache.delete(completionCache.keys().next().value)
+            }
+            return { ok: true, text: insertText }
+          } catch (error) {
+            setCompletionStatus(controller.signal.aborted ? 'AI 补全已取消' : `AI 补全失败：${error.message ?? error}`)
+            return { ok: false, text: '' }
+          }
+        })()
+        inFlightRef.current.set(cacheKey, pending)
         try {
-          const text = await streamCompletion({
-            sessionId,
-            path: st.path,
-            language: model.getLanguageId(),
-            prefix,
-            suffix,
-          }, controller.signal)
-          const insertText = stripFences(text, true).slice(0, 2000)
+          const answer = await pending
+          if (!answer.ok) return { items: [] }
           if (token.isCancellationRequested) {
             setCompletionStatus('AI 补全已取消')
             return { items: [] }
           }
-          setCompletionStatus(insertText === '' ? 'AI 未返回补全' : 'Tab 接受 AI 建议')
-          if (insertText === '') return { items: [] }
-          completionCache.set(cacheKey, insertText)
-          while (completionCache.size > 40) completionCache.delete(completionCache.keys().next().value)
-          return {
-            items: [{
-              insertText,
-              range: new monaco.Range(position.lineNumber, position.column, position.lineNumber, position.column),
-            }],
+          if (answer.text === '') {
+            setCompletionStatus('AI 未返回补全')
+            return { items: [] }
           }
-        } catch (error) {
-          setCompletionStatus(controller.signal.aborted ? 'AI 补全已取消' : `AI 补全失败：${error.message ?? error}`)
-          return { items: [] }
+          setCompletionStatus('Tab 接受 AI 建议')
+          return ghostText(answer.text)
         } finally {
-          inFlightRef.current = false
+          inFlightRef.current.delete(cacheKey)
           onCancel?.dispose?.()
         }
       },
@@ -1148,7 +1185,9 @@ function CodePanel(props) {
     observer.observe(document.body, { attributes: true, attributeFilter: ['data-ds-dark-theme'] })
     return () => {
       completions.dispose()
-      if (inlineTriggerTimerRef.current !== null) clearTimeout(inlineTriggerTimerRef.current)
+      // The map outlives the editor; drop it so a torn-down panel cannot hand a
+      // later instance a promise from the previous one.
+      inFlightRef.current.clear()
       selectionListener.dispose()
       observer.disconnect()
       editor.dispose()
@@ -1262,14 +1301,16 @@ function CodePanel(props) {
         setEditRevision((revision) => revision + 1)
         if (editor.getModel() !== model) return
         setDirty(st.dirty)
-        if (inlineTriggerTimerRef.current !== null) clearTimeout(inlineTriggerTimerRef.current)
-        if (settingsRef.current.completionEnabled === false) return
-        inlineTriggerTimerRef.current = setTimeout(() => {
-          inlineTriggerTimerRef.current = null
-          if (editor.getModel() === model && editor.getPosition?.() && typeof editor.trigger === 'function') {
-            editor.trigger('code-workbench', 'editor.action.inlineSuggest.trigger', {})
-          }
-        }, 400)
+        // No nudge here on purpose. Monaco already asks on its own for every
+        // typed character, for backspace and delete (they sit in its
+        // `triggerCommands` list precisely because they never reach
+        // `onDidType`), and for Tab and paste. Nudging it arrives as an
+        // *Explicit* trigger, which never satisfies the automatic request
+        // already on the wire: Monaco (`UpdateRequest.satisfies`) drops that one
+        // and starts over, so every completion paid a second round trip plus a
+        // fixed 400ms, and every extra keystroke pushed the ghost text another
+        // 400ms out. That was the "I have to press space or delete to make it
+        // appear" report.
       })
       }
       }

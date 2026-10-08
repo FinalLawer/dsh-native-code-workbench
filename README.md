@@ -160,6 +160,12 @@ node tools/probe-completion-credential.mjs --live    # 再对每一路真实各�
 - 新发送的代码引用在聊天记录中默认折叠为文件与行号，点击展开；模型仍收到完整选区。此前发送的普通代码块没有引用标记，保留原展示。
 - Tab 补全采用 180ms 请求防抖、较小的前后文（前缀 3200 字符 / 后缀 900 字符）和 128 token 预算，并缓存最近 40 个光标上下文。
 
+  触发完全交给 Monaco：它在每个输入字符（含空格）、退格/删除、Tab、粘贴和显式光标移动上都会自己发请求，插件不再额外补一枪。
+
+  此前插件在内容变更后 400ms 会自己发一次 `editor.action.inlineSuggest.trigger`，而那是 **Explicit** 触发，不满足已在途的 Automatic 请求（`UpdateRequest.satisfies` 要求 `this` 侧也是 Explicit）——Monaco 会丢掉在途那次并重开一次，于是每次补全都多一个往返、固定多等 400ms；更糟的是每多敲一个字终点就再后退 400ms，表现就是「要打个空格或删一下才会出来」。
+
+  同一光标的并发请求现在共享一次往返：第二次询问 await 第一次的答案并优先读缓存，而不是回 `{items: []}`——空数组对 Monaco 不是「我不知道」而是「这一版没有建议」的判决，被记进 state 后 `satisfies` 会短路掉该版本上后续的显式询问，于是必须再动一次键盘才解锁。
+
   ⚠️ **本机网络抖动实测 ±300ms，比大部分参数效应还大**——任何「提速了」的判断都要多轮取样才作数，单次测量没有意义。目前真正能调的只剩防抖（180ms）和 `max_tokens`（128）。`max_tokens` 调小能省 150–400ms，但长建议会被截断，属于取舍不是白捡。
 
 - 凭据第三级（DSH 账号授权）已**对真实 `/beta/completions` 端点验证通过**（HTTP 200，用私有头 `x-dsh-auth-token`、不带 `Authorization`）。用 `node tools/probe-completion-credential.mjs --live` 可随时复核三条链路。注意它只在 **origin** 属于该账号服务信任的推理源时才会签发。
