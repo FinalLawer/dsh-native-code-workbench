@@ -15,13 +15,13 @@ https://github.com/FinalLawer/dsh-native-code-workbench#path:/dsh-code-workbench
 固定版本请把 tag 一起带上：
 
 ```
-https://github.com/FinalLawer/dsh-native-code-workbench#v0.4.3&path:/dsh-code-workbench
+https://github.com/FinalLawer/dsh-native-code-workbench#v0.4.4&path:/dsh-code-workbench
 ```
 
 命令行等价写法（需先完全退出 DSH）：
 
 ```
-dsh plugin --profile desktop add "https://github.com/FinalLawer/dsh-native-code-workbench#v0.4.3&path:/dsh-code-workbench"
+dsh plugin --profile desktop add "https://github.com/FinalLawer/dsh-native-code-workbench#v0.4.4&path:/dsh-code-workbench"
 ```
 
 也可以从压缩包安装：把 `dsh-code-workbench-<版本>.tgz` 放到任意位置，在同一个对话框里填它的**绝对路径**。两条路径装进 profile 的内容一致（按 `files` 白名单，13 个文件）。
@@ -38,7 +38,7 @@ dsh plugin --profile desktop add "https://github.com/FinalLawer/dsh-native-code-
 
 ## 文件树右键菜单
 
-右键点击文件、目录或文件树空白处，可以新建文件和文件夹、在资源管理器中显示、添加路径引用到当前对话、剪切/复制/粘贴、复制路径、重命名及删除。新建和重命名使用工作台内的名称弹窗，删除使用确认弹窗。剪切和复制后，在目标文件夹右键选择粘贴；复制遇到同名文件会自动生成副本名称。目录引用会提示 Agent 按需读取路径。文件操作要求会话允许工作区写入，禁止覆盖已有目标和修改工作区外路径；删除需要确认且不能撤销。
+右键点击文件、目录或文件树空白处，可以新建文件和文件夹、在资源管理器中显示、添加路径引用到当前对话、剪切/复制/粘贴、复制路径、重命名及删除。新建和重命名使用工作台内的名称弹窗，删除使用确认弹窗。剪切和复制后，在目标文件夹右键选择粘贴；复制遇到同名文件会自动生成副本名称。「添加路径引用」或把文件树行拖进输入框会落成一枚引用胶囊，发送时展开为与官方 `@` 引用同形的 **`@路径` mention**（目录带尾斜杠）：聊天记录里因此渲染回同一个胶囊、点按在右栏预览，Agent 则按系统提示里那条 `@` 指引先读再下结论。文件操作要求会话允许工作区写入，禁止覆盖已有目标和修改工作区外路径；删除需要确认且不能撤销。
 
 已移除「打开工作区终端」和「在文件夹中查找」。菜单不包含运行测试、调试测试、运行覆盖率测试，目前未加入「添加到新对话」。
 
@@ -111,6 +111,7 @@ API Key 通过 Host 设置服务保存，标记为秘密字段，设置页不会
 | **检查点 / 回滚** | 每次保存自动入账本；左栏「历史」列出检查点，**一键回滚**到任意保存之前；回滚本身也是检查点，可再回滚 | `POST /api/code-workbench/history` / `rollback`（host 内存账本，每文件 20 条、每侧 200KB 上限）+ `ctx.fs.writeText` 版本守卫 |
 | **外部改动自动重载** | Agent/外部改了盘上文件 → 干净缓冲区**自动刷新**；有未保存修改时警告不覆盖 | 官方 `workspaceFiles.changes` 流（`ctx.remote.$stream`），按打开文件订阅 |
 | **加到对话（Add to Chat）** | 右栏**选中多行代码** → `Ctrl+L`/按钮 → 主对话输入框里出现**引用胶囊**（只显示 `文件:行号 · N 行`），**发送时才展开**成完整代码块给 Agent | 官方 chip 机制：`slash/input-insert-reference` 事件插 `ReferenceChipNode` + 自注册 reference codec（`inputTriggers.registerSource` 的 `codec.serialize` 做提交展开） |
+| **拖拽行到输入框** | 文件树行（文件或目录）拖进主对话输入框 → 落成引用胶囊；**发送时展开为共享 `@路径` mention**（目录带尾斜杠、含空格走 `@"…"`），聊天记录里渲染回同一个胶囊 | 私有 MIME「三重收窄」在 document 捕获阶段接管拖放 → 同一个官方 `slash/input-insert-reference` 通道；提交展开走同一个 reference codec（`clipboardText` 与展开文案逐字一致） |
 | 可追溯 | 每次保存记 Session 备注 | `sessionFeedback.record` |
 | 主题 | 跟随 DSH 明暗主题 | `body[data-ds-dark-theme]` MutationObserver → `monaco.editor.setTheme` |
 | 快捷键 | `Ctrl+S` 保存、`Ctrl+L` 将选中代码加入对话、`Tab` 接受补全（编辑器内） | `editor.addCommand` |
@@ -158,6 +159,7 @@ node tools/probe-completion-credential.mjs --live    # 再对每一路真实各�
 
 - 文件同步使用官方 changes 流，并每 1.5 秒检查打开文件版本、窗口重新聚焦时检查；干净缓冲区自动重读，未保存修改保留。
 - 新发送的代码引用在聊天记录中默认折叠为文件与行号，点击展开；模型仍收到完整选区。此前发送的普通代码块没有引用标记，保留原展示。
+- 路径引用（右键「添加路径引用」或拖拽文件树行）在聊天记录里是与输入框同形的胶囊，点按在右栏预览——因为提交时展开的就是官方 `@路径` mention，官方投影再把这段文字装饰回胶囊。目录胶囊只作展示：官方投影只给文件接跳转。
 - Tab 补全采用 180ms 请求防抖、较小的前后文（前缀 3200 字符 / 后缀 900 字符）和 128 token 预算，并缓存最近 40 个光标上下文。
 
   触发完全交给 Monaco：它在每个输入字符（含空格）、退格/删除、Tab、粘贴和显式光标移动上都会自己发请求，插件不再额外补一枪。
