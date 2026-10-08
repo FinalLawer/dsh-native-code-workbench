@@ -148,6 +148,7 @@ const calls = {
   watchSpecs: [],
   inserted: [],
   bailed: [],
+  previewOpens: [],
 }
 const fakeActx = {
   bail(self, event, payload) {
@@ -357,6 +358,12 @@ const files = {
   },
   read: async (sessionId, path) => {
     calls.read.push(path)
+    // The Host's text channel refuses anything that is not UTF-8 text: the exact
+    // failure a PDF, a spreadsheet or an Office container produces. The panel has
+    // to react to the code, so the stub answers with the real one.
+    if (path.endsWith('.xlsx')) {
+      return { ok: false, error: { code: 'workspace-file/not-text', message: 'file is not UTF-8 text' } }
+    }
     return { ok: true, value: { text: fakeModel.getValue(), version: { v: 1 }, lines: 2, eof: true } }
   },
   changes: (sessionId, path) => {
@@ -407,8 +414,16 @@ function textOf(node) {
   return textOf(node.children)
 }
 
+// The right-sidebar navigation controller the body is handed. The panel calls
+// exactly one method on it, so the recorder is the whole fake.
+const previewController = {
+  openResource: (address) => {
+    calls.previewOpens.push(address)
+  },
+}
 const props = {
   sessionId: 's1',
+  sidebarRight: previewController,
   useSessions: (select) => select({ byId: { s1: { cwd: 'C:\\repo' } } }),
   inputActions: {
     captureInsertion: () => ({ start: 0, end: 0, draftRev: 1 }),
@@ -1501,6 +1516,160 @@ check('the context before the caret is shipped exactly, anchored at the caret',
 check('the context after the caret is shipped exactly, anchored at the caret',
   shipped?.suffix === caretBuffer.slice(fakeOffset, fakeOffset + COMPLETION_SUFFIX_CHARS),
   { sent: shipped?.suffix?.length, window: COMPLETION_SUFFIX_CHARS })
+
+console.log('\na file that is not text is handed to the official document preview')
+// Mounted fresh, and last on purpose. Fresh, because the blocks above leave a dirty
+// buffer behind and `openFile` autosaves it on the way in: that save's "已保存 …"
+// status resolves after the handoff's, so the status line below would race the save
+// instead of the handoff. Last, because this block re-points the directory listing,
+// and the selection and batch assertions above count rows in the shared one.
+files.list = async (sessionId, dir) => {
+  calls.list.push(dir)
+  return { ok: true, value: { entries: [{ name: 'a.js', type: 'file' }, { name: 'book.xlsx', type: 'file' }], truncated: false } }
+}
+await act(async () => { renderer.unmount() })
+await act(async () => { renderer = create(h(CodePanel, props), { createNodeMock: createMockNode }) })
+await act(async () => {})
+const panelTabTitles = () => findAll(tree(), (node) => typeof node.props?.className === 'string'
+  && node.props.className.split(' ')[0] === 'code-workbench-tab').map((node) => textOf(node))
+const spreadsheetRow = findAll(tree(), (node) => node.type === 'div' && node.props.title === 'C:\\repo\\book.xlsx')[0]
+check('the tree lists the spreadsheet', spreadsheetRow !== undefined)
+const tabsBefore = panelTabTitles().length
+const modelsBefore = calls.models.length
+check('a fresh panel has nothing open', tabsBefore === 0, panelTabTitles())
+
+await act(async () => { spreadsheetRow?.props?.onClick?.() })
+await act(async () => {})
+
+check('the panel opened the official preview for it, exactly once',
+  calls.previewOpens.length === 1, calls.previewOpens)
+// Pinned as a literal: the address grammar belongs to the official builder, and a
+// test that rebuilt the expectation with the same package could not notice it
+// changing shape under the panel.
+check('the address is the shared session file address the official preview claims',
+  calls.previewOpens[0] === 'dsh-resource://file/session/s1/book.xlsx', calls.previewOpens)
+check('no Monaco model was built for a file the panel cannot render',
+  calls.models.length === modelsBefore, { before: modelsBefore, after: calls.models.length })
+check('the plugin kept its own tab strip clean',
+  panelTabTitles().length === tabsBefore, panelTabTitles())
+check('the status says where the file went',
+  allText().includes('已在右栏「文档预览」中打开'), { tail: allText().slice(-160) })
+
+console.log('\nthe handoff degrades when nothing claims the file')
+// A build without the preview package: `openResource` throws because no registered
+// type claims the address. The panel must keep its own error rather than report a
+// file it never managed to show.
+await act(async () => { renderer.unmount() })
+await act(async () => {
+  renderer = create(h(CodePanel, {
+    ...props,
+    sidebarRight: { openResource() { throw new Error('sidebarRight: no type claims the address') } },
+  }), { createNodeMock: createMockNode })
+})
+await act(async () => {})
+const lonelyRow = findAll(tree(), (node) => node.type === 'div' && node.props.title === 'C:\\repo\\book.xlsx')[0]
+await act(async () => { lonelyRow?.props?.onClick?.() })
+await act(async () => {})
+check('the panel did not claim to have opened anything',
+  !allText().includes('已在右栏「文档预览」中打开'), allText().slice(0, 140))
+check('and it names the panel that can show the file',
+  allText().includes('读取失败') && allText().includes('此类文件需在右栏「文档预览」中打开'), allText().slice(0, 200))
+
+console.log('\na published update is offered, and taking it is one click')
+// The panel is opened constantly and a release is rare, so the whole point of
+// this pair is that it costs one read per mount and nothing at all when there is
+// nothing to say. Every case mounts fresh, because the check is a mount effect.
+const baseFetch = globalThis.fetch
+const updateCalls = { check: [], apply: [] }
+const answers = { check: { ok: true, hasUpdate: false }, apply: { ok: true, applied: true, version: '0.4.5', needsRestart: false } }
+globalThis.fetch = async (url, options) => {
+  const text = String(url)
+  if (!text.includes('/update-check') && !text.includes('/update-apply')) return baseFetch(url, options)
+  const kind = text.includes('/update-check') ? 'check' : 'apply'
+  calls.fetch.push({ url: text, body: JSON.parse(options.body) })
+  updateCalls[kind].push({ url: text, body: JSON.parse(options.body), signal: options.signal })
+  if (answers[`${kind}Throws`] === true) throw new TypeError('fetch failed')
+  return { ok: true, status: 200, json: async () => answers[kind] }
+}
+const unmount = async () => { await act(async () => { renderer.unmount() }) }
+const mount = async () => {
+  await act(async () => { renderer = create(h(CodePanel, props), { createNodeMock: createMockNode }) })
+  await act(async () => {})
+}
+const remount = async () => { await unmount(); await mount() }
+const bannerButton = (label) => findAll(tree(), (node) => node.type === 'button' && textOf(node) === label)[0]
+
+await remount()
+check('a panel with nothing to update says nothing about updating',
+  !allText().includes('有新版本') && !allText().includes('升级'), allText().slice(0, 120))
+check('and it asked the host exactly once', updateCalls.check.length === 1, updateCalls.check.length)
+check('asking carries the request body the host ignores', JSON.stringify(updateCalls.check[0]?.body) === '{}', updateCalls.check[0]?.body)
+const firstCheck = updateCalls.check[0]?.signal
+await unmount()
+check('a panel that closed takes its question with it', firstCheck?.aborted === true)
+
+// Case: a client-only release — the kind the shipped module registry reloads by
+// itself, so the banner must not ask anyone to restart anything.
+answers.check = { ok: true, current: '0.4.4', latest: '0.4.5', hasUpdate: true, changed: ['client.js'], needsRestart: false }
+await mount()
+check('the banner names the version that is published',
+  allText().includes('有新版本 0.4.5'), allText().slice(0, 160))
+check('and a client-only release does not ask for a restart',
+  !allText().includes('需要重启'), allText().slice(0, 160))
+const upgrade = bannerButton('升级')
+check('with a button that takes it', upgrade !== undefined, allText().slice(0, 160))
+await act(async () => { upgrade?.props.onClick() })
+await act(async () => {})
+check('one click posts one apply, and the body names no files',
+  updateCalls.apply.length === 1 && JSON.stringify(updateCalls.apply[0]?.body) === '{}', updateCalls.apply)
+check('the panel reports the version that landed and that it is reloading',
+  allText().includes('已更新到 0.4.5，正在重新加载'), allText().slice(0, 200))
+check('and the offer is gone', !allText().includes('有新版本'), allText().slice(0, 200))
+
+// Case: a release that also replaced something the running Host already loaded.
+answers.check = { ok: true, current: '0.4.4', latest: '0.4.5', hasUpdate: true, changed: ['index.js'], needsRestart: true }
+answers.apply = { ok: true, applied: true, version: '0.4.5', changed: ['index.js'], needsRestart: true }
+await remount()
+check('a host-half release says a restart is coming',
+  allText().includes('有新版本 0.4.5（需要重启 DSH）'), allText().slice(0, 160))
+await act(async () => { bannerButton('升级')?.props.onClick() })
+await act(async () => {})
+check('and the panel does not pretend it is already in effect',
+  allText().includes('已更新到 0.4.5，重启 DSH 后生效'), allText().slice(0, 240))
+
+// Case: the host refuses the release, and says why.
+answers.apply = { ok: false, error: { code: 'UPDATE_DIGEST', message: 'client.js 的摘要与清单不符' } }
+await remount()
+await act(async () => { bannerButton('升级')?.props.onClick() })
+await act(async () => {})
+check('a refusal is shown with the reason the host gave',
+  allText().includes('client.js 的摘要与清单不符'), allText().slice(0, 260))
+check('and the offer is still there to retry', allText().includes('有新版本 0.4.5'), allText().slice(0, 200))
+
+// Case: no network at all. The button must come back rather than stick on
+// "更新中…" and leave the panel unable to try again.
+answers.applyThrows = true
+await remount()
+await act(async () => { bannerButton('升级')?.props.onClick() })
+await act(async () => {})
+check('an unreachable host is reported as a network failure',
+  allText().includes('更新失败，请检查网络后重试'), allText().slice(0, 260))
+check('and the button is usable again', bannerButton('升级') !== undefined)
+delete answers.applyThrows
+
+// Case: the check itself fails. Silence is the entire fallback — nobody opened
+// the panel to hear about GitHub.
+answers.checkThrows = true
+await remount()
+check('a check that cannot run shows no banner and breaks nothing',
+  !allText().includes('有新版本') && !allText().includes('更新'), allText().slice(0, 120))
+delete answers.checkThrows
+answers.check = { ok: false, error: { code: 'UPDATE_UNAVAILABLE' } }
+await remount()
+check('and a check the host cannot answer is equally quiet',
+  !allText().includes('有新版本'), allText().slice(0, 120))
+
+globalThis.fetch = baseFetch
 
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURE(S)`)
 await act(async () => { renderer.unmount() })

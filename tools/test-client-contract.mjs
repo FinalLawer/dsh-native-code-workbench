@@ -118,6 +118,9 @@ const registeredShortcuts = []
 const registeredInjects = []
 const registeredSources = []
 const effects = []
+// The right-sidebar navigation controller. The panel reaches the official
+// document preview through it, so the inject face has to carry the real object.
+const sidebarRightController = { openResource() {} }
 
 const ctx = {
   effect(callback, label) {
@@ -154,6 +157,7 @@ const ctx = {
       return () => {}
     },
   },
+  sidebarRight: sidebarRightController,
   shortcuts: {
     registerFixed(command) {
       registeredShortcuts.push(command)
@@ -257,6 +261,11 @@ for (const key of module.inject.filter((name) => name.includes('.'))) {
 }
 check('declares no extra hooks (the panel uses the standard kit)',
   face?.hooks === undefined, face?.hooks)
+// Same class of defect as the dotted keys above, but this service carries no dot:
+// the body's only route to the official document preview is this object, and a
+// face that dropped it would leave a non-text file failing with a bare code.
+check('the inject face hands over the right-sidebar navigation controller',
+  face?.sidebarRight === sidebarRightController, Object.keys(face ?? {}))
 
 console.log('\nstandard-kit contract')
 // Source-level facts about the component. Prose is stripped, because the component's own

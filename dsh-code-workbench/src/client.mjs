@@ -11,12 +11,17 @@
  *  - writing            → the package's own host half, `POST /api/code-workbench/write`,
  *                         version-guarded via `ctx.fs.writeText` on the Host
  *                         (implemented in index.js; the only mutation path)
+ *  - non-text files     → the OFFICIAL document preview, through
+ *                         `ctx.sidebarRight.openResource(fileAddressFor(…))`; this tab
+ *                         type registers no `pattern`, so it never shadows that
+ *                         `dsh-resource://file/**` fallback (see `openInDocumentPreview`)
  *
  * The bundle contract: exports { inject, apply, name }; `require` is limited to
  * the frozen browser module table (`react`). Monaco is inlined at build time.
  */
 
 import React from 'react'
+import { fileAddressFor } from '@deepseek-ai/dsh-util-workspace-path'
 import './workbench.css'
 import { serializeSnippet, splitSnippets } from './snippets.mjs'
 import { COMPLETION_PREFIX_CHARS, COMPLETION_SUFFIX_CHARS } from './completion-window.mjs'
@@ -58,6 +63,23 @@ const TAB_KIND = 'code-workbench'
 const TAB_LABEL = '代码工作台'
 /** Guide-capsule description. */
 const TAB_DESCRIPTION = '编辑工作区代码，使用 AI 补全，将选中代码加入对话'
+
+/**
+ * The read failures that mean "this is not text this panel can page through",
+ * and therefore the only two that hand a file to the official preview.
+ *
+ * Decided on the error CODE, never on message text, and never on a suffix list.
+ * A suffix list would be a second copy of a rule the Host already owns — the
+ * text channel is the only thing that actually knows whether a file is text —
+ * and it would have to track the official preview's own registry to stay right
+ * about which suffixes it can render. The code is exact: `not-text` is invalid
+ * UTF-8 or a NUL byte, `too-large` is the page cap.
+ */
+const NON_TEXT_CODES = new Set(['workspace-file/not-text', 'workspace-file/too-large'])
+/** Status after a non-text file was handed to the official document preview. */
+const NON_TEXT_HANDOFF_STATUS = '此文件不是文本，已在右栏「文档预览」中打开'
+/** Status suffix for a non-text file when no preview claimed it, so nothing can show it. */
+const NON_TEXT_NO_PREVIEW_SUFFIX = '（此类文件需在右栏「文档预览」中打开）'
 
 /**
  * The private drag flavor for tree rows.
@@ -104,6 +126,38 @@ function referenceMention(path, directory) {
   // path still reads correctly to the model and simply is not a chip.
   if (/[\u0000-\u001f\u007f-\u009f"]/u.test(spelled)) return spelled
   return ` ${/\s/u.test(spelled) ? `@"${spelled}"` : `@${spelled}`}`
+}
+
+/**
+ * Hand a file this panel cannot show to the official document preview.
+ *
+ * The panel only ever renders UTF-8 text in Monaco, so a PDF, a spreadsheet or
+ * an Office container is a dead end here — but not in the product. DSH ships a
+ * right-sidebar preview that renders exactly those (PDF; xlsx/xls/csv/tsv;
+ * doc/docx/ppt/pptx through the Host conversion service; images; HTML), and this
+ * tab type registers no `pattern`, so it never shadows that
+ * `dsh-resource://file/**` fallback. Addressing the file and opening it is the
+ * official way to reach it — the same `fileAddressFor` + `openResource` pair the
+ * official file tree uses — so nothing here is a private channel.
+ *
+ * `openResource` throws when no registered type claims the address (a build
+ * without the preview package) and the panel must not pretend it opened
+ * something it did not: the boolean is the caller's licence to report success.
+ *
+ * @param sidebarRight - the right-sidebar navigation controller, or undefined.
+ * @param sessionId - the Session that authorizes the read.
+ * @param cwd - the Session workspace root, so a native absolute path relativizes.
+ * @param path - the file to preview.
+ * @returns true when the official preview took the file.
+ */
+function openInDocumentPreview(sidebarRight, sessionId, cwd, path) {
+  if (typeof sidebarRight?.openResource !== 'function') return false
+  try {
+    sidebarRight.openResource(fileAddressFor(sessionId, cwd, path))
+    return true
+  } catch {
+    return false
+  }
 }
 
 /** The drag payload for one tree row. */
@@ -208,6 +262,9 @@ const CREDENTIAL_SOURCE_LABELS = {
 /** The save journal endpoints (checkpoints: list and roll back saves). */
 const HISTORY_PATH = '/api/code-workbench/history'
 const ROLLBACK_PATH = '/api/code-workbench/rollback'
+/** The update endpoints: is a newer release published, and install it. */
+const UPDATE_CHECK_PATH = '/api/code-workbench/update-check'
+const UPDATE_APPLY_PATH = '/api/code-workbench/update-apply'
 
 /**
  * How often the version fallback ticks. The tick is local and free; what costs
@@ -999,6 +1056,7 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
 function CodePanel(props) {
   const {
     sessionId,
+    sidebarRight,
     useSessions,
     inputActions,
     'remote.workspaceFiles': files,
@@ -1063,6 +1121,64 @@ function CodePanel(props) {
   const [treeClipboard, setTreeClipboard] = useState(null)
   const [searchDirectory, setSearchDirectory] = useState(null)
   const [tabMenu, setTabMenu] = useState(null)
+
+  // ---- published updates ---------------------------------------------------
+  // Asked once per mount: the panel is opened constantly and a release is rare,
+  // so one read per mount is the whole budget this costs anyone.
+  const [release, setRelease] = useState(null) // { latest, needsRestart } | null
+  const [updateBusy, setUpdateBusy] = useState(false)
+  const [updateNote, setUpdateNote] = useState('')
+
+  useEffect(() => {
+    let cancelled = false
+    const controller = new AbortController()
+    fetch(UPDATE_CHECK_PATH, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}', signal: controller.signal })
+      .then((response) => response.json())
+      .then((answer) => {
+        if (cancelled || answer?.ok !== true || answer.hasUpdate !== true) return
+        setRelease({ latest: answer.latest, needsRestart: answer.needsRestart === true })
+      })
+      // A check that cannot run is not news: silence is the entire fallback, for
+      // the same reason the completion route has one — nobody opened the panel
+      // to hear about GitHub.
+      .catch(() => {})
+    return () => {
+      cancelled = true
+      controller.abort()
+    }
+  }, [])
+
+  /**
+   * Install the published release.
+   *
+   * Success needs no announcement of its own: the Host replaces `client.js`, the
+   * shipped module registry sees the new revision and reloads this panel, so for
+   * a client-only release the banner disappears with the remount. A release that
+   * also changed what the running Host already loaded can only be honest about
+   * needing a restart — it must not report an update that is not in effect yet.
+   */
+  const runUpdate = async () => {
+    if (updateBusy) return
+    setUpdateBusy(true)
+    setUpdateNote('正在下载新版本…')
+    try {
+      const response = await fetch(UPDATE_APPLY_PATH, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
+      const answer = await response.json()
+      if (answer?.ok !== true) {
+        setUpdateNote(answer?.error?.message ?? '更新失败，请稍后重试')
+        return
+      }
+      setRelease(null)
+      if (answer.applied !== true) setUpdateNote('已经是最新版本')
+      else if (answer.needsRestart === true) setUpdateNote(`已更新到 ${answer.version}，重启 DSH 后生效`)
+      else setUpdateNote(`已更新到 ${answer.version}，正在重新加载…`)
+    } catch {
+      setUpdateNote('更新失败，请检查网络后重试')
+    } finally {
+      setUpdateBusy(false)
+    }
+  }
+
   useEffect(() => {
     const close = () => setTabMenu(null)
     document.addEventListener?.('click', close)
@@ -1297,7 +1413,13 @@ function CodePanel(props) {
       let version = null
       for (let page = 0; page < 40; page++) {
         const res = await files.read(sessionId, path, { offset }, undefined)
-        if (!res?.ok) throw new Error(res?.error?.code ?? 'read failed')
+        if (!res?.ok) {
+          // Carry the code, not just the message: whether this file belongs to
+          // the official preview is a decision on the code (`NON_TEXT_CODES`).
+          const failure = new Error(res?.error?.code ?? 'read failed')
+          failure.code = res?.error?.code
+          throw failure
+        }
         text += res.value.text
         version = res.value.version ?? version
         if (res.value.eof) break
@@ -1363,7 +1485,16 @@ function CodePanel(props) {
         setTimeout(() => { editor.deltaDecorations(decorations, []) }, 1500)
       }
     } catch (error) {
-      setStatus(`读取失败: ${error.message ?? error}`)
+      // A file the text channel refuses is not a dead end. Hand it to the
+      // official document preview instead of reporting a raw code the user can
+      // do nothing with — and leave this panel exactly as it was: no tab, no
+      // model, the open file still open.
+      if (NON_TEXT_CODES.has(error?.code) && openInDocumentPreview(sidebarRight, sessionId, cwd, path)) {
+        setStatus(NON_TEXT_HANDOFF_STATUS)
+        return
+      }
+      const hint = NON_TEXT_CODES.has(error?.code) ? NON_TEXT_NO_PREVIEW_SUFFIX : ''
+      setStatus(`读取失败: ${error.message ?? error}${hint}`)
     }
   }, [files, monaco, sessionId])
 
@@ -2004,6 +2135,25 @@ function CodePanel(props) {
       }, '加到对话'),
       h('button', { style: button, onClick: () => save(), disabled: !dirty }, '保存 (Ctrl+S)'),
     ),
+    release === null && updateNote === '' ? null : h('div', {
+      className: 'code-workbench-update',
+      role: 'status',
+      style: { ...header, borderBottom: `1px solid ${T.border}`, background: T.bgRaised, color: T.fg, padding: '8px 12px' },
+    },
+      h('span', { style: { flex: '1 1 auto', minWidth: 0, overflowWrap: 'anywhere' } },
+        // The note never replaces the offer: a failure is something to read, not
+        // something to hide the version behind — and the button beside it is
+        // what a retry uses.
+        release === null
+          ? updateNote
+          : `有新版本 ${release.latest}${release.needsRestart ? '（需要重启 DSH）' : ''}${updateNote === '' ? '' : ` · ${updateNote}`}`),
+      release === null ? null : h('button', {
+        type: 'button',
+        style: { ...button, opacity: updateBusy ? 0.6 : 1, cursor: updateBusy ? 'default' : 'pointer' },
+        disabled: updateBusy,
+        onClick: runUpdate,
+      }, updateBusy ? '更新中…' : '升级'),
+    ),
     h('div', { className: 'code-workbench-body', style: { display: 'flex', flex: '1 1 auto', minHeight: 0 } },
       h('div', { className: 'code-workbench-activity', role: 'toolbar', 'aria-label': '工作区视图' },
         [['tree', '文件', 'files'], ['search', '搜索', 'search'], ['history', '历史', 'history']].map(([mode, label, icon]) => h('button', {
@@ -2055,7 +2205,7 @@ function CodePanel(props) {
 // Registration
 // ---------------------------------------------------------------------------
 
-const inject = ['slots', 'sidebarRightTabs', 'remote.workspaceFiles', 'remote.session', 'shortcuts', 'sessions', 'inputTriggers', 'configForms']
+const inject = ['slots', 'sidebarRightTabs', 'sidebarRight', 'remote.workspaceFiles', 'remote.session', 'shortcuts', 'sessions', 'inputTriggers', 'configForms']
 
 function CodeWorkbenchSettings({ form }) {
   const snapshot = usePluginSettings(form)
@@ -2342,6 +2492,9 @@ function apply(ctx) {
     inject: () => ({
       'remote.workspaceFiles': ctx['remote.workspaceFiles'],
       'remote.session': ctx['remote.session'],
+      // The navigation controller is what hands a non-text file to the official
+      // preview; without it the panel keeps its own read error.
+      'sidebarRight': ctx.sidebarRight,
       'settings.form': settingsForm,
       'remote.stream': (spec) => ctx.remote.$stream(spec),
       'sessions.scope': (id) => ctx.sessions.scope(id),

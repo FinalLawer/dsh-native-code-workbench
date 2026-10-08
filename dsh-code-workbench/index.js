@@ -1,9 +1,11 @@
 /**
  * dsh-code-workbench — Host half.
  *
- * The one mutation path of the plugin: `POST /api/code-workbench/write`, a
- * version-guarded workspace file write. Everything else the panel does is
- * read-only through the shipped `ctx.remote.workspaceFiles`.
+ * Two mutation paths, both narrow: `POST /api/code-workbench/write`, a
+ * version-guarded write inside the Session's workspace — and
+ * `POST /api/code-workbench/update-apply`, which lands a published release over
+ * this package's own directory and touches nothing else. Everything else the
+ * panel does is read-only through the shipped `ctx.remote.workspaceFiles`.
  *
  * Every mechanism here is the shipped one:
  *  - routing + authentication → `ctx.connection.fetch.register` — the same seam
@@ -28,6 +30,9 @@
 // no registry fetch can fail behind a restrictive network.
 import z from './vendor/schemastery.mjs'
 import * as disk from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { fimEndpoint, completeFim } from './completion-api.mjs'
 import { COMPLETION_PREFIX_CHARS, COMPLETION_SUFFIX_CHARS } from './src/completion-window.mjs'
 
@@ -53,6 +58,10 @@ const SEARCH_PATH = '/api/code-workbench/search'
 /** The save journal (save checkpoints): list and roll back saves. */
 const HISTORY_PATH = '/api/code-workbench/history'
 const ROLLBACK_PATH = '/api/code-workbench/rollback'
+/** The route answering whether a newer release of this package is published. */
+const UPDATE_CHECK_PATH = '/api/code-workbench/update-check'
+/** The route that installs the published release over this installation. */
+const UPDATE_APPLY_PATH = '/api/code-workbench/update-apply'
 /**
  * Journal caps: entries retained per file, bytes retained per side, and the
  * bounds on the journal as a whole.
@@ -1023,6 +1032,362 @@ async function handleFileOperation(scope, request) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Update check and apply
+//
+// A panel that can tell its own installation a newer release exists — and land
+// it — is the difference between "upgrade" and "uninstall it and type the URL
+// again". Nothing here invents a channel: the bytes are the ones the release
+// already published, and the swap works only because the shipped client-module
+// registry reads a row's `client.js` from disk on demand and re-publishes the
+// row when its revision changes — the same transport `dsh-client-hmr` documents
+// as the way a development rebuild supplies bundle changes.
+//
+// GitHub is read through the REST API rather than a raw-content host because the
+// raw host is not reachable from every machine this runs on while
+// `api.github.com` is; files past the contents API's 1 MB inline limit come from
+// the blob API it names in their place.
+// ---------------------------------------------------------------------------
+
+/** The published repository an update comes from. */
+const UPDATE_REPOSITORY = 'FinalLawer/dsh-native-code-workbench'
+/** The package inside that repository; the repository root carries no package.json. */
+const UPDATE_SUBDIR = 'dsh-code-workbench'
+/** The released manifest naming every shipped file and its SHA-256. */
+const UPDATE_MANIFEST = 'update.json'
+/** The directory this half is installed in — the only thing an update writes to. */
+const INSTALL_DIR = dirname(fileURLToPath(import.meta.url))
+/** Tags scanned newest-first: a release published without a manifest must fall through, not fail. */
+const UPDATE_TAG_SCAN = 5
+/**
+ * Files the running Host already has in memory.
+ *
+ * `index.js` and everything it imports are loaded once, at boot, so replacing
+ * them is necessary but not sufficient: the process keeps running the old code
+ * until DSH restarts, and the caller has to say so rather than report an update
+ * that is not in effect yet. Everything else in the package either gets read off
+ * disk on demand — `client.js`, which the shipped module registry re-publishes
+ * the moment its revision changes — or is inert once loaded: the build inputs
+ * under `src/`, `build.mjs`, the licence, the readme.
+ */
+const UPDATE_BOOT_FILES = new Set([
+  'index.js',
+  'completion-api.mjs',
+  'vendor/schemastery.mjs',
+  'src/completion-window.mjs',
+  'cordis.patch.yml',
+])
+/** Caps: the manifest, one shipped file, and the two request budgets. */
+const UPDATE_MANIFEST_BYTES = 256 * 1024
+const UPDATE_FILE_BYTES = 32 * 1024 * 1024
+const UPDATE_META_TIMEOUT_MS = 15_000
+const UPDATE_BLOB_TIMEOUT_MS = 120_000
+/** One check is two small reads; hold the answer briefly so a reopened panel is free. */
+const UPDATE_CACHE_MS = 5 * 60 * 1000
+/**
+ * A relative path this half is willing to write.
+ *
+ * An update writes inside this package's own directory, so what a hostile or
+ * corrupt manifest must not be able to say is the whole point: no absolute path,
+ * no `.` or `..` segment, no backslash, no empty segment.
+ */
+const UPDATE_SAFE_PATH = /^[A-Za-z0-9][A-Za-z0-9._-]*(?:\/[A-Za-z0-9][A-Za-z0-9._-]*)*$/
+/** The newest release carrying a manifest, held for {@link UPDATE_CACHE_MS}. */
+let updateCache = { at: 0, release: null }
+
+/** GitHub accepts anonymous REST reads; the version header pins the response shape. */
+const UPDATE_HEADERS = {
+  accept: 'application/vnd.github+json',
+  'x-github-api-version': '2022-11-28',
+  'user-agent': 'dsh-code-workbench',
+}
+
+/**
+ * Parse `v1.2.3`, `1.2.3` or `1.2.3-rc.1` into comparable parts.
+ * @param text - a tag name or a package version.
+ * @returns the parts, or null when the text is not a version this understands.
+ */
+function parseVersion(text) {
+  const match = /^v?(\d+)\.(\d+)\.(\d+)(?:-(.+))?$/.exec(String(text).trim())
+  if (match === null) return null
+  return { numbers: [Number(match[1]), Number(match[2]), Number(match[3])], pre: match[4] ?? null }
+}
+
+/**
+ * Order two versions, with a pre-release below its release (`1.0.0-rc.1 < 1.0.0`).
+ * Unparseable text compares equal, so it can never win the "is it newer?" test.
+ * @returns a negative number, zero, or a positive number.
+ */
+function compareVersions(left, right) {
+  const a = parseVersion(left)
+  const b = parseVersion(right)
+  if (a === null || b === null) return 0
+  for (let index = 0; index < 3; index += 1) if (a.numbers[index] !== b.numbers[index]) return a.numbers[index] - b.numbers[index]
+  if (a.pre === b.pre) return 0
+  if (a.pre === null) return 1
+  if (b.pre === null) return -1
+  return a.pre < b.pre ? -1 : 1
+}
+
+/**
+ * One bounded GitHub read.
+ * @param url - the REST URL.
+ * @param timeoutMs - the bound, independent of the caller's own deadline.
+ * @param signal - the caller's cancellation, or undefined.
+ * @returns the parsed body.
+ * @throws {Error} when the request fails, the bound expires, or the body is not JSON.
+ */
+async function readGithub(url, timeoutMs, signal) {
+  const deadline = AbortSignal.timeout(timeoutMs)
+  const response = await fetch(url, {
+    headers: UPDATE_HEADERS,
+    signal: signal === undefined ? deadline : AbortSignal.any([signal, deadline]),
+  })
+  if (!response.ok) throw requestFailure(502, 'UPDATE_GITHUB', `GitHub 返回 ${response.status}`)
+  return response.json()
+}
+
+/** This installation's own version, read from the manifest beside this file. */
+async function installedVersion() {
+  const manifest = JSON.parse(await disk.readFile(join(INSTALL_DIR, 'package.json'), 'utf8'))
+  return typeof manifest.version === 'string' ? manifest.version : '0.0.0'
+}
+
+/**
+ * The file list a manifest is allowed to name.
+ * @param manifest - the parsed manifest.
+ * @returns the paths, relative to the package directory.
+ * @throws {Error} when the manifest is not one this half will act on.
+ */
+function manifestNames(manifest) {
+  const files = manifest?.files
+  if (files === null || typeof files !== 'object') throw requestFailure(502, 'UPDATE_MANIFEST', '清单没有文件表')
+  const names = Object.keys(files)
+  if (names.length === 0 || names.length > 64) throw requestFailure(502, 'UPDATE_MANIFEST', '清单的文件数不合理')
+  for (const name of names) {
+    if (!UPDATE_SAFE_PATH.test(name)) throw requestFailure(502, 'UPDATE_MANIFEST', `清单包含不安全的路径：${name}`)
+    if (typeof files[name] !== 'string' || !/^[0-9a-f]{64}$/.test(files[name])) throw requestFailure(502, 'UPDATE_MANIFEST', `清单的摘要不合法：${name}`)
+  }
+  return names.sort()
+}
+
+/**
+ * The newest published tag that carries a manifest.
+ *
+ * Tags are ordered here rather than trusted: `/tags` promises no order, and a
+ * release published without a manifest has to fall through to the one below it
+ * instead of failing the whole check — which is exactly the case for every tag
+ * older than this feature.
+ * @param signal - the caller's cancellation.
+ * @returns `{ tag, version, manifest, names }`, or null when no scanned tag carries one.
+ */
+async function newestRelease(signal) {
+  const tags = await readGithub(`https://api.github.com/repos/${UPDATE_REPOSITORY}/tags?per_page=100`, UPDATE_META_TIMEOUT_MS, signal)
+  if (!Array.isArray(tags)) return null
+  const ranked = tags
+    .map((entry) => entry?.name)
+    .filter((name) => typeof name === 'string' && parseVersion(name) !== null)
+    .sort((left, right) => compareVersions(right, left))
+    .slice(0, UPDATE_TAG_SCAN)
+  for (const tag of ranked) {
+    const listing = await readGithub(
+      `https://api.github.com/repos/${UPDATE_REPOSITORY}/contents/${UPDATE_SUBDIR}/${UPDATE_MANIFEST}?ref=${encodeURIComponent(tag)}`,
+      UPDATE_META_TIMEOUT_MS, signal,
+    ).catch(() => null)
+    if (listing === null || typeof listing.content !== 'string' || listing.encoding !== 'base64') continue
+    if (!Number.isFinite(listing.size) || listing.size > UPDATE_MANIFEST_BYTES) throw requestFailure(502, 'UPDATE_MANIFEST', '清单超出允许的大小')
+    const manifest = JSON.parse(Buffer.from(listing.content, 'base64').toString('utf8'))
+    if (typeof manifest?.version !== 'string' || parseVersion(manifest.version) === null) continue
+    return { tag, version: manifest.version, manifest, names: manifestNames(manifest) }
+  }
+  return null
+}
+
+/** The newest release, held briefly: reopening the panel must not cost another two reads. */
+async function cachedRelease(signal) {
+  if (Date.now() - updateCache.at < UPDATE_CACHE_MS) return updateCache.release
+  const release = await newestRelease(signal)
+  updateCache = { at: Date.now(), release }
+  return release
+}
+
+/**
+ * LF-normalised bytes: the form these text files are stored in.
+ * @param bytes - the file as it is on disk.
+ * @returns the same bytes with every CRLF reduced to LF.
+ */
+function normalisedLineEndings(bytes) {
+  if (!bytes.includes(0x0d)) return bytes
+  return Buffer.from(bytes.toString('latin1').replace(/\r\n/gu, '\n'), 'latin1')
+}
+
+/**
+ * SHA-256 of an installed file, over normalised bytes, or null when it is missing.
+ *
+ * The digest has to describe the file, not the way it was checked out. Git holds
+ * every one of these files with LF, a Windows working tree with
+ * `core.autocrlf=true` hands them over as CRLF, and a tarball packed from that
+ * tree keeps it — one source, three byte streams. Normalising here and in
+ * `tools/make-update-manifest.py` makes the comparison about content, so an
+ * installation made from a locally packed tarball is not perpetually "outdated".
+ */
+async function localDigest(path) {
+  try {
+    return createHash('sha256').update(normalisedLineEndings(await disk.readFile(path))).digest('hex')
+  } catch {
+    return null
+  }
+}
+
+/** Which of a release's files differ from what is installed. */
+async function changedFiles(release) {
+  const changed = []
+  for (const name of release.names) if (await localDigest(join(INSTALL_DIR, name)) !== release.manifest.files[name]) changed.push(name)
+  return changed
+}
+
+/**
+ * One shipped file, straight from the tag's own blob.
+ *
+ * The contents API inlines files up to 1 MB and answers with the blob's name for
+ * anything larger, so the 5 MB bundle costs one extra read instead of a second
+ * protocol.
+ * @param tag - the release tag.
+ * @param name - the path inside the package.
+ * @param signal - the caller's cancellation.
+ * @returns the bytes.
+ */
+async function readReleaseFile(tag, name, signal) {
+  const listing = await readGithub(
+    `https://api.github.com/repos/${UPDATE_REPOSITORY}/contents/${UPDATE_SUBDIR}/${name}?ref=${encodeURIComponent(tag)}`,
+    UPDATE_META_TIMEOUT_MS, signal,
+  )
+  if (typeof listing?.content === 'string' && listing.encoding === 'base64') {
+    const inline = Buffer.from(listing.content, 'base64')
+    if (inline.length !== listing.size) throw requestFailure(502, 'UPDATE_TRUNCATED', `下载不完整：${name}`)
+    return inline
+  }
+  if (typeof listing?.sha !== 'string') throw requestFailure(502, 'UPDATE_GITHUB', `无法定位 ${name}`)
+  if (!Number.isFinite(listing.size) || listing.size > UPDATE_FILE_BYTES) throw requestFailure(502, 'UPDATE_TOO_LARGE', `${name} 超出允许的大小`)
+  const blob = await readGithub(`https://api.github.com/repos/${UPDATE_REPOSITORY}/git/blobs/${listing.sha}`, UPDATE_BLOB_TIMEOUT_MS, signal)
+  if (blob?.encoding !== 'base64' || typeof blob.content !== 'string') throw requestFailure(502, 'UPDATE_GITHUB', `无法读取 ${name}`)
+  const bytes = Buffer.from(blob.content, 'base64')
+  if (bytes.length !== listing.size) throw requestFailure(502, 'UPDATE_TRUNCATED', `下载不完整：${name}`)
+  return bytes
+}
+
+/**
+ * Publish one file over the installed copy.
+ *
+ * `rename` and not a write: an installed tree is pnpm's, where every file is
+ * hard-linked into the content store, so writing through the name would edit the
+ * store copy other profiles share. Renaming a fresh file onto the name replaces
+ * the directory entry instead — atomically, and without touching the store.
+ * @param name - the path inside the package.
+ * @param bytes - the verified bytes to publish.
+ */
+async function replaceFile(name, bytes) {
+  const target = join(INSTALL_DIR, name)
+  await disk.mkdir(dirname(target), { recursive: true })
+  const staging = `${target}.update-${process.pid}-${Date.now()}`
+  await disk.writeFile(staging, bytes)
+  try {
+    await disk.rename(staging, target)
+  } catch (error) {
+    await disk.rm(staging, { force: true })
+    throw error
+  }
+}
+
+/**
+ * Answer whether a newer release is published.
+ *
+ * A courtesy, not a report: a machine that cannot reach GitHub, a repository
+ * with no manifest, and an installation already at the newest version all answer
+ * the same quiet "nothing to do". Only a well-formed answer about a real release
+ * is worth the panel's attention.
+ * @param scope - injected Host services.
+ * @param request - the buffered Fetch request the Connection dispatched.
+ * @returns the JSON outcome.
+ */
+async function handleUpdateCheck(scope, request) {
+  const admission = scope.connection.admit(request)
+  if ('rejection' in admission) return json(admission.rejection, { ok: false })
+  try {
+    const current = await installedVersion()
+    const release = await cachedRelease(request.signal)
+    if (release === null || compareVersions(release.version, current) <= 0) {
+      return json(200, { ok: true, current, latest: release?.version ?? null, hasUpdate: false })
+    }
+    const changed = await changedFiles(release)
+    return json(200, {
+      ok: true,
+      current,
+      latest: release.version,
+      hasUpdate: changed.length > 0,
+      changed,
+      needsRestart: changed.some((name) => UPDATE_BOOT_FILES.has(name)),
+    })
+  } catch (error) {
+    const logger = scope?.logger
+    if (typeof logger?.warn === 'function') logger.warn('code-workbench: update check skipped — %s', error?.message ?? String(error))
+    return json(200, { ok: false, error: { code: 'UPDATE_UNAVAILABLE' } })
+  }
+}
+
+/**
+ * Install the published release over this installation.
+ *
+ * The manifest is read again here rather than taken from the caller: the request
+ * only ever says "now", never which files or which digests. Every file is
+ * checked against the digest the release published before it lands, and each one
+ * lands atomically, so a failure part-way through leaves a working tree of mixed
+ * — but individually valid — versions rather than a half-written file.
+ * @param scope - injected Host services.
+ * @param request - the buffered Fetch request the Connection dispatched.
+ * @returns the JSON outcome; `needsRestart` is true when a file this process
+ * already loaded was among those replaced.
+ */
+async function handleUpdateApply(scope, request) {
+  const admission = scope.connection.admit(request)
+  if ('rejection' in admission) return json(admission.rejection, { ok: false })
+  try {
+    const current = await installedVersion()
+    const release = await newestRelease(request.signal)
+    if (release === null || compareVersions(release.version, current) <= 0) {
+      return json(200, { ok: true, applied: false, reason: 'up-to-date', current })
+    }
+    const changed = await changedFiles(release)
+    if (changed.length === 0) return json(200, { ok: true, applied: false, reason: 'up-to-date', current, version: release.version })
+    for (const name of changed) {
+      // Normalised once, then verified and written: what lands on disk has to be
+      // the file the digest describes, or the next check would report the same
+      // file as changed again for a line-ending it never chose.
+      const bytes = normalisedLineEndings(await readReleaseFile(release.tag, name, request.signal))
+      if (createHash('sha256').update(bytes).digest('hex') !== release.manifest.files[name]) {
+        throw requestFailure(502, 'UPDATE_DIGEST', `${name} 的摘要与清单不符`)
+      }
+      await replaceFile(name, bytes)
+    }
+    // The answer just changed under the cache: the next check must read the tree again.
+    updateCache = { at: 0, release: null }
+    return json(200, {
+      ok: true,
+      applied: true,
+      version: release.version,
+      changed,
+      needsRestart: changed.some((name) => UPDATE_BOOT_FILES.has(name)),
+    })
+  } catch (error) {
+    const failure = typeof error?.status === 'number'
+      ? { code: error.code, message: error.message }
+      : { code: 'UPDATE_FAILED', message: `更新失败：${error?.message ?? error}` }
+    const logger = scope?.logger
+    if (typeof logger?.warn === 'function') logger.warn('code-workbench: update failed — %s', failure.message)
+    return json(200, { ok: false, error: failure })
+  }
+}
+
 export function apply(ctx, config) {
   const runtime = { settings: undefined }
   if (ctx.fiber) {
@@ -1072,6 +1437,18 @@ export function apply(ctx, config) {
       requestBody: 'buffered',
       fetch: (request) => handleRollback(scope, request),
     }), 'code-workbench: POST /api/code-workbench/rollback')
+    scope.effect(() => scope.connection.fetch.register({
+      path: UPDATE_CHECK_PATH,
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: (request) => handleUpdateCheck(scope, request),
+    }), 'code-workbench: POST /api/code-workbench/update-check')
+    scope.effect(() => scope.connection.fetch.register({
+      path: UPDATE_APPLY_PATH,
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: (request) => handleUpdateApply(scope, request),
+    }), 'code-workbench: POST /api/code-workbench/update-apply')
     scope.effect(() => scope.tools.register(codebaseSearchTool(scope)), 'code-workbench: codebase_search tool')
   })
 }
