@@ -1,5 +1,35 @@
 # DSH Code Workbench
 
+## 安装
+
+推荐直接用 GitHub 链接安装，不必先下载压缩包。在 DSH 侧边栏的**插件**页点**添加插件**，粘贴：
+
+```
+https://github.com/FinalLawer/dsh-native-code-workbench#path:/dsh-code-workbench
+```
+
+装完点**立即启用**；已安装但没启用的组合包，之后也能在插件页开启。
+
+⚠️ **`#path:/dsh-code-workbench` 这一段不能省。** 这个仓库的根目录不是包——插件在 `dsh-code-workbench/` 子目录里，根目录没有 `package.json`。省略它时 pnpm 仍会报告安装成功，但装出来的是一个名为 `dsh-native-code-workbench.git`、版本 `0.0.0` 的占位包（清单是 pnpm 生成的 `{"_pnpmPlaceholder": …}`），既没有包清单也没有 `dsh.bundle` 声明，DSH 读不到组合包，插件不会出现。这个失败发生在安装**之后**，光看安装过程看不出来。
+
+固定版本请把 tag 一起带上：
+
+```
+https://github.com/FinalLawer/dsh-native-code-workbench#v0.4.1&path:/dsh-code-workbench
+```
+
+命令行等价写法（需先完全退出 DSH）：
+
+```
+dsh plugin --profile desktop add "https://github.com/FinalLawer/dsh-native-code-workbench#v0.4.1&path:/dsh-code-workbench"
+```
+
+也可以从压缩包安装：把 `dsh-code-workbench-<版本>.tgz` 放到任意位置，在同一个对话框里填它的**绝对路径**。两条路径装进 profile 的内容一致（按 `files` 白名单，12 个文件）。
+
+安装需要目标机器有 **pnpm**；走 GitHub 链接还需要 **git**，压缩包不需要。包里的 `client.js` 是预构建产物，安装过程**不执行任何构建脚本**，所以不会触发 pnpm 的依赖脚本拦截。
+
+**升级**：profile 安装的插件不支持自动更新，升级要「卸载 → 装新版」——所以对外分发建议带 tag，而不是跟最新 master。
+
 ## 工作台布局
 
 左侧图标栏切换文件、搜索和历史视图，再次点击当前视图可收起导航。文件树顶部提供新建文件、新建文件夹、刷新和全部折叠。编辑区显示多文件标签和当前文件的路径面包屑，配色与控件跟随 DSH 主题。
@@ -113,8 +143,6 @@ node tools/analyze-bundle.mjs         # bundle 体积归因（哪个模块最胖
 node tools/fim-mock-server.mjs        # 本地 FIM 镜像：打印真实请求形状、判定 FIM/chat、回一段合法 JSON 让 ghost text 真的出现
 node tools/probe-completion-credential.mjs          # 打印凭据链会选中哪一路（只读，不联网）
 node tools/probe-completion-credential.mjs --live    # 再对每一路真实各发一个小请求，验证真的能补
-```
-
 # 改 client.js 不需要重启：HMR 按文件元数据（mtime/ctime/size）算修订号，重写即重载
 # 改 index.js（host 半体）需要重启 DSH：桌面 boot 图是启动快照
 ```
