@@ -28,7 +28,7 @@
 // no registry fetch can fail behind a restrictive network.
 import z from './vendor/schemastery.mjs'
 import * as disk from 'node:fs/promises'
-import { completionEndpoint, streamCompletionApi } from './completion-api.mjs'
+import { completionEndpoint, fimEndpoint, streamCompletionApi, streamCompletionFim } from './completion-api.mjs'
 
 export const Config = z.object({
   autoSave: z.boolean().default(false).volatile(),
@@ -36,6 +36,7 @@ export const Config = z.object({
   completionProvider: z.string().default('').volatile(),
   completionModel: z.string().default('').volatile(),
   completionApiEnabled: z.boolean().default(false).volatile(),
+  completionApiStyle: z.string().default('chat').volatile(),
   completionBaseUrl: z.string().default('').volatile(),
   completionApiKey: z.string().default('').role('secret').volatile(),
   completionApiModel: z.string().default('').volatile(),
@@ -279,8 +280,13 @@ async function handleComplete(scope, request, config, settings) {
   const completionModel = liveSettings?.completionModel ?? config?.completionModel?.get?.() ?? config?.completionModel
   const selected = scope.get('agentDefaultModel')?.currentSelection()
   const independentApi = preference('completionApiEnabled') === true
+  // The independent route has two wire shapes: the framed chat call this
+  // plugin started with, and a fill-in-the-middle call that hands the
+  // provider the caret's two sides directly. `chat` stays the default so an
+  // existing configuration keeps behaving exactly as before.
+  const useFim = independentApi && preference('completionApiStyle') === 'fim'
   const route = independentApi
-    ? { provider: '独立 API', model: preference('completionApiModel') }
+    ? { provider: useFim ? '独立 FIM API' : '独立 API', model: preference('completionApiModel') }
     : completionProvider && completionModel
     ? { provider: completionProvider, model: completionModel }
     : selected
@@ -289,31 +295,46 @@ async function handleComplete(scope, request, config, settings) {
   }
 
   if (independentApi) {
-    try { completionEndpoint(preference('completionBaseUrl')) }
+    try { (useFim ? fimEndpoint : completionEndpoint)(preference('completionBaseUrl')) }
     catch { return json(400, { ok: false, error: { code: 'INVALID_API_URL', message: '请在插件设置中填写有效的补全 API Base URL' } }) }
   }
+  const before = prefix.slice(-COMPLETE_CAPS.prefix)
+  const after = typeof suffix === 'string' ? suffix.slice(0, COMPLETE_CAPS.suffix) : ''
+  // A fill-in-the-middle call needs neither the framing nor the instruction:
+  // the provider receives the caret's two sides and returns what belongs
+  // between them. The chat shape still frames them as JSON for a model that
+  // only understands messages.
   const framed = [
     `File: ${path}${typeof language === 'string' && language !== '' ? ` (${language})` : ''}`,
     '',
     'Context JSON: { before, after }. "before" ends at the caret and "after" starts at it. Output the code to insert between them.',
-    JSON.stringify({
-      before: prefix.slice(-COMPLETE_CAPS.prefix),
-      after: typeof suffix === 'string' ? suffix.slice(0, COMPLETE_CAPS.suffix) : '',
-    }),
+    JSON.stringify({ before, after }),
   ].join('\n')
 
-  const options = {
-    provider: route.provider,
-    model: route.model,
-    messages: [{ role: 'user', content: [{ type: 'text', text: framed }] }],
-    system: COMPLETE_SYSTEM,
-    reasoningEffort: 'off',
-    maxTokens: COMPLETE_CAPS.maxTokens,
-    sessionId,
-    signal: request.signal,
-  }
+  const options = useFim
+    ? {
+        provider: route.provider,
+        model: route.model,
+        prompt: before,
+        suffix: after,
+        maxTokens: COMPLETE_CAPS.maxTokens,
+        sessionId,
+        signal: request.signal,
+      }
+    : {
+        provider: route.provider,
+        model: route.model,
+        messages: [{ role: 'user', content: [{ type: 'text', text: framed }] }],
+        system: COMPLETE_SYSTEM,
+        reasoningEffort: 'off',
+        maxTokens: COMPLETE_CAPS.maxTokens,
+        sessionId,
+        signal: request.signal,
+      }
 
-  const llm = independentApi
+  const llm = useFim
+    ? { stream: (requestOptions) => streamCompletionFim({ baseUrl: preference('completionBaseUrl'), apiKey: preference('completionApiKey') }, requestOptions) }
+    : independentApi
     ? { stream: (requestOptions) => streamCompletionApi({ baseUrl: preference('completionBaseUrl'), apiKey: preference('completionApiKey') }, requestOptions) }
     : scope.llm
   return llmNdjsonStream(llm, options, `补全模型 ${route.provider} / ${route.model}`)

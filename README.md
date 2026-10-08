@@ -14,9 +14,14 @@
 
 ## 独立补全 API
 
-在 DSH 设置的「代码工作台」中开启「使用独立补全 API」，填写 API Base URL（例如 `https://api.example.com/v1`）、模型 ID 和 API Key，然后点击「保存补全模型」。独立 API 仅用于 Tab 补全；独立接口支持 OpenAI 兼容的 `/chat/completions` SSE 流式接口，也支持填写完整端点地址；本地免鉴权服务可以不填密钥。
+在 DSH 设置的「代码工作台」中开启「使用独立补全 API」，选择接口类型，填写 API Base URL、模型 ID 和 API Key，然后点击「保存补全模型」。独立 API 仅用于 Tab 补全，优先于下方 Provider；本地免鉴权服务可以不填密钥。
 
-API Key 通过 Host 设置服务保存，标记为秘密字段，设置页不会回显。密钥输入框留空保留原密钥，勾选「清除已保存的 API Key」并保存可删除密钥。关闭独立 API 后，使用已配置的 DSH Provider / Model，两项留空则跟随 Agent。当前独立接口不支持 FIM、Anthropic Messages 或厂商特有参数。
+接口类型有两种：
+
+- **Chat Completions**（默认）：把光标上下文包成 JSON 交给 OpenAI 兼容的 `/chat/completions` 流式接口。任何对话式服务都能用，也支持填写完整端点地址。
+- **FIM 补全**：把光标前后的代码作为 `prompt` / `suffix` 直接交给补全接口（fill-in-the-middle），由服务端补出中间部分。无需提示词，代码补全的贴合度更高；Base URL 例如 `https://api.deepseek.com/beta`（自动补 `/completions`），也接受完整端点（如 `https://api.mistral.ai/v1/fim/completions`）。响应兼容 `text`、`delta.content`、`message.content` 三种字段。
+
+API Key 通过 Host 设置服务保存，标记为秘密字段，设置页不会回显。密钥输入框留空保留原密钥，勾选「清除已保存的 API Key」并保存可删除密钥。关闭独立 API 后，使用已配置的 DSH Provider / Model，两项留空则跟随 Agent。两种接口都只支持流式补全，不支持 Anthropic Messages、FIM 专用 token 或厂商特有参数。
 
 给 DSH Web GUI 的右侧栏加一个 **VS Code 风格的代码工作台**：用 **Monaco（VS Code 编辑器内核本体）** 浏览和编辑工作区文件——语法高亮、多光标、查找、撤销，全部与 VS Code 同款。
 
@@ -35,7 +40,7 @@ API Key 通过 Host 设置服务保存，标记为秘密字段，设置页不会
 | **写文件** | `POST /api/code-workbench/write`，**版本守卫**（`FS_STALE_VERSION` 拒绝覆盖并发修改），沙箱策略 = 会话标准策略 | host 半体 `ctx.connection.fetch.register`（与官方 `/api/file` 同一通道）→ `ctx.fs.writeText(target, text, intent, signal, sandboxPolicy)` |
 | **代码库检索** | 左栏「搜索」模式：正则/大小写搜索、结果列表、点击跳转到行并高亮 | `POST /api/code-workbench/search`：`ctx.fs` 有界遍历（忽略 `node_modules`/二进制扩展）+ 行匹配，文件数/匹配数/时间三重预算 |
 | **@codebase（Agent 工具）** | 对话里的 Agent 自带 `codebase_search` 工具：自然语言多词**排序检索**，返回 top 片段（补官方 `grep` 的精确正则） | `ctx.tools.register`（官方 Tool Runtime）+ 同一检索核心（terms 模式 + 词覆盖率排序） |
-| **Tab 补全** | 打字停顿后灰色 ghost 建议，**Tab 接受**、继续打字即取消；同一时刻最多一个请求 | Monaco `registerInlineCompletionsProvider`（ghost 渲染/接受全是内建）+ `POST /api/code-workbench/complete`（光标前后文 JSON 帧，128 token 小预算） |
+| **Tab 补全** | 打字停顿后灰色 ghost 建议，**Tab 接受**、继续打字即取消；同一时刻最多一个请求 | Monaco `registerInlineCompletionsProvider`（ghost 渲染/接受全是内建）+ `POST /api/code-workbench/complete`（128 token 小预算；独立 API 可选 Chat 帧或 FIM `prompt`/`suffix` 两种形态，默认跟随 Agent） |
 | **检查点 / 回滚** | 每次保存自动入账本；左栏「历史」列出检查点，**一键回滚**到任意保存之前；回滚本身也是检查点，可再回滚 | `POST /api/code-workbench/history` / `rollback`（host 内存账本，每文件 20 条、每侧 200KB 上限）+ `ctx.fs.writeText` 版本守卫 |
 | **外部改动自动重载** | Agent/外部改了盘上文件 → 干净缓冲区**自动刷新**；有未保存修改时警告不覆盖 | 官方 `workspaceFiles.changes` 流（`ctx.remote.$stream`），按打开文件订阅 |
 | **加到对话（Add to Chat）** | 右栏**选中多行代码** → `Ctrl+L`/按钮 → 主对话输入框里出现**引用胶囊**（只显示 `文件:行号 · N 行`），**发送时才展开**成完整代码块给 Agent | 官方 chip 机制：`slash/input-insert-reference` 事件插 `ReferenceChipNode` + 自注册 reference codec（`inputTriggers.registerSource` 的 `codec.serialize` 做提交展开） |

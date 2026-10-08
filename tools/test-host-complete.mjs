@@ -19,9 +19,10 @@ function check(label, condition, detail) {
   }
 }
 
-for (const field of ['autoSave', 'completionProvider', 'completionModel']) {
+for (const field of ['autoSave', 'completionProvider', 'completionModel', 'completionApiStyle']) {
   check(`${field} is editable through Host settings`, Config.dict[field].meta.volatile === true)
 }
+check('the independent route defaults to the chat shape', Config.dict.completionApiStyle.meta.default === 'chat')
 
 /**
  * Build the recording service scope.
@@ -164,6 +165,75 @@ console.log('\ncaps hold')
   const parsed = JSON.parse(contextLine)
   check('prefix is capped at 3200', parsed.before.length === 3200, parsed.before.length)
   check('suffix is capped at 900', parsed.after.length === 900, parsed.after.length)
+}
+
+console.log('\nthe independent route: chat shape (default)')
+{
+  const originalFetch = globalThis.fetch
+  let sent
+  try {
+    globalThis.fetch = async (url, init) => {
+      sent = { url, init }
+      const bytes = new TextEncoder().encode('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n')
+      return new Response(new ReadableStream({ start(controller) { for (const byte of bytes) controller.enqueue(new Uint8Array([byte])); controller.close() } }))
+    }
+    const { route } = mount({ config: { completionApiEnabled: true, completionBaseUrl: 'https://example.com/v1', completionApiModel: 'm', completionApiKey: 'k' } })
+    const got = await frames(await route.fetch(makeRequest(SAMPLE)))
+    check('an enabled independent API still uses /chat/completions by default',
+      sent.url === 'https://example.com/v1/chat/completions', sent.url)
+    check('the chat body carries a messages array', Array.isArray(JSON.parse(sent.init.body).messages))
+    check('the chat shape streams delta then done',
+      JSON.stringify(got.map((f) => f.t)) === JSON.stringify(['delta', 'done']), got)
+  } finally { globalThis.fetch = originalFetch }
+}
+
+console.log('\nthe independent route: FIM shape')
+{
+  const originalFetch = globalThis.fetch
+  let sent
+  try {
+    globalThis.fetch = async (url, init) => {
+      sent = { url, init }
+      const bytes = new TextEncoder().encode('data: {"choices":[{"text":"filled"}]}\n\ndata: [DONE]\n\n')
+      return new Response(new ReadableStream({ start(controller) { for (const byte of bytes) controller.enqueue(new Uint8Array([byte])); controller.close() } }))
+    }
+    const { route } = mount({ config: { completionApiEnabled: true, completionApiStyle: 'fim', completionBaseUrl: 'https://api.deepseek.com/beta', completionApiModel: 'deepseek-v4-pro', completionApiKey: 'k' } })
+    const got = await frames(await route.fetch(makeRequest(SAMPLE)))
+    check('the style selects the /completions endpoint',
+      sent.url === 'https://api.deepseek.com/beta/completions', sent.url)
+    const body = JSON.parse(sent.init.body)
+    check('the caret sides travel as prompt and suffix',
+      body.prompt === SAMPLE.prefix && body.suffix === SAMPLE.suffix, { prompt: body.prompt, suffix: body.suffix })
+    check('the FIM body carries no messages array', body.messages === undefined, body.messages)
+    check('the FIM shape streams delta then done',
+      JSON.stringify(got.map((f) => f.t)) === JSON.stringify(['delta', 'done']), got)
+  } finally { globalThis.fetch = originalFetch }
+}
+{
+  const originalFetch = globalThis.fetch
+  let sent
+  try {
+    globalThis.fetch = async (url, init) => {
+      sent = { url, init }
+      return new Response(new ReadableStream({ start(controller) { controller.close() } }))
+    }
+    const { route } = mount({ config: { completionApiEnabled: true, completionApiStyle: 'fim', completionBaseUrl: 'https://api.deepseek.com/beta', completionApiModel: 'deepseek-v4-pro' } })
+    await route.fetch(makeRequest({ ...SAMPLE, prefix: 'x'.repeat(9000), suffix: 'y'.repeat(5000) }))
+    const body = JSON.parse(sent.init.body)
+    check('FIM caps the prefix at 3200', body.prompt.length === 3200, body.prompt.length)
+    check('FIM caps the suffix at 900', body.suffix.length === 900, body.suffix.length)
+    check('FIM keeps the small token budget', body.max_tokens === 128, body.max_tokens)
+  } finally { globalThis.fetch = originalFetch }
+}
+{
+  const { route } = mount({ config: { completionApiEnabled: true, completionApiStyle: 'fim', completionBaseUrl: 'not-a-url', completionApiModel: 'm' } })
+  check('an invalid FIM base URL is 400', (await route.fetch(makeRequest(SAMPLE))).status === 400)
+}
+{
+  const { route, calls } = mount({ config: { completionApiStyle: 'fim' } })
+  await frames(await route.fetch(makeRequest(SAMPLE)))
+  check('a FIM style without the independent toggle stays on the Agent route',
+    calls.stream[0]?.provider === 'deepseek' && calls.stream[0]?.model === 'deepseek-chat', calls.stream[0])
 }
 
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURE(S)`)

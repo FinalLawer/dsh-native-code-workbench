@@ -1064,7 +1064,7 @@ function CodePanel(props) {
         const suffix = value.slice(offset, offset + 900)
         if (prefix.trim() === '') return { items: [] }
         const settings = settingsRef.current
-        const cacheKey = `${sessionId}\u0000${st.path}\u0000${settings.completionProvider}\u0000${settings.completionModel}\u0000${settings.completionApiEnabled}\u0000${settings.completionBaseUrl}\u0000${settings.completionApiModel}\u0000${model.getLanguageId()}\u0000${prefix}\u0000${suffix}`
+        const cacheKey = `${sessionId}\u0000${st.path}\u0000${settings.completionProvider}\u0000${settings.completionModel}\u0000${settings.completionApiEnabled}\u0000${settings.completionApiStyle}\u0000${settings.completionBaseUrl}\u0000${settings.completionApiModel}\u0000${model.getLanguageId()}\u0000${prefix}\u0000${suffix}`
         const cached = completionCache.get(cacheKey)
         if (cached !== undefined) {
           setCompletionStatus('Tab 接受 AI 建议')
@@ -1948,6 +1948,7 @@ function CodeWorkbenchSettings({ form }) {
   const [provider, setProvider] = useState(value.completionProvider)
   const [model, setModel] = useState(value.completionModel)
   const [apiEnabled, setApiEnabled] = useState(value.completionApiEnabled === true)
+  const [apiStyle, setApiStyle] = useState(value.completionApiStyle === 'fim' ? 'fim' : 'chat')
   const [baseUrl, setBaseUrl] = useState(value.completionBaseUrl ?? '')
   const [apiModel, setApiModel] = useState(value.completionApiModel ?? '')
   const [apiKey, setApiKey] = useState('')
@@ -1960,9 +1961,10 @@ function CodeWorkbenchSettings({ form }) {
     setProvider(value.completionProvider ?? '')
     setModel(value.completionModel ?? '')
     setApiEnabled(value.completionApiEnabled === true)
+    setApiStyle(value.completionApiStyle === 'fim' ? 'fim' : 'chat')
     setBaseUrl(value.completionBaseUrl ?? '')
     setApiModel(value.completionApiModel ?? '')
-  }, [value.autoSave, value.completionEnabled, value.completionProvider, value.completionModel, value.completionApiEnabled, value.completionBaseUrl, value.completionApiModel])
+  }, [value.autoSave, value.completionEnabled, value.completionProvider, value.completionModel, value.completionApiEnabled, value.completionApiStyle, value.completionBaseUrl, value.completionApiModel])
   const persist = async (operation) => {
     if (busy) return
     setBusy(true)
@@ -2026,9 +2028,21 @@ function CodeWorkbenchSettings({ form }) {
     h('p', { style: { color: T.fgMuted, fontSize: '12px' } }, '填写 DSH 已配置的 Provider 和模型 ID；两项留空跟随 Agent。'),
     h('label', null, h('input', { type: 'checkbox', checked: apiEnabled, disabled, onChange: (event) => setApiEnabled(event.target.checked) }), '使用独立补全 API'),
     apiEnabled ? h('div', { style: { display: 'grid', gap: '12px', marginTop: '12px' } },
-      h('p', { style: { color: T.fgMuted, fontSize: '12px', margin: 0 } }, '独立 API 优先于上方 Provider，支持 OpenAI 兼容的 Chat Completions 流式接口。'),
-      h('label', null, 'API Base URL', h('input', { style: input, value: baseUrl, placeholder: 'https://api.example.com/v1', disabled, onChange: (event) => setBaseUrl(event.target.value) })),
-      h('label', null, '补全模型 ID', h('input', { style: input, value: apiModel, placeholder: '接口提供的模型 ID', disabled, onChange: (event) => setApiModel(event.target.value) })),
+      h('div', { style: { display: 'grid', gap: '6px' } },
+        h('div', { className: 'code-workbench-setting-title' }, '接口类型'),
+        h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '16px', fontSize: '12px', color: T.fg } },
+          h('label', { style: { display: 'flex', alignItems: 'center', gap: '6px' } },
+            h('input', { type: 'radio', name: 'code-workbench-api-style', checked: apiStyle === 'chat', disabled, onChange: () => setApiStyle('chat') }),
+            'Chat Completions'),
+          h('label', { style: { display: 'flex', alignItems: 'center', gap: '6px' } },
+            h('input', { type: 'radio', name: 'code-workbench-api-style', checked: apiStyle === 'fim', disabled, onChange: () => setApiStyle('fim') }),
+            'FIM 补全')),
+        h('p', { style: { color: T.fgMuted, fontSize: '12px', margin: 0 } }, apiStyle === 'fim'
+          ? '把光标前后的代码直接交给补全接口，由服务端补出中间部分。代码补全专用，无需提示词，贴合度更高；Base URL 例如 https://api.deepseek.com/beta（会自动补 /completions）。'
+          : '把光标上下文包成 JSON 交给对话接口。任何 OpenAI 兼容的 Chat Completions 服务都能用。')),
+      h('p', { style: { color: T.fgMuted, fontSize: '12px', margin: 0 } }, '独立 API 优先于上方 Provider。'),
+      h('label', null, 'API Base URL', h('input', { style: input, value: baseUrl, placeholder: apiStyle === 'fim' ? 'https://api.deepseek.com/beta' : 'https://api.example.com/v1', disabled, onChange: (event) => setBaseUrl(event.target.value) })),
+      h('label', null, '补全模型 ID', h('input', { style: input, value: apiModel, placeholder: apiStyle === 'fim' ? '例如 deepseek-v4-pro 或 codestral-latest' : '接口提供的模型 ID', disabled, onChange: (event) => setApiModel(event.target.value) })),
       h('label', null, 'API Key', h('input', { type: 'password', autoComplete: 'new-password', style: input, value: apiKey, placeholder: '留空保留已保存密钥；本地接口可不填', disabled, onChange: (event) => { setApiKey(event.target.value); setClearApiKey(false) } })),
       h('label', null, h('input', { type: 'checkbox', checked: clearApiKey, disabled, onChange: (event) => { setClearApiKey(event.target.checked); setApiKey('') } }), '清除已保存的 API Key'),
       h('p', { style: { color: T.fgMuted, fontSize: '12px', margin: 0 } }, '密钥由 DSH Host 保存和使用，不回显到设置页。')) : null,
@@ -2040,7 +2054,7 @@ function CodeWorkbenchSettings({ form }) {
           if (!['http:', 'https:'].includes(endpoint.protocol) || endpoint.username || endpoint.password || !apiModel.trim()) throw new Error()
         } catch { setNotice('请填写有效的 HTTP(S) API 地址和补全模型 ID'); return }
       } else if (Boolean(provider.trim()) !== Boolean(model.trim())) { setNotice('Provider 和 Model 必须同时填写，或同时留空'); return }
-      const ops = Object.entries({ completionEnabled, completionProvider: provider.trim(), completionModel: model.trim(), completionApiEnabled: apiEnabled, completionBaseUrl: baseUrl.trim(), completionApiModel: apiModel.trim() }).map(([field, setting]) => ({ op: 'set', path: [field], value: setting }))
+      const ops = Object.entries({ completionEnabled, completionProvider: provider.trim(), completionModel: model.trim(), completionApiEnabled: apiEnabled, completionApiStyle: apiStyle, completionBaseUrl: baseUrl.trim(), completionApiModel: apiModel.trim() }).map(([field, setting]) => ({ op: 'set', path: [field], value: setting }))
       if (clearApiKey || apiKey.trim()) ops.push({ op: 'set', path: ['completionApiKey'], value: clearApiKey ? '' : apiKey.trim() })
       persist(async () => {
         const saved = await form.mutate(ops, snapshot.revision)
