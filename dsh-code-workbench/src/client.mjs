@@ -91,6 +91,30 @@ function parseTreeDragPayload(raw) {
   return { path, directory: kind === 'd' }
 }
 
+/** Whether a path is the given directory or sits inside it. */
+function isAtOrUnder(path, directory) {
+  return path === directory || path.startsWith(`${directory}/`) || path.startsWith(`${directory}\\`)
+}
+
+/**
+ * Point the open tabs at a moved or renamed path, keeping subtrees together.
+ *
+ * The deduplication is the point, not an optimisation. `from` and `to` can both
+ * already be open — a tab outlives the file it points at, so a name that is free
+ * on disk can still be taken in the tab strip — and a plain rewrite then leaves
+ * two tabs on one path. React reports that only as a duplicate-key warning in
+ * the console, and the person sees two tabs where closing either one leaves the
+ * other behind. The first occurrence keeps its position, so the tab that was
+ * already open does not jump.
+ * @param paths - the open tab paths, in strip order.
+ * @param from - the path being moved.
+ * @param to - where it lands.
+ * @returns the rewritten paths, without duplicates.
+ */
+function rewriteOpenPaths(paths, from, to) {
+  return [...new Set(paths.map((path) => isAtOrUnder(path, from) ? to + path.slice(from.length) : path))]
+}
+
 /** Theme-token vocabulary: the only shared styling dependency. */
 const T = {
   bg: 'var(--dsw-alias-bg-base)',
@@ -674,8 +698,7 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
             if (!isDir || dragRef.current === null) return
             // Dropping a folder into itself (or into its own descendant) would
             // detach that subtree from the tree, so those targets stay inert.
-            if (full === dragRef.current.path) return
-            if (full.startsWith(`${dragRef.current.path}/`) || full.startsWith(`${dragRef.current.path}\\`)) return
+            if (isAtOrUnder(full, dragRef.current.path)) return
             event.preventDefault()
             event.dataTransfer.dropEffect = 'move'
             if (dropTarget !== full) setDropTarget(full)
@@ -686,8 +709,7 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
           onDrop: (event) => {
             if (!isDir || dragRef.current === null) return
             const drag = dragRef.current
-            if (full === drag.path) return
-            if (full.startsWith(`${drag.path}/`) || full.startsWith(`${drag.path}\\`)) return
+            if (isAtOrUnder(full, drag.path)) return
             event.preventDefault()
             event.stopPropagation()
             dragRef.current = null
@@ -1533,7 +1555,7 @@ function CodePanel(props) {
         const folder = target.destination
         const sources = target.sources ?? [path]
         const moves = sources
-          .filter((item) => item !== folder && !folder.startsWith(`${item}/`) && !folder.startsWith(`${item}\\`))
+          .filter((item) => !isAtOrUnder(folder, item))
           .map((item) => ({ from: item, to: joinPath(folder, item.split(/[\\/]/).at(-1)) }))
           .filter((item) => item.to !== item.from)
         if (moves.length === 0) { setStatus('文件已经位于这个文件夹'); return { ok: true } }
@@ -1550,14 +1572,14 @@ function CodePanel(props) {
         // single rename does — a move is just a rename across folders.
         for (const move of moved) {
           for (const buffer of [...buffersRef.current.values()]) {
-            if (buffer.path !== move.from && !buffer.path.startsWith(`${move.from}/`) && !buffer.path.startsWith(`${move.from}\\`)) continue
+            if (!isAtOrUnder(buffer.path, move.from)) continue
             buffersRef.current.delete(buffer.path)
             buffer.model.dispose()
           }
-          setOpenPaths((paths) => paths.map((item) => item === move.from || item.startsWith(`${move.from}/`) || item.startsWith(`${move.from}\\`) ? move.to + item.slice(move.from.length) : item))
+          setOpenPaths((paths) => rewriteOpenPaths(paths, move.from, move.to))
         }
         const current = stateRef.current.path
-        const followed = moved.find((move) => current !== null && (current === move.from || current.startsWith(`${move.from}/`) || current.startsWith(`${move.from}\\`)))
+        const followed = moved.find((move) => current !== null && isAtOrUnder(current, move.from))
         if (followed) {
           stateRef.current = { path: null, version: null, dirty: false, text: '' }
           setActivePath(null)
@@ -1612,15 +1634,15 @@ function CodePanel(props) {
             setTreeRevision((revision) => revision + 1)
             for (const item of done) {
               for (const buffer of [...buffersRef.current.values()]) {
-                if (buffer.path !== item && !buffer.path.startsWith(`${item}/`) && !buffer.path.startsWith(`${item}\\`)) continue
+                if (!isAtOrUnder(buffer.path, item)) continue
                 if (buffer === stateRef.current) editorRef.current?.setModel(null)
                 buffersRef.current.delete(buffer.path)
                 buffer.model.dispose()
               }
-              setOpenPaths((paths) => paths.filter((path_) => path_ !== item && !path_.startsWith(`${item}/`) && !path_.startsWith(`${item}\\`)))
+              setOpenPaths((paths) => paths.filter((path_) => !isAtOrUnder(path_, item)))
             }
             const stillOpen = stateRef.current.path
-            if (stillOpen !== null && done.some((item) => stillOpen === item || stillOpen.startsWith(`${item}/`) || stillOpen.startsWith(`${item}\\`))) {
+            if (stillOpen !== null && done.some((item) => isAtOrUnder(stillOpen, item))) {
               editorRef.current?.setModel(null)
               stateRef.current = { path: null, version: null, dirty: false, text: '' }
               setActivePath(null)
@@ -1652,7 +1674,7 @@ function CodePanel(props) {
             if (destination.startsWith(`${path}/`) || destination.startsWith(`${path}\\`)) return { ok: false, error: '名称不能嵌套在自身之下' }
           } else source = joinPath(directory, name.trim())
         }
-        const affected = [...buffersRef.current.values()].filter((buffer) => buffer.path === source || buffer.path.startsWith(`${source}/`) || buffer.path.startsWith(`${source}\\`))
+        const affected = [...buffersRef.current.values()].filter((buffer) => isAtOrUnder(buffer.path, source))
         if (['rename', 'delete'].includes(operation) && affected.some((buffer) => buffer.dirty || buffer.saving)) throw new Error('请先保存受影响文件的修改，并等待保存完成')
         const response = await fetch('/api/code-workbench/file-operation', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId, operation, path: source, destination }) })
         const result = await response.json()
@@ -1666,12 +1688,11 @@ function CodePanel(props) {
             if (buffer === stateRef.current) editorRef.current?.setModel(null)
             buffer.model.dispose()
           }
-          setOpenPaths((paths) => paths.flatMap((item) => {
-            const matches = item === source || item.startsWith(`${source}/`) || item.startsWith(`${source}\\`)
-            return matches ? operation === 'rename' ? [destination + item.slice(source.length)] : [] : [item]
-          }))
+          setOpenPaths((paths) => operation === 'rename'
+            ? rewriteOpenPaths(paths, source, destination)
+            : paths.filter((item) => !isAtOrUnder(item, source)))
         }
-        if (current && (current === source || current.startsWith(`${source}/`) || current.startsWith(`${source}\\`))) {
+        if (current && isAtOrUnder(current, source)) {
           if (operation === 'rename') {
             stateRef.current = { path: null, version: null, dirty: false, text: '' }
             setActivePath(null)

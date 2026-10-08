@@ -1314,6 +1314,19 @@ const moveCalls = calls.fetch.filter((call) => call.body?.operation === 'rename'
 check('dropping onto a folder moves the file into it',
   moveCalls.length === 1 && moveCalls[0].body.path === 'C:\\repo\\a.js' && moveCalls[0].body.destination === 'C:\\repo\\sub\\a.js',
   moveCalls.map((call) => call.body))
+// The move rewrites the open tabs to their new homes, and `sub/a.js` was opened
+// further up — so the incoming `a.js` lands on a path that already has a tab.
+// A plain rewrite appended a second tab on the same path, which React reports
+// only as a duplicate-key warning buried in the console, and which the user
+// sees as two identical tabs where closing one does not close the other. Read
+// the real paths off the tab spans (the close button's title is a basename, so
+// the separator is what tells the two apart) and require exactly one each.
+const tabPaths = () => findAll(tree(), (node) => node.props?.className?.split(' ').includes('code-workbench-tab'))
+  .flatMap((tab) => findAll(tab, (node) => typeof node.props?.title === 'string' && /[\\/]/.test(node.props.title)).map((node) => node.props.title))
+const movedTabPaths = tabPaths()
+check('a move leaves one tab per path', new Set(movedTabPaths).size === movedTabPaths.length, movedTabPaths)
+check('the moved file is open at its new path',
+  movedTabPaths.filter((path_) => path_ === 'C:\\repo\\sub\\a.js').length === 1, movedTabPaths)
 // A file is not a drop target: it has no children to move into. The drop lands
 // on a FILE row here, so nothing should be issued.
 const fileDrag = moveTransfer()
