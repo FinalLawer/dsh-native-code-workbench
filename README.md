@@ -173,7 +173,7 @@ node tools/probe-completion-credential.mjs --live    # 再对每一路真实各�
 「检查更新」唯一的版本来源：列出本版每个文件的 SHA-256，并带上 `version`。两条约束：
 
 - **`update.json` 的 `version` 必须与该 tag 上的 `package.json` 一致**（脚本从 `package.json` 读，不要手改）。不一致时，用户点升级会拿到一个「仓库从没发布过」的版本号。
-- 摘要算的是**把 CRLF 归一化成 LF 之后**的字节。git 里存 LF、Windows 工作区检出 CRLF、从工作区打的 tarball 保留 CRLF——同一份内容三条字节流，只有归一化之后清单才同时描述它们（否则从 tarball 装的副本会永远「有更新」）。`index.js` 与 `src/client.mjs` 在 Windows 上就是 CRLF，脚本会打印哪几个文件被归一化了。
+- 摘要算的是**把 CRLF 归一化成 LF 之后**的字节。仓库根 `.gitattributes` 现在把所有文件在**检出时**也钉成 LF（`* text=auto eol=lf`），所以库里的、工作区的、tarball 里的、git 安装落地的字节如今是同一条流，脚本在正常仓库里不会再打印任何「被归一化」的行。归一化本身仍然保留：它对付的是 **`.gitattributes` 之前装下来的副本**——那些副本里 `index.js`、`src/client.mjs`、`client.js` 在 Windows 上是 CRLF，不归一化就会被永久判成「有更新」。这就是 `_fault_inject_update.py` 注入 A 要守的东西。
 
 `update.json` 随仓库发布即可，**不进 npm `files`**：升级读的是 GitHub 上那个 tag 的副本，装在盘上的副本没有用处。
 
