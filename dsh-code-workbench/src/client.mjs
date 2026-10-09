@@ -279,6 +279,8 @@ const SEARCH_PATH = '/api/code-workbench/search'
 const COMPLETE_PATH = '/api/code-workbench/complete'
 /** Host route reporting which credential a completion would use (values never leave the Host). */
 const COMPLETION_STATUS_PATH = '/api/code-workbench/completion-status'
+/** Host route answering this installation's own version and repository (the About panel). */
+const ABOUT_PATH = '/api/code-workbench/about'
 /** How each credential source is described to the person configuring the plugin. */
 const CREDENTIAL_SOURCE_LABELS = {
   manual: '设置页填写的 API Key',
@@ -2512,10 +2514,42 @@ function CodeWorkbenchSettings({ form }) {
   )
 }
 
+/**
+ * The About row: what this installation is, where its source lives, and a nudge.
+ *
+ * One POST per mount — the panel is opened constantly and the answer changes
+ * only with an update, so there is nothing worth re-asking. A route that
+ * cannot run is not news: the row stays collapsed to its label, the same quiet
+ * fallback the completion-status read uses.
+ */
+function CodeWorkbenchAbout() {
+  const [about, setAbout] = useState(null) // { version, repository } | false | null
+  useEffect(() => {
+    let live = true
+    fetch(ABOUT_PATH, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
+      .then((response) => (response.ok ? response.json() : null))
+      .then((payload) => { if (live) setAbout(payload?.ok === true ? payload : false) })
+      .catch(() => { if (live) setAbout(false) })
+    return () => { live = false }
+  }, [])
+  const available = about !== null && about !== false
+  return h('details', { className: 'code-workbench-about', style: { marginTop: '12px', paddingTop: '10px', borderTop: `1px solid ${T.border}` } },
+    h('summary', { style: { cursor: 'pointer', fontSize: '12px', color: T.fgMuted, userSelect: 'none' } }, '关于'),
+    available ? h('div', { style: { display: 'grid', gap: '4px', marginTop: '8px', fontSize: '12px', color: T.fgMuted } },
+      h('div', null, '当前版本：', about.version),
+      h('div', null,
+        '仓库：',
+        h('a', { href: about.repository, target: '_blank', rel: 'noreferrer noopener', style: { color: T.accent, textDecoration: 'underline' } }, about.repository)),
+      h('div', null, '觉得好用的话，欢迎到仓库点个 Star 支持一下。'),
+    ) : null,
+  )
+}
+
 function CodeWorkbenchSection({ renderSlot }) {
   return h('div', { style: { display: 'flex', flexDirection: 'column', minHeight: 0 } },
     h('h2', { style: { margin: '0 0 18px', fontSize: '20px', fontWeight: 500, color: T.fg } }, '代码工作台'),
     renderSlot('settings.code-workbench.item', {}),
+    h(CodeWorkbenchAbout),
   )
 }
 

@@ -62,6 +62,8 @@ const ROLLBACK_PATH = '/api/code-workbench/rollback'
 const UPDATE_CHECK_PATH = '/api/code-workbench/update-check'
 /** The route that installs the published release over this installation. */
 const UPDATE_APPLY_PATH = '/api/code-workbench/update-apply'
+/** The route answering this installation's own version and repository (the About panel). */
+const ABOUT_PATH = '/api/code-workbench/about'
 /**
  * Journal caps: entries retained per file, bytes retained per side, and the
  * bounds on the journal as a whole.
@@ -1336,6 +1338,28 @@ async function handleUpdateCheck(scope, request) {
 }
 
 /**
+ * Answer the About panel: this installation's own version and repository.
+ *
+ * Read-only and local: it reads the manifest beside this file — the same file
+ * an update rewrites — and nothing else, so the panel cannot outlive the truth
+ * about what is actually running.
+ * @param scope - injected Host services.
+ * @param request - the buffered Fetch request the Connection dispatched.
+ * @returns the JSON outcome.
+ */
+async function handleAbout(scope, request) {
+  const admission = scope.connection.admit(request)
+  if ('rejection' in admission) return json(admission.rejection, { ok: false })
+  try {
+    return json(200, { ok: true, version: await installedVersion(), repository: `https://github.com/${UPDATE_REPOSITORY}` })
+  } catch (error) {
+    const logger = scope?.logger
+    if (typeof logger?.warn === 'function') logger.warn('code-workbench: about skipped — %s', error?.message ?? String(error))
+    return json(200, { ok: false, error: { code: 'ABOUT_UNAVAILABLE' } })
+  }
+}
+
+/**
  * Install the published release over this installation.
  *
  * The manifest is read again here rather than taken from the caller: the request
@@ -1449,6 +1473,12 @@ export function apply(ctx, config) {
       requestBody: 'buffered',
       fetch: (request) => handleUpdateApply(scope, request),
     }), 'code-workbench: POST /api/code-workbench/update-apply')
+    scope.effect(() => scope.connection.fetch.register({
+      path: ABOUT_PATH,
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: (request) => handleAbout(scope, request),
+    }), 'code-workbench: POST /api/code-workbench/about')
     scope.effect(() => scope.tools.register(codebaseSearchTool(scope)), 'code-workbench: codebase_search tool')
   })
 }
