@@ -15,13 +15,13 @@ https://github.com/FinalLawer/dsh-native-code-workbench#path:/dsh-code-workbench
 固定版本请把 tag 一起带上：
 
 ```
-https://github.com/FinalLawer/dsh-native-code-workbench#v0.5.3&path:/dsh-code-workbench
+https://github.com/FinalLawer/dsh-native-code-workbench#v0.5.4&path:/dsh-code-workbench
 ```
 
 命令行等价写法（需先完全退出 DSH）：
 
 ```
-dsh plugin --profile desktop add "https://github.com/FinalLawer/dsh-native-code-workbench#v0.5.3&path:/dsh-code-workbench"
+dsh plugin --profile desktop add "https://github.com/FinalLawer/dsh-native-code-workbench#v0.5.4&path:/dsh-code-workbench"
 ```
 
 也可以从压缩包安装：把 `dsh-code-workbench-<版本>.tgz` 放到任意位置，在同一个对话框里填它的**绝对路径**。两条路径装进 profile 的内容一致（按 `files` 白名单，13 个文件）。
