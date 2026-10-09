@@ -25,21 +25,22 @@
   background: var(--dsw-alias-interactive-bg-hover);
   box-shadow: inset 0 0 0 1px var(--dsw-alias-border-l2);
 }
-.code-workbench-tree-row[data-active="true"] {
-  background: var(--dsw-alias-interactive-bg-hover);
-  box-shadow: inset 0 0 0 1px var(--dsw-alias-brand-primary);
-}
-/* The toolbar's create target. Separate from [data-active] so a selected
-   directory is still visible — directories can never be active. */
+/* The tree marks one thing and one thing only: the selection — the row the
+   toolbar's create, the context menu and the drag all act on.
+   The file you have open is *not* marked here. It used to be, and every marker
+   tried for it was wrong in the same way: one click opens a file and selects it
+   at the same time, so the row wears both states at once, and whatever the open
+   file paints looks like part of the selection — a box that never clears, or a
+   second marker the user did not ask for. Which file you are editing is already
+   answered by the tab strip, which shows exactly one active tab; the tree does
+   not need to answer it again. Hover is the pointer's own transient feedback and
+   stays. */
 .code-workbench-tree-row[data-selected="true"] {
   background: var(--dsw-alias-interactive-bg-hover);
   box-shadow: inset 0 0 0 1px var(--dsw-alias-border-l2);
 }
 .code-workbench-tree-row[aria-selected="true"] {
   background: var(--dsw-alias-interactive-bg-hover);
-}
-.code-workbench-tree-row[data-selected="true"][data-active="true"] {
-  box-shadow: inset 0 0 0 1px var(--dsw-alias-brand-primary);
 }
 .code-workbench-tree-row:focus-visible {
   outline: 2px solid var(--dsw-alias-brand-primary);

@@ -149,6 +149,8 @@ const calls = {
   inserted: [],
   bailed: [],
   previewOpens: [],
+  terminalOpens: [],
+  editorActions: [],
 }
 const fakeActx = {
   bail(self, event, payload) {
@@ -218,6 +220,12 @@ const fakeEditor = {
   addCommand(keybinding, handler) {
     calls.commands ??= []
     calls.commands.push({ keybinding, handler })
+  },
+  // Monaco's action registry, which is what puts an entry in the editor's own
+  // context menu. A descriptor, not a handler: the point of the assertions is
+  // that the menu entry and the Ctrl+L chord resolve to the same action.
+  addAction(descriptor) {
+    calls.editorActions.push(descriptor)
   },
   getSelection: () => ({
     isEmpty: () => selectionEmpty,
@@ -414,11 +422,15 @@ function textOf(node) {
   return textOf(node.children)
 }
 
-// The right-sidebar navigation controller the body is handed. The panel calls
-// exactly one method on it, so the recorder is the whole fake.
+// The right-sidebar navigation controller the body is handed. The panel uses two
+// of its methods — `openResource` for the official preview handoff, `openTab` for
+// the terminal — so the recorder is the whole fake.
 const previewController = {
   openResource: (address) => {
     calls.previewOpens.push(address)
+  },
+  openTab: (kind, options) => {
+    calls.terminalOpens.push({ kind, options })
   },
 }
 const props = {
@@ -462,6 +474,20 @@ check('editor commands retain save and Add to Chat without inline editing',
     fakeMonaco.KeyMod.CtrlCmd | fakeMonaco.KeyCode.KeyS,
     fakeMonaco.KeyMod.CtrlCmd | fakeMonaco.KeyCode.KeyL,
   ]), calls.commands?.map((row) => row.keybinding))
+// The context-menu door onto the same action. Three things are pinned here: it
+// is registered exactly once, it carries no second chord (Ctrl+L is the one
+// above, and a duplicate registration of a chord is silent), and it declares no
+// precondition — a context key this build does not define evaluates to false for
+// ever, which would leave a permanently greyed-out entry.
+check('the editor context menu offers Add to Chat through one action',
+  calls.editorActions.length === 1
+  && calls.editorActions[0].id === 'code-workbench.addToChat'
+  && calls.editorActions[0].label === '添加到对话'
+  && calls.editorActions[0].keybinding === undefined
+  && calls.editorActions[0].precondition === undefined
+  && calls.editorActions[0].contextMenuGroupId === '9_cutcopypaste'
+  && typeof calls.editorActions[0].run === 'function',
+  calls.editorActions)
 check('inline editing is absent from the interface and shortcut catalog',
   !allText().includes('改写') && !registered.shortcuts.some((row) => row.id === 'code-workbench.rewrite'))
 
@@ -476,8 +502,22 @@ check('folders share the hover frame and keyboard focus styling',
 const css = fs.readFileSync(new URL('../dsh-code-workbench/src/workbench.css', import.meta.url), 'utf8')
 check('hover uses theme background and an inset frame without layout shifts',
   /\.code-workbench-tree-row:hover\s*\{[^}]*background:\s*var\(--dsw-alias-interactive-bg-hover\);[^}]*box-shadow:\s*inset 0 0 0 1px var\(--dsw-alias-border-l2\);/s.test(css))
-check('active row has a separate brand-colored frame',
-  /\.code-workbench-tree-row\[data-active="true"\]\s*\{[^}]*box-shadow:\s*inset 0 0 0 1px var\(--dsw-alias-brand-primary\);/s.test(css))
+// The tree marks exactly one thing: the selection — the row the toolbar, the
+// context menu and the drag all act on.
+//
+// The file you have open is deliberately not marked. It used to be, and every
+// marker tried for it failed the same way. One click opens a file *and* selects
+// it, so that row wears both states at once, and whatever the open file paints
+// reads as part of the selection: two boxes drawn identically looked like a
+// selection that would not clear, and a rail on top of the selection's box was a
+// second marker on a row that had already been marked. Which file is open is
+// answered by the tab strip, where exactly one tab is active; the tree does not
+// answer it again. Hover stays — that is the pointer's own transient feedback,
+// and it is not attached to any state.
+check('the tree marks nothing at all for the file you have open',
+  !/\[data-active="true"\]/.test(css))
+check('the selection is what it marks, filled and framed',
+  /\.code-workbench-tree-row\[data-selected="true"\]\s*\{[^}]*background:\s*var\(--dsw-alias-interactive-bg-hover\);[^}]*box-shadow:\s*inset 0 0 0 1px var\(--dsw-alias-border-l2\);/s.test(css))
 await act(async () => {
   fileRow.props.onClick()
 })
@@ -487,7 +527,9 @@ check('the editor model carries the content and language',
   calls.models.at(-1)?.language === 'javascript' && calls.models.at(-1)?.text.includes('needle'), calls.models.at(-1))
 check('status reports the open file', allText().includes('2 行'), allText().slice(-60))
 const activeTreeRows = findAll(tree(), (n) => n.props.className === 'code-workbench-tree-row' && n.props['data-active'] === true)
-check('opening a file marks only its tree row active',
+// A data hook, not a style: the panel knows which row is the open one, and says
+// so on the element — but the stylesheet above deliberately draws nothing for it.
+check('opening a file marks exactly one tree row as the open one',
   activeTreeRows.length === 1 && activeTreeRows[0].props.title === 'C:\\repo\\a.js',
   activeTreeRows.map((n) => ({ title: n.props.title, active: n.props['data-active'] })))
 
@@ -663,7 +705,21 @@ const submitName = async (name) => {
   await act(async () => {})
 }
 await contextMenuFor('C:\\repo\\b.js')
-check('removed context actions are absent', !allText().includes('打开工作区终端') && !allText().includes('在文件夹中查找'))
+// One of the two came back. The terminal entry now has somewhere to go — the
+// navigation controller's `openTab` — so it is no longer a dead row; the
+// find-in-folder entry is still absent.
+check('removed context actions are absent', !allText().includes('在文件夹中查找'))
+const terminalOpensBefore = calls.terminalOpens.length
+await menuAction('打开工作区终端')
+// The kind is the terminal package's, and the *package* name
+// (`dsh-client-ui-sidebar-terminal`) is the wrong string: passing it throws and
+// opens nothing, which is exactly the mistake this pins.
+check('the terminal entry asks for the terminal kind, not the package name',
+  calls.terminalOpens.length === terminalOpensBefore + 1
+  && calls.terminalOpens.at(-1).kind === 'terminal', calls.terminalOpens)
+check('and reports the terminal instead of staying silent',
+  allText().includes('已在右侧打开终端'), allText().slice(-120))
+await contextMenuFor('C:\\repo\\b.js')
 await menuAction('新建文件…')
 // The field lives in the tree, so the files around it stay visible. It must
 // NOT be a modal — that is the whole point of editing in place.
@@ -885,6 +941,19 @@ check('the chip is a compact label, not the code',
 check('the chip carries the code in its private ref payload',
   insert?.payload.reference.ref.code.includes('const needle = 1'), insert?.payload.reference.ref)
 check('the chip insertion used a captured draft span', insert?.payload.span?.draftRev === 1, insert?.payload.span)
+// The menu entry is a second door onto the same action, not a second feature, so
+// invoking it has to produce the identical chip — including its label.
+const bailsBeforeMenu = calls.bailed.length
+await act(async () => {
+  calls.editorActions[0].run()
+})
+await act(async () => {})
+const fromMenu = calls.bailed.at(-1)
+check('the editor context-menu action inserts the same chip as the Ctrl+L path',
+  calls.bailed.length === bailsBeforeMenu + 1
+  && fromMenu?.event === 'slash/input-insert-reference'
+  && fromMenu.payload.reference.label === insert.payload.reference.label,
+  calls.bailed.slice(-2))
 const codec = registered.sources.find((source) => source.name === 'code-workbench')?.codec
 const expanded = await codec?.serialize(insert?.payload.reference.ref)
 check('submit-time codec expands the chip to the anchored fenced code',
@@ -1575,6 +1644,18 @@ check('the panel did not claim to have opened anything',
 check('and it names the panel that can show the file',
   allText().includes('读取失败') && allText().includes('此类文件需在右栏「文档预览」中打开'), allText().slice(0, 200))
 
+// The terminal entry degrades for the same reason and in the same way: a
+// controller without `openTab` must produce a failure the user can read, not a
+// status line claiming a terminal that was never asked for.
+await contextMenuFor('C:\\repo\\a.js')
+const opensBeforeGuard = calls.terminalOpens.length
+await menuAction('打开工作区终端')
+check('a controller without openTab reports a failure instead of a terminal',
+  calls.terminalOpens.length === opensBeforeGuard
+  && allText().includes('操作失败')
+  && !allText().includes('已在右侧打开终端'),
+  allText().slice(-200))
+
 console.log('\nclicking blank space clears the selection')
 // A fresh mount against a known listing: the blocks above re-pointed the tree at
 // a spreadsheet and mounted with a sidebar that throws.
@@ -1595,6 +1676,25 @@ const treeRoot = () => findAll(tree(), (n) => n.props?.className === 'code-workb
 const selectedRowCount = () => findAll(tree(), (n) => n.props?.['data-selected'] === true).length
 
 check('the tree exposes the container a blank click lands on', treeRoot() !== undefined)
+
+// A renderer cannot measure, so the layout contract that makes that handler
+// reachable is pinned instead of the geometry. It is not decoration: 0.5.1 put
+// the handler on a content-height box and left the scroller with the caller, so
+// every click under the last row landed outside the tree and the selection could
+// not clear — and nothing here could tell, because every assertion called the
+// handler directly. The box with the handler fills; the row list inside it
+// scrolls; the column above keeps no scroll box of its own.
+const treeStyle = treeRoot().props.style
+check('the tree box fills the column it sits in',
+  treeStyle.flex === '1 1 auto' && treeStyle.minHeight === 0, JSON.stringify(treeStyle))
+const treeBodyRowList = treeBody()
+check('and the row list inside it is the box that scrolls',
+  treeBodyRowList?.props?.style?.flex === '1 1 auto' && treeBodyRowList?.props?.style?.overflow === 'auto',
+  JSON.stringify(treeBodyRowList?.props?.style))
+const treeColumn = findAll(tree(), (n) => n.props?.className === 'code-workbench-tree-column')[0]
+check('and the column it sits in keeps no scroll box of its own',
+  treeColumn !== undefined && treeColumn.props.style?.overflow !== 'auto' && treeColumn.props.style?.display === 'flex',
+  JSON.stringify(treeColumn?.props?.style))
 check('a fresh tree has nothing selected', selectedRowCount() === 0)
 check('and the toolbar offers to create in the workspace root',
   toolbarButton('新建文件').props.title === '新建文件', toolbarButton('新建文件').props.title)

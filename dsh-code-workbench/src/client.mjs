@@ -160,6 +160,33 @@ function openInDocumentPreview(sidebarRight, sessionId, cwd, path) {
   }
 }
 
+/**
+ * Open the official terminal in the right panel.
+ *
+ * `openTab` is the navigation controller's own entry point and it expands the
+ * panel by itself; `ctx.layout.openRightbar` only reports geometry and would
+ * leave the panel closed. The kind is `'terminal'` — the *package* is
+ * `dsh-client-ui-sidebar-terminal`, and that is not the string to pass here. An
+ * unregistered kind throws, hence the try/catch and the boolean answer.
+ *
+ * What opens is the official terminal tab: its shell, its working directory (the
+ * session workspace) and its PTY all belong to that package. So this opens a
+ * terminal and deliberately does not run anything — a command for the clicked
+ * row would need the terminal's undocumented client service.
+ *
+ * @param sidebarRight - the right-sidebar navigation controller, or undefined.
+ * @returns true when the panel was asked for a terminal.
+ */
+function openWorkspaceTerminal(sidebarRight) {
+  if (typeof sidebarRight?.openTab !== 'function') return false
+  try {
+    sidebarRight.openTab('terminal')
+    return true
+  } catch {
+    return false
+  }
+}
+
 /** The drag payload for one tree row. */
 function treeDragPayload(path, cwd, isDir) {
   return `${isDir ? 'd' : 'f'}${relativeToCwd(path, cwd) || '.'}`
@@ -982,6 +1009,12 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
     ['createFile', '新建文件…'], ['createDirectory', '新建文件夹…'],
     ['reveal', '在资源管理器中显示'],
     ['addToChat', menu.isDir ? '添加目录到对话' : '添加文件到对话'],
+    // The terminal entry is back, and this time it can actually open one: the
+    // navigation controller exposes `openTab` and the terminal package registers
+    // the kind it takes. It says *workspace* because that is where the official
+    // terminal starts — the row under the pointer does not choose its directory,
+    // so the label must not promise one.
+    ['openTerminal', '打开工作区终端'],
     ['cut', '剪切'], ['copy', '复制'], ['paste', '粘贴'],
     ['copyPath', '复制路径'], ['copyRelativePath', '复制相对路径'],
     ['rename', '重命名…'], ['delete', '删除…'],
@@ -1038,7 +1071,12 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
   }
   return h('div', {
     className: 'code-workbench-tree',
-    style: { overflow: 'auto', padding: '4px 0' },
+    // This box has to be the one that fills the column. The click handler below
+    // is what "clicking empty space" means, and an empty space outside this
+    // element never reaches it — a content-height tree left every click under
+    // the last row on the caller's wrapper, which listens to nothing. The
+    // scrolling belongs to the row list inside, not to this box: see there.
+    style: { display: 'flex', flexDirection: 'column', flex: '1 1 auto', minHeight: 0, overflow: 'hidden', padding: '4px 0' },
     onClick: clearSelection,
     onContextMenu: (event) => contextMenu(event, cwd, true),
   },
@@ -1068,6 +1106,13 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
       className: 'code-workbench-tree-body',
       role: 'tree',
       tabIndex: -1,
+      // The row list fills what is left of the tree and scrolls it, so the empty
+      // space under the last row is part of this element — which is what a blank
+      // click lands on, and the reason the tree's click handler sees it at all.
+      // It is also the box `scrollerRef` measures: a ref on an element that never
+      // overflows reads a scroll offset of zero forever, which quietly turned the
+      // "a refresh must not jump you to the top" restore into a no-op.
+      style: { flex: '1 1 auto', minHeight: 0, overflow: 'auto' },
       ref: scrollerRef,
       onKeyDown: handleTreeKeys,
       onMouseEnter: () => setPointerInTree(true),
@@ -1270,6 +1315,26 @@ function CodePanel(props) {
     // latest closures through refs.
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => { saveRef.current?.() })
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyL, () => { addToChatRef.current?.() })
+    // The same action, in the editor's own context menu. Ctrl+L was the only way
+    // to reach Add to Chat, and a right-click on a selection is where people look
+    // for it first — the floating pill that would have answered this was dropped,
+    // so the menu entry is the affordance instead.
+    //
+    // Two omissions are deliberate. No `keybinding`: Ctrl+L is registered once
+    // above, and a second registration of the same chord is a silent duplicate
+    // (the smoke suite also pins the editor's command list to exactly those two
+    // chords). No `precondition`: a context key this build does not define
+    // evaluates to false for ever, which would leave a permanently greyed-out
+    // entry that reads as a broken feature — and with no selection `addToChat`
+    // explains itself in the status line, which is more use than a dead row.
+    // `contextMenuGroupId` is Monaco's cut/copy/paste group, ordered after Paste.
+    editor.addAction({
+      id: 'code-workbench.addToChat',
+      label: '添加到对话',
+      contextMenuGroupId: '9_cutcopypaste',
+      contextMenuOrder: 100,
+      run: () => addToChatRef.current?.(),
+    })
     const selectionListener = editor.onDidChangeCursorSelection(() => {
       setHasSelection(!editor.getSelection().isEmpty())
     })
@@ -1819,6 +1884,13 @@ function CodePanel(props) {
         const relative = path.slice(cwd.length).replace(/^[\\/]+/, '') || '.'
         const reference = { source: 'code-workbench', ref: { path: relative, directory: target.isDir, pathOnly: true }, label: relative, appearance: 'file', clipboardText: referenceMention(relative, target.isDir === true) }
         if (scope.bail(scope, 'slash/input-insert-reference', { reference, span: inputActions.captureInsertion() }) !== true) throw new Error('对话输入框正忙')
+      } else if (action === 'openTerminal') {
+        if (!openWorkspaceTerminal(sidebarRight)) throw new Error('无法打开终端：宿主未提供终端面板')
+        // Early return like the clipboard branch: the tail of this function
+        // reports a generic 「操作完成」, which would overwrite the one message
+        // that says where the terminal went.
+        setStatus('已在右侧打开终端')
+        return
       } else if (action === 'move') {
         // Drag-to-move. Each source is a rename into the dropped folder, so it
         // reuses the rename path the host already guards; doing them one at a
@@ -2274,7 +2346,12 @@ function CodePanel(props) {
           ? searchPanel
           : leftMode === 'history'
             ? historyPanel
-            : h('div', { style: { flex: '1 1 auto', minHeight: 0, overflow: 'auto' } },
+            // Hands its whole height to the tree and keeps no scroll box of its
+            // own. Whoever holds the scroller holds the empty space under the
+            // last row, and that space is the one a blank click lands on — a
+            // scroller here puts it outside the tree's own element, where the
+            // tree's click handler cannot see it.
+            : h('div', { className: 'code-workbench-tree-column', style: { display: 'flex', flexDirection: 'column', flex: '1 1 auto', minHeight: 0 } },
               cwd
                 ? h(FileTree, { list, cwd, activePath, onOpen: openFile, joinPath, onAction: treeAction, refreshRevision: treeRevision, clipboard: treeClipboard, closeMenuSignal: tabMenu?.path ?? null, onMenuOpen: () => setTabMenu(null) })
                 : h('div', { style: { padding: '12px', color: T.fgMuted, fontSize: '12px' } }, '会话没有工作区目录')),
