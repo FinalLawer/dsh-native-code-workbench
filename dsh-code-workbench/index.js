@@ -85,6 +85,21 @@ function journalEntryChars(entry) {
 }
 
 /**
+ * Count the lines in one text without materialising the split.
+ *
+ * `text.split('\n').length` builds an array holding every line — against the
+ * 8 MiB the write route admits, that is a transient array of hundreds of
+ * thousands of strings allocated for one integer.
+ * @param text - the saved text.
+ * @returns the number of lines.
+ */
+function countLines(text) {
+  let lines = 1
+  for (let index = 0; index < text.length; index += 1) if (text.charCodeAt(index) === 10) lines += 1
+  return lines
+}
+
+/**
  * Drop the oldest entry of the least recently written file. The map iterates in
  * write order, so its first key is the coldest file, and re-inserting a key on
  * every write is what keeps that ordering meaningful.
@@ -118,7 +133,7 @@ function journalWrite(sessionId, path, note, outcome, text) {
     version: outcome.version,
     before,
     beforeTruncated: before !== null && String(outcome.before).length > JOURNAL_CAPS.sideChars,
-    lines: text.split('\n').length,
+    lines: countLines(text),
   }
   entries.unshift(entry)
   journalChars += journalEntryChars(entry)
@@ -251,6 +266,40 @@ function fileFailure(error) {
 }
 
 /**
+ * The preamble every JSON POST route shares: admit the request, then read its
+ * body.
+ *
+ * Returns exactly one of the two, so a caller cannot skip the admission check or
+ * forget the malformed-body answer. Both were copied into every handler, which
+ * is how a route drifts into answering a different body for the same event.
+ * @param scope - injected Host services.
+ * @param request - the buffered Fetch request the Connection dispatched.
+ * @returns `{response}` to answer with, or `{body}` to carry on with.
+ */
+async function admittedJson(scope, request) {
+  const admission = scope.connection.admit(request)
+  if ('rejection' in admission) return { response: json(admission.rejection, { ok: false, error: { code: 'UNAUTHORIZED' } }) }
+  try {
+    return { body: await request.json() }
+  } catch {
+    return { response: json(400, { ok: false, error: { code: 'BAD_REQUEST', message: 'body must be JSON' } }) }
+  }
+}
+
+/**
+ * The preamble of a POST route that reads no body of interest: admission only.
+ * @param scope - injected Host services.
+ * @param request - the buffered Fetch request the Connection dispatched.
+ * @returns the refusal response, or null when the caller should continue.
+ */
+function admittedOnly(scope, request) {
+  const admission = scope.connection.admit(request)
+  return 'rejection' in admission
+    ? json(admission.rejection, { ok: false, error: { code: 'UNAUTHORIZED' } })
+    : null
+}
+
+/**
  * Handle one write request.
  * @param scope - injected Host services (`connection`, `fs`, `sessions`).
  * @param request - the buffered Fetch request the Connection dispatched.
@@ -259,16 +308,10 @@ function fileFailure(error) {
 async function handleWrite(scope, request) {
   // Defense in depth: the shared /api channel already admitted the request, but
   // a mutation endpoint re-checks rather than assumes.
-  const admission = scope.connection.admit(request)
-  if ('rejection' in admission) return json(admission.rejection, { ok: false, error: { code: 'UNAUTHORIZED' } })
-
-  let body
-  try {
-    body = await request.json()
-  } catch {
-    return json(400, { ok: false, error: { code: 'BAD_REQUEST', message: 'body must be JSON' } })
-  }
-  const { sessionId, path, text, expectedVersion } = body ?? {}
+  const admitted = await admittedJson(scope, request)
+  if (admitted.response !== undefined) return admitted.response
+  const body = admitted.body ?? {}
+  const { sessionId, path, text, expectedVersion } = body
   if (typeof sessionId !== 'string' || sessionId === '') return json(400, { ok: false, error: { code: 'BAD_REQUEST', message: 'sessionId is required' } })
   if (typeof path !== 'string' || path === '') return json(400, { ok: false, error: { code: 'BAD_REQUEST', message: 'path is required' } })
   if (typeof text !== 'string') return json(400, { ok: false, error: { code: 'BAD_REQUEST', message: 'text is required' } })
@@ -280,6 +323,21 @@ async function handleWrite(scope, request) {
   const workspaceRoot = header?.cwd ?? scope.get('sandboxPolicy')?.workspaceRoot
   if (typeof workspaceRoot !== 'string' || workspaceRoot === '') {
     return json(404, { ok: false, error: { code: 'UNKNOWN_SESSION', message: 'session has no workspace root' } })
+  }
+
+  // The session's standing policy, resolved once and reused below.
+  //
+  // The name-level route refuses a read-only session up front; this one relied
+  // entirely on `writeText` honouring the policy it is handed, which left the
+  // plain mutation endpoint weaker than the file-operation one. The gate applies
+  // only when a policy actually resolves — a Host without the sandbox service
+  // keeps its previous behaviour instead of losing every save.
+  const sandboxPolicy = scope.get('sandboxPolicy')?.resolve({ session })
+  if (sandboxPolicy !== undefined && !['workspace-write', 'danger-full-access'].includes(sandboxPolicy.mode)) {
+    return json(403, {
+      ok: false,
+      error: { code: 'FS_SANDBOX_DENIED', message: '当前会话为只读，无法保存文件；请在对话区将文件权限切换为允许工作区写入后重试' },
+    })
   }
 
   try {
@@ -301,11 +359,9 @@ async function handleWrite(scope, request) {
     }
 
     // The sandbox fence. `dsh-tool-fs` stamps every mutation with the session's
-    // standing policy (`sandboxPolicy.resolve({ session })` — mode plus the
-    // session cwd as workspace root); without it `ctx.fs.writeText` falls back
-    // to the deployment policy and denies with FS_SANDBOX_DENIED.
-    const sandboxPolicy = scope.get('sandboxPolicy')?.resolve({ session })
-
+    // standing policy (resolved above — mode plus the session cwd as workspace
+    // root); without it `ctx.fs.writeText` falls back to the deployment policy
+    // and denies with FS_SANDBOX_DENIED.
     const outcome = await scope.fs.writeText(target, text, intent, undefined, sandboxPolicy)
 
     // Traceability: the session record shows the edit even though the agent did
@@ -315,7 +371,7 @@ async function handleWrite(scope, request) {
     try {
       scope.get('sessionFeedback')?.record({
         sessionId,
-        text: `[code-workbench] 手动保存 ${path}（${outcome.operation}，${text.split('\n').length} 行）${note === '' ? '' : ` — ${note}`}`,
+        text: `[code-workbench] 手动保存 ${path}（${outcome.operation}，${countLines(text)} 行）${note === '' ? '' : ` — ${note}`}`,
       })
     } catch { /* remark is best-effort */ }
 
@@ -392,16 +448,10 @@ function silentCompletion(scope, reason, context, error) {
  * @returns the completion text, or a JSON rejection.
  */
 async function handleComplete(scope, request, config, settings) {
-  const admission = scope.connection.admit(request)
-  if ('rejection' in admission) return json(admission.rejection, { ok: false, error: { code: 'UNAUTHORIZED' } })
-
-  let body
-  try {
-    body = await request.json()
-  } catch {
-    return json(400, { ok: false, error: { code: 'BAD_REQUEST', message: 'body must be JSON' } })
-  }
-  const { sessionId, path, prefix, suffix } = body ?? {}
+  const admitted = await admittedJson(scope, request)
+  if (admitted.response !== undefined) return admitted.response
+  const body = admitted.body ?? {}
+  const { sessionId, path, prefix, suffix } = body
   if (typeof sessionId !== 'string' || sessionId === '') return json(400, { ok: false, error: { code: 'BAD_REQUEST', message: 'sessionId is required' } })
   if (typeof path !== 'string' || path === '') return json(400, { ok: false, error: { code: 'BAD_REQUEST', message: 'path is required' } })
   if (typeof prefix !== 'string' || prefix.trim() === '') return json(400, { ok: false, error: { code: 'BAD_REQUEST', message: 'prefix is required' } })
@@ -517,8 +567,8 @@ async function completionStatus(scope, preference) {
  * @returns the status payload as JSON.
  */
 async function handleCompletionStatus(scope, request, config, settings) {
-  const admission = scope.connection.admit(request)
-  if ('rejection' in admission) return json(admission.rejection, { ok: false, error: { code: 'UNAUTHORIZED' } })
+  const refusal = admittedOnly(scope, request)
+  if (refusal !== null) return refusal
   const liveSettings = settings?.describe?.({ redactSecrets: false })
     ?.find((entry) => entry.ns === 'code-workbench')?.value
   const preference = (field) => liveSettings?.[field] ?? config?.[field]?.get?.() ?? config?.[field]
@@ -608,8 +658,13 @@ function buildMatcher(query, regex, caseSensitive) {
 async function collectFiles(scope, rootTarget, signal) {
   const files = []
   const queue = [{ target: rootTarget, depth: 0 }]
-  while (queue.length > 0 && files.length < SEARCH_CAPS.files) {
-    const { target, depth } = queue.shift()
+  // An index cursor rather than `queue.shift()`: draining a queue by repeated
+  // shift is O(n) per removal, which across a 4000-directory walk is real cost
+  // for nothing. Entries are never removed, so the cursor is all that is needed.
+  let cursor = 0
+  while (cursor < queue.length && files.length < SEARCH_CAPS.files) {
+    const { target, depth } = queue[cursor]
+    cursor += 1
     let entries
     try {
       entries = await scope.fs.listDir(target, signal)
@@ -709,16 +764,10 @@ async function searchWorkspace(scope, workspaceRoot, params, signal) {
  * @returns the JSON match report.
  */
 async function handleSearch(scope, request) {
-  const admission = scope.connection.admit(request)
-  if ('rejection' in admission) return json(admission.rejection, { ok: false, error: { code: 'UNAUTHORIZED' } })
-
-  let body
-  try {
-    body = await request.json()
-  } catch {
-    return json(400, { ok: false, error: { code: 'BAD_REQUEST', message: 'body must be JSON' } })
-  }
-  const { sessionId, query, regex, caseSensitive, maxMatches } = body ?? {}
+  const admitted = await admittedJson(scope, request)
+  if (admitted.response !== undefined) return admitted.response
+  const body = admitted.body ?? {}
+  const { sessionId, query, regex, caseSensitive, maxMatches } = body
   if (typeof sessionId !== 'string' || sessionId === '') return json(400, { ok: false, error: { code: 'BAD_REQUEST', message: 'sessionId is required' } })
   if (typeof query !== 'string' || query.trim() === '') return json(400, { ok: false, error: { code: 'BAD_REQUEST', message: 'query is required' } })
   if (query.length > SEARCH_CAPS.queryChars) return json(413, { ok: false, error: { code: 'TOO_LARGE', message: `query exceeds ${SEARCH_CAPS.queryChars} chars` } })
@@ -745,7 +794,7 @@ async function handleSearch(scope, request) {
     if (typeof body.directory === 'string' && body.directory !== '') {
       const root = await scope.fs.resolve(workspaceRoot)
       const directory = await scope.fs.resolve(body.directory, { cwd: workspaceRoot })
-      if (!scope.fs.contains(root, directory)) return json(403, { ok: false, error: { message: '搜索目录必须位于工作区内' } })
+      if (!scope.fs.contains(root, directory)) return json(403, { ok: false, error: { code: 'OUTSIDE_WORKSPACE', message: '搜索目录必须位于工作区内' } })
       searchRoot = directory.displayPath
     }
     const report = await searchWorkspace(scope, searchRoot, { query, regex, caseSensitive, limit }, request.signal)
@@ -860,16 +909,10 @@ function codebaseSearchTool(scope) {
  * @returns the JSON entry list (no file contents).
  */
 async function handleHistory(scope, request) {
-  const admission = scope.connection.admit(request)
-  if ('rejection' in admission) return json(admission.rejection, { ok: false, error: { code: 'UNAUTHORIZED' } })
-
-  let body
-  try {
-    body = await request.json()
-  } catch {
-    return json(400, { ok: false, error: { code: 'BAD_REQUEST', message: 'body must be JSON' } })
-  }
-  const { sessionId, path } = body ?? {}
+  const admitted = await admittedJson(scope, request)
+  if (admitted.response !== undefined) return admitted.response
+  const body = admitted.body ?? {}
+  const { sessionId, path } = body
   if (typeof sessionId !== 'string' || sessionId === '') return json(400, { ok: false, error: { code: 'BAD_REQUEST', message: 'sessionId is required' } })
   if (typeof path !== 'string' || path === '') return json(400, { ok: false, error: { code: 'BAD_REQUEST', message: 'path is required' } })
 
@@ -895,16 +938,10 @@ async function handleHistory(scope, request) {
  * @returns the JSON outcome.
  */
 async function handleRollback(scope, request) {
-  const admission = scope.connection.admit(request)
-  if ('rejection' in admission) return json(admission.rejection, { ok: false, error: { code: 'UNAUTHORIZED' } })
-
-  let body
-  try {
-    body = await request.json()
-  } catch {
-    return json(400, { ok: false, error: { code: 'BAD_REQUEST', message: 'body must be JSON' } })
-  }
-  const { sessionId, path, id } = body ?? {}
+  const admitted = await admittedJson(scope, request)
+  if (admitted.response !== undefined) return admitted.response
+  const body = admitted.body ?? {}
+  const { sessionId, path, id } = body
   if (typeof sessionId !== 'string' || sessionId === '') return json(400, { ok: false, error: { code: 'BAD_REQUEST', message: 'sessionId is required' } })
   if (typeof path !== 'string' || path === '') return json(400, { ok: false, error: { code: 'BAD_REQUEST', message: 'path is required' } })
   if (typeof id !== 'string' || id === '') return json(400, { ok: false, error: { code: 'BAD_REQUEST', message: 'id is required' } })
@@ -972,8 +1009,8 @@ async function handleRollback(scope, request) {
  * @returns the JSON outcome.
  */
 async function handleFileOperation(scope, request) {
-  const admission = scope.connection.admit(request)
-  if ('rejection' in admission) return json(admission.rejection, { ok: false })
+  const refusal = admittedOnly(scope, request)
+  if (refusal !== null) return refusal
   try {
     const body = await request.json()
     if (!['createFile', 'createDirectory', 'rename', 'copy', 'delete'].includes(body?.operation)
@@ -1313,8 +1350,8 @@ async function replaceFile(name, bytes) {
  * @returns the JSON outcome.
  */
 async function handleUpdateCheck(scope, request) {
-  const admission = scope.connection.admit(request)
-  if ('rejection' in admission) return json(admission.rejection, { ok: false })
+  const refusal = admittedOnly(scope, request)
+  if (refusal !== null) return refusal
   try {
     const current = await installedVersion()
     const release = await cachedRelease(request.signal)
@@ -1348,8 +1385,8 @@ async function handleUpdateCheck(scope, request) {
  * @returns the JSON outcome.
  */
 async function handleAbout(scope, request) {
-  const admission = scope.connection.admit(request)
-  if ('rejection' in admission) return json(admission.rejection, { ok: false })
+  const refusal = admittedOnly(scope, request)
+  if (refusal !== null) return refusal
   try {
     return json(200, { ok: true, version: await installedVersion(), repository: `https://github.com/${UPDATE_REPOSITORY}` })
   } catch (error) {
@@ -1373,8 +1410,8 @@ async function handleAbout(scope, request) {
  * already loaded was among those replaced.
  */
 async function handleUpdateApply(scope, request) {
-  const admission = scope.connection.admit(request)
-  if ('rejection' in admission) return json(admission.rejection, { ok: false })
+  const refusal = admittedOnly(scope, request)
+  if (refusal !== null) return refusal
   try {
     const current = await installedVersion()
     const release = await newestRelease(request.signal)

@@ -1391,6 +1391,27 @@ await act(async () => { rowNodeFor('C:\\repo\\b.js').props.onClick({ ctrlKey: tr
 await act(async () => {})
 check('Ctrl-clicking a selected row removes it again',
   selectedTitles().length === 1 && selectedTitles().includes('C:\\repo\\a.js'), selectedTitles())
+// The primary row lives in `selected`, not in the extras set, so the same
+// gesture has to be answered there too. Testing only the extras made
+// Ctrl-clicking the primary *add* it a second time: it could not be removed, and
+// `selectionRows` then handed the same path to Delete and to drag twice.
+await act(async () => { rowNodeFor('C:\\repo\\a.js').props.onClick({}) })
+await act(async () => { rowNodeFor('C:\\repo\\sub').props.onClick({ ctrlKey: true }) })
+await act(async () => {})
+await act(async () => { rowNodeFor('C:\\repo\\a.js').props.onClick({ ctrlKey: true }) })
+await act(async () => {})
+check('Ctrl-clicking the primary row removes it and promotes the remaining row',
+  selectedTitles().length === 1 && selectedTitles().includes('C:\\repo\\sub'), selectedTitles())
+await act(async () => { rowNodeFor('C:\\repo\\sub').props.onClick({ ctrlKey: true }) })
+await act(async () => {})
+check('removing the last selected row leaves nothing selected',
+  selectedTitles().length === 0, selectedTitles())
+// With nothing selected there is nothing to add to, so a modifier-click has to
+// start the selection rather than leaving the row unselected.
+await act(async () => { rowNodeFor('C:\\repo\\b.js').props.onClick({ ctrlKey: true }) })
+await act(async () => {})
+check('a modifier-click with nothing selected starts the selection',
+  selectedTitles().length === 1 && selectedTitles().includes('C:\\repo\\b.js'), selectedTitles())
 // Shift-click takes the visual range between the anchor and the clicked row.
 await act(async () => { rowNodeFor('C:\\repo\\a.js').props.onClick({}) })
 await act(async () => { rowNodeFor('C:\\repo\\sub').props.onClick({ shiftKey: true }) })

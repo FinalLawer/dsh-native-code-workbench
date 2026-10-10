@@ -93,10 +93,17 @@ const NON_TEXT_NO_PREVIEW_SUFFIX = '（此类文件需在右栏「文档预览�
  */
 const TREE_DRAG_MIME = 'application/x-code-workbench-tree'
 
-/** Workspace-relative path for an absolute tree path. */
+/**
+ * Workspace-relative path for an absolute tree path.
+ *
+ * Containment is decided by {@link isAtOrUnder}, not by a bare `startsWith`:
+ * a sibling that merely shares the root's text prefix — `/w/app` beside
+ * `/w/application/x.js` — would otherwise be relativised into `lication/x.js`,
+ * which then shows up in the breadcrumb, the search rows and the copied path.
+ */
 function relativeToCwd(path, cwd) {
   if (typeof path !== 'string' || path === '') return ''
-  return path.startsWith(cwd) ? path.slice(cwd.length).replace(/^[\\/]+/, '') : path
+  return isAtOrUnder(path, cwd) ? path.slice(cwd.length).replace(/^[\\/]+/, '') : path
 }
 
 /**
@@ -520,24 +527,38 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
 
   useEffect(() => { load(cwd) }, [cwd, load])
   /**
+   * The open-directory set, readable from an effect that must not re-run when it
+   * changes.
+   *
+   * `expanded` is a fresh Set on every toggle, so listing it as a dependency made
+   * the refresh below fire on every expand and collapse — re-reading *every* open
+   * directory each time, on top of the single fetch `toggle` had already issued
+   * for the folder being opened. Synced in its own effect, declared above the
+   * refresh, so it is current by the time that one runs.
+   */
+  const expandedRef = useRef(expanded)
+  useEffect(() => { expandedRef.current = expanded }, [expanded])
+  /**
    * Reload every open directory when the revision changes.
    *
    * `expanded` is deliberately *not* reset — a refresh must not collapse a tree
-   * the user opened. The scroller's offset is captured first and restored after
-   * the new rows paint, so a refresh that happens to finish while the user is
-   * scrolled down does not jump them back to the top.
+   * the user opened — and the reload is keyed on the revision alone: opening one
+   * folder is not a reason to re-read the others. The scroller's offset is
+   * captured first and restored after the new rows paint, so a refresh that
+   * happens to finish while the user is scrolled down does not jump them back to
+   * the top.
    */
   useEffect(() => {
     const scroller = scrollerRef.current
     const offset = scroller?.scrollTop ?? 0
-    for (const dir of expanded) load(dir)
+    for (const dir of expandedRef.current) load(dir)
     // Restore after paint, once the rebuilt list has its new height. Guarded
     // because `requestAnimationFrame` does not exist in a bare Node test host.
     const raf = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : (fn) => setTimeout(fn, 0)
     const cancel = typeof cancelAnimationFrame === 'function' ? cancelAnimationFrame : clearTimeout
     const frame = raf(() => { if (scroller) scroller.scrollTop = offset })
     return () => cancel(frame)
-  }, [refreshRevision, list, expanded, load])
+  }, [refreshRevision, list, load])
   useEffect(() => { setMenu(null) }, [closeMenuSignal])
   const contextMenu = (event, path, isDir) => {
     event.preventDefault()
@@ -566,7 +587,11 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
    */
   const selectionRows = () => {
     if (selected === null) return []
-    const extras = flat.filter((row) => extraSelection.has(selectedKey(row)))
+    // The primary row is filtered out of the extras on purpose: the two sets are
+    // maintained separately, so a row that is somehow in both would otherwise be
+    // handed to Delete/drag twice — one success and one 404.
+    const primaryKey = selectedKey(selected)
+    const extras = flat.filter((row) => selectedKey(row) !== primaryKey && extraSelection.has(selectedKey(row)))
     return [selected, ...extras]
   }
 
@@ -592,13 +617,39 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
       }
     }
     if (additive) {
+      const key = selectedKey(row)
+      // With nothing selected there is nothing to add to, so a modifier-click
+      // starts the selection exactly as a plain one would. Without this the row
+      // was left unselected (the extras set hangs off `selected`).
+      if (selected === null) {
+        setSelected(row)
+        setExtraSelection(new Set())
+        selectionAnchorRef.current = key
+        return
+      }
+      // The primary row lives in `selected`, not in `extraSelection`, so testing
+      // only the extras made Ctrl-clicking it *add* it a second time: it could
+      // not be deselected, and `selectionRows` then carried it twice, which made
+      // Delete and drag act on the same path twice. Removing the primary
+      // promotes one of the extras, so the primary is always a selected row.
+      if (key === selectedKey(selected)) {
+        const promoted = flat.find((item) => extraSelection.has(selectedKey(item))) ?? null
+        setSelected(promoted)
+        setExtraSelection((prev) => {
+          const next = new Set(prev)
+          if (promoted !== null) next.delete(selectedKey(promoted))
+          return next
+        })
+        selectionAnchorRef.current = promoted === null ? null : selectedKey(promoted)
+        return
+      }
       setExtraSelection((prev) => {
         const next = new Set(prev)
-        if (next.has(selectedKey(row))) next.delete(selectedKey(row))
-        else if (selected !== null) next.add(selectedKey(row))
+        if (next.has(key)) next.delete(key)
+        else next.add(key)
         return next
       })
-      selectionAnchorRef.current = selectedKey(row)
+      selectionAnchorRef.current = key
       return
     }
     // A plain click always collapses back to one row, which is what keeps the
@@ -734,7 +785,9 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
   const flat = []
   /** Row path → its live DOM node, so a selection can be focused and revealed. */
   const nodesRef = useRef(new Map())
-  nodesRef.current = new Map()
+  // Cleared, not reallocated: the commit's ref callbacks refill it in this same
+  // pass, so a fresh Map per render was pure garbage.
+  nodesRef.current.clear()
   const pushRow = (spec) => {
     flat.push(spec)
   }
@@ -915,7 +968,11 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
    * rows rebuild, which is what carries the selection from a directory into the
    * child it just expanded.
    */
-  const moveSelection = useCallback((step, extend) => {
+  // Deliberately not `useCallback`: `flat` is rebuilt on every render, so the
+  // memo could never hit — it only paid for a dependency array that was new each
+  // time. The handler is read straight from this render's scope, which is what it
+  // needs to be anyway (it must see the rows that are on screen right now).
+  const moveSelection = (step, extend) => {
     const current = selected === null ? -1 : flat.findIndex((row) => row.path === selected.path && row.isDir === selected.isDir)
     if (current < 0) {
       const edge = step > 0 ? flat[0] : flat.at(-1)
@@ -944,7 +1001,7 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
     // The row's keys are stable, so the node can be focused directly instead of
     // waiting for the re-render that `setSelected` schedules.
     focusRow(next.path)
-  }, [selected, flat])
+  }
   const handleTreeKeys = (event) => {
     // While the name field is open it owns every key — arrows move the caret,
     // Delete erases characters. `stopPropagation` in the field usually keeps
@@ -1002,11 +1059,15 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
       default:
     }
   }
-  // Keyboard navigation drives the selection, so the selection drives reveal.
+  // Keyboard navigation drives the selection, so the selection drives reveal —
+  // and nothing else does. A refresh or an expand is not a selection change, and
+  // keying on them pulled the caret out of the editor after every file operation
+  // (each one bumps `refreshRevision`), so a file created from the tree could not
+  // be typed into until the user clicked back in.
   useEffect(() => {
     if (selected === null) return
     focusRow(selected.path)
-  }, [selected?.path, selected?.isDir, refreshRevision, expanded])
+  }, [selected?.path, selected?.isDir])
   const items = menu ? [
     ['createFile', '新建文件…'], ['createDirectory', '新建文件夹…'],
     ['reveal', '在资源管理器中显示'],
@@ -1194,7 +1255,6 @@ function CodePanel(props) {
   const [editRevision, setEditRevision] = useState(0)
   const [treeRevision, setTreeRevision] = useState(0)
   const [treeClipboard, setTreeClipboard] = useState(null)
-  const [searchDirectory, setSearchDirectory] = useState(null)
   const [tabMenu, setTabMenu] = useState(null)
   /**
    * The tab strip's in-flight drag and where it would land.
@@ -1696,7 +1756,9 @@ function CodePanel(props) {
       const response = await fetch(SEARCH_PATH, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ sessionId, query: q, directory: searchDirectory }),
+        // No `directory`: the panel has no scope picker, so a search is always
+        // the whole workspace. The Host route still accepts one.
+        body: JSON.stringify({ sessionId, query: q }),
       })
       const body = await response.json().catch(() => ({}))
       if (!response.ok || body.ok === false) {
@@ -1708,7 +1770,7 @@ function CodePanel(props) {
     } finally {
       setSearching(false)
     }
-  }, [query, sessionId, searchDirectory])
+  }, [query, sessionId])
 
   // ---- save journal (checkpoints) --------------------------------------
   const loadHistory = useCallback(async () => {
@@ -1776,7 +1838,7 @@ function CodePanel(props) {
     }
     const code = model.getValueInRange(selection)
     const path = stateRef.current.path ?? '(未保存文件)'
-    const rel = path.startsWith(cwd) ? path.slice(cwd.length).replace(/^[\\/]+/, '') : path
+    const rel = relativeToCwd(path, cwd) || path
     const startLine = selection.startLineNumber
     const endLine = selection.endLineNumber
     const lines = endLine - startLine + 1
@@ -1873,7 +1935,7 @@ function CodePanel(props) {
     const directory = target.isDir ? path : parent
     try {
       if (action === 'copyPath' || action === 'copyRelativePath') {
-        await navigator.clipboard.writeText(action === 'copyPath' ? path : path.slice(cwd.length).replace(/^[\\/]+/, '') || '.')
+        await navigator.clipboard.writeText(action === 'copyPath' ? path : relativeToCwd(path, cwd) || '.')
       } else if (action === 'reveal') {
         await session.openWorkspacePath({ path, action: 'reveal' }, undefined)
       } else if (action === 'copy' || action === 'cut') {
@@ -1883,7 +1945,7 @@ function CodePanel(props) {
       } else if (action === 'addToChat') {
         const scope = sessionsScope?.(sessionId)
         if (!scope || !inputActions?.captureInsertion) throw new Error('对话输入框尚未就绪')
-        const relative = path.slice(cwd.length).replace(/^[\\/]+/, '') || '.'
+        const relative = relativeToCwd(path, cwd) || '.'
         const reference = { source: 'code-workbench', ref: { path: relative, directory: target.isDir, pathOnly: true }, label: relative, appearance: 'file', clipboardText: referenceMention(relative, target.isDir === true) }
         if (scope.bail(scope, 'slash/input-insert-reference', { reference, span: inputActions.captureInsertion() }) !== true) throw new Error('对话输入框正忙')
       } else if (action === 'openTerminal') {
@@ -1919,6 +1981,10 @@ function CodePanel(props) {
           for (const buffer of [...buffersRef.current.values()]) {
             if (!isAtOrUnder(buffer.path, move.from)) continue
             buffersRef.current.delete(buffer.path)
+            // Detach before disposing, exactly as the rename/delete paths do: the
+            // editor must not be left holding a disposed model between here and
+            // the `openFile` that re-opens the moved file below.
+            if (buffer === stateRef.current) editorRef.current?.setModel(null)
             buffer.model.dispose()
           }
           setOpenPaths((paths) => rewriteOpenPaths(paths, move.from, move.to))
@@ -2086,9 +2152,7 @@ function CodePanel(props) {
   }, [activePath, openFile, openPaths])
 
   const copyPath = useCallback(async (path, relative = false) => {
-    const value = relative && cwd
-      ? path.startsWith(cwd) ? path.slice(cwd.length).replace(/^[\\/]+/, '') : path
-      : path
+    const value = relative && cwd ? relativeToCwd(path, cwd) : path
     try {
       await globalThis.navigator?.clipboard?.writeText?.(value)
       setStatus(relative ? '已复制相对路径' : '已复制路径')
@@ -2139,7 +2203,7 @@ function CodePanel(props) {
   const searchRows = []
   if (result?.matches) {
     for (const [index, hit] of result.matches.entries()) {
-      const rel = hit.path.startsWith(cwd) ? hit.path.slice(cwd.length).replace(/^[\\/]+/, '') : hit.path
+      const rel = relativeToCwd(hit.path, cwd)
       searchRows.push(h('div', {
         key: `${hit.path}#${hit.line}#${index}`,
         style: { ...rowStyle(0), flexDirection: 'column', alignItems: 'flex-start', gap: '1px', padding: '4px 8px' },
@@ -2211,7 +2275,7 @@ function CodePanel(props) {
           : h('div', { style: { padding: '8px', color: T.fgMuted, fontSize: '11px' } }, '加载中…')),
   )
 
-  const relativePath = activePath?.startsWith(cwd) ? activePath.slice(cwd.length).replace(/^[\\/]+/, '') : activePath
+  const relativePath = typeof activePath === 'string' ? relativeToCwd(activePath, cwd) : activePath
   const showTabMenu = (event, path) => {
     event.preventDefault()
     event.stopPropagation()
