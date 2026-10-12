@@ -1,5 +1,5 @@
 /**
- * dsh-code-workbench — client half source (bundled by build.mjs into client.js).
+ * dsh-code-workbench — client half source (bundled by build.mts into client.js).
  *
  * A right-sidebar tab type ("code-workbench") that renders a VS Code-style code
  * workspace: recursive file tree + Monaco (the VS Code editor core) with full
@@ -10,7 +10,7 @@
  *  - the workspace root → standard `useSessions` prop (`byId[sessionId].cwd`)
  *  - writing            → the package's own host half, `POST /api/code-workbench/write`,
  *                         version-guarded via `ctx.fs.writeText` on the Host
- *                         (implemented in index.js; the only mutation path)
+ *                         (implemented in src/host/index.ts; the only mutation path)
  *  - non-text files     → the OFFICIAL document preview, through
  *                         `ctx.sidebarRight.openResource(fileAddressFor(…))`; this tab
  *                         type registers no `pattern`, so it never shadows that
@@ -18,22 +18,272 @@
  *
  * The bundle contract: exports { inject, apply, name }; `require` is limited to
  * the frozen browser module table (`react`). Monaco is inlined at build time.
+ *
+ * Types: the DSH client SDK declares `"types"` but ships no `.d.ts`, so the
+ * surface this file talks to is declared by hand in `types/dsh-client.d.ts`.
  */
 
 import React from 'react'
+import type * as Monaco from 'monaco-editor/editor/editor.api.js'
 import { fileAddressFor } from '@deepseek-ai/dsh-util-workspace-path'
 import './workbench.css'
 import { serializeSnippet, splitSnippets } from './snippets.mjs'
 import { COMPLETION_PREFIX_CHARS, COMPLETION_SUFFIX_CHARS } from './completion-window.mjs'
 
-const { useCallback, useEffect, useMemo, useRef, useState } = React
+const { useCallback, useEffect, useRef, useState } = React
 const h = React.createElement
 const SETTINGS_NS = 'code-workbench'
-const defaultSettings = { autoSave: false, completionEnabled: true, completionBaseUrl: 'https://api.deepseek.com/beta', completionApiModel: 'deepseek-flash' }
-function usePluginSettings(form) {
-  const [snapshot, setSnapshot] = useState(() => form?.getSnapshot?.() ?? { value: defaultSettings, writable: false })
+const defaultSettings: PluginSettings = { autoSave: false, completionEnabled: true, completionBaseUrl: 'https://api.deepseek.com/beta', completionApiModel: 'deepseek-flash' }
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/**
+ * The plugin's own settings.
+ *
+ * Every field is optional because this is what the settings form *resolves*:
+ * before the form has synced, and for a field the user never set, the value is
+ * simply absent and the caller falls back to {@link defaultSettings}.
+ */
+type PluginSettings = Partial<{
+  autoSave: boolean
+  completionEnabled: boolean
+  completionBaseUrl: string
+  completionApiModel: string
+}>
+
+/** The slim monaco entry, as the dynamic import resolves it. */
+type MonacoApi = typeof import('./monaco-entry.mjs')
+
+/** The editor instance `monaco.editor.create` hands back. */
+type Editor = Monaco.editor.IStandaloneCodeEditor
+
+/** The text model behind one open buffer. */
+type TextModel = Monaco.editor.ITextModel
+
+/** A saved scroll/selection snapshot, as `saveViewState` reports it. */
+type ViewState = Monaco.editor.ICodeEditorViewState
+
+/** The listener monaco attaches to the provider's change announcement. */
+type CompletionsChangedListener = (hint: Monaco.languages.IInlineCompletionChangeHint | void) => void
+
+/** One entry in a directory listing, as the read route reports it. */
+interface TreeEntry {
+  name: string
+  type: string
+}
+
+/** A row's identity in the tree: a path plus whether it is a directory. */
+interface TreeRow {
+  path: string
+  isDir: boolean
+}
+
+/**
+ * A row as it is on screen, in visual order.
+ *
+ * This is the data a movement key needs rather than a DOM node, and `walk`
+ * fills it in the same pass that builds the rendered rows, so the two can never
+ * disagree about what is visible.
+ */
+interface FlatRow extends TreeRow {
+  key: string
+  isOpen: boolean
+  depth: number
+  parent: string | null
+}
+
+/** What a directory's children resolve to, keyed by directory path. */
+type TreeChildren = Record<string, TreeEntry[] | string>
+
+/** The in-tree name field's mode and target. */
+type TreeEditor =
+  | { mode: 'createFile' | 'createDirectory'; parent: string }
+  | { mode: 'rename'; path: string; isDir: boolean }
+
+/** The row the toolbar's create actions target. */
+interface Selection {
+  path: string
+  isDir: boolean
+}
+
+/** The open context menu and where it sits. */
+interface TreeMenu extends Selection {
+  element: EventTarget | null
+  x: number
+  y: number
+}
+
+/** The in-flight tree drag. */
+interface TreeDrag {
+  path: string
+  isDir: boolean
+  sources: string[]
+}
+
+/** The file clipboard a copy/cut fills. */
+interface TreeClipboard extends Selection {
+  operation: 'copy' | 'cut'
+}
+
+/** Every action the tree can ask the host to perform. */
+type TreeAction =
+  | 'createFile' | 'createDirectory' | 'rename' | 'delete'
+  | 'copy' | 'cut' | 'paste' | 'move' | 'reveal'
+  | 'copyPath' | 'copyRelativePath' | 'addToChat' | 'openTerminal'
+
+/** What a tree action applies to. */
+interface TreeActionTarget {
+  path: string
+  isDir: boolean
+  /** The name typed into the in-tree field, for a create or rename. */
+  newName?: string
+  /** The paths a batch delete or drag-move acts on. */
+  sources?: string[]
+  /** Where a drag-move lands. */
+  destination?: string
+}
+
+/** What a tree action reports back; `undefined` means "handled elsewhere". */
+interface ActionResult {
+  ok: boolean
+  error?: string
+}
+
+/** Where a search hit should be revealed. */
+interface Reveal {
+  line: number
+  column?: number
+  length?: number
+}
+
+/** One search hit. */
+interface SearchMatch {
+  path: string
+  line: number
+  column: number
+  length: number
+  text: string
+}
+
+/** The search route's report. */
+interface SearchReport {
+  matches: SearchMatch[]
+  truncated?: boolean
+  filesScanned: number
+  elapsedMs: number
+}
+
+/** One save-journal entry. */
+interface HistoryEntry {
+  id: string
+  at: number
+  operation: string
+  note: string
+  lines: number
+  rollbackable: boolean
+}
+
+/** The history route's report. */
+interface HistoryReport {
+  entries: HistoryEntry[]
+}
+
+/** A published release, as the update check reports it. */
+interface Release {
+  latest: string
+  needsRestart: boolean
+}
+
+/** The modal the tree uses for destructive confirmations. */
+interface Dialog {
+  title: string
+  input: boolean
+}
+
+/** The reference a chat chip carries. */
+interface ChatReference {
+  source: 'code-workbench'
+  ref: {
+    path: string
+    directory?: boolean
+    pathOnly?: boolean
+    startLine?: number
+    endLine?: number
+    language?: string
+    code?: string
+  }
+  label: string
+  appearance: 'file'
+  clipboardText: string
+}
+
+/** One open file's buffer: its model, its disk version, and its dirty flag. */
+interface Buffer {
+  path: string
+  version: unknown
+  dirty: boolean
+  text: string
+  model: TextModel
+  saving?: boolean
+  viewState?: ViewState | null
+}
+
+/** The editor state before any file is open. */
+interface NoBuffer {
+  path: null
+  version: null
+  dirty: false
+  text: ''
+  model: null
+  saving?: boolean
+  viewState?: ViewState | null
+}
+
+/** What the editor holds: one open file, or the empty placeholder. */
+type EditorState = Buffer | NoBuffer
+
+/** The caret context one completion request carries. */
+interface CompletionRequest {
+  sessionId: string
+  path: string
+  language: string
+  prefix: string
+  suffix: string
+}
+
+/** The outcome of one in-flight completion. */
+interface CompletionAnswer {
+  ok: boolean
+  text: string
+}
+
+/** The props a `conversation.chat.node` occupant receives. */
+interface ChatNodeProps {
+  node?: { data?: { content?: unknown } }
+  [key: string]: unknown
+}
+
+/**
+ * A slot occupant's component, as the registry stores it.
+ *
+ * Not always a function: the official entries include `memo` / `forwardRef`
+ * wrappers, which are objects carrying `$$typeof`. The renderer accepts both,
+ * so this does too.
+ */
+type StoredComponent =
+  | React.ComponentType<Record<string, unknown>>
+  | { $$typeof: unknown }
+
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
+
+function usePluginSettings(form: DSH.ConfigFormController | undefined): DSH.ConfigFormSnapshot {
+  const [snapshot, setSnapshot] = useState<DSH.ConfigFormSnapshot>(() => form?.getSnapshot?.() ?? { value: defaultSettings, revision: 0, writable: false })
   useEffect(() => {
-    const refresh = () => setSnapshot(form?.getSnapshot?.() ?? { value: defaultSettings, writable: false })
+    const refresh = () => setSnapshot(form?.getSnapshot?.() ?? { value: defaultSettings, revision: 0, writable: false })
     refresh()
     return form?.subscribe?.(refresh)
   }, [form])
@@ -44,12 +294,22 @@ function usePluginSettings(form) {
 // module runtime and the contract harness, and the GUI only pays the parse cost
 // when the panel is first opened. The test override lets the render smoke suite
 // substitute a fake namespace without touching the production path.
-let monacoPromise = null
-const completionCache = new Map()
-function loadMonaco() {
+let monacoPromise: Promise<MonacoApi> | null = null
+const completionCache = new Map<string, string>()
+function loadMonaco(): Promise<MonacoApi> {
   if (monacoPromise === null) {
-    monacoPromise = globalThis.__CODE_WORKBENCH_TEST_MONACO__ !== undefined
-      ? Promise.resolve(globalThis.__CODE_WORKBENCH_TEST_MONACO__)
+    // Read through `globalThis`, never as a bare identifier.
+    //
+    // `__CODE_WORKBENCH_TEST_MONACO__` exists only inside the render smoke
+    // suite, which installs it on `globalThis` before evaluating this bundle.
+    // Declaring it as a bare global made a bare reference type-check — and then
+    // throw `ReferenceError` in a real page, where nothing defines it: the tab
+    // body crashed and the whole right panel went blank. A property access is
+    // `undefined` when absent, at compile time and at runtime alike, which is
+    // exactly the behaviour this needs.
+    const seam = (globalThis as { __CODE_WORKBENCH_TEST_MONACO__?: unknown }).__CODE_WORKBENCH_TEST_MONACO__
+    monacoPromise = seam !== undefined
+      ? Promise.resolve(seam as MonacoApi)
       : import('./monaco-entry.mjs')
   }
   return monacoPromise
@@ -101,7 +361,7 @@ const TREE_DRAG_MIME = 'application/x-code-workbench-tree'
  * `/w/application/x.js` — would otherwise be relativised into `lication/x.js`,
  * which then shows up in the breadcrumb, the search rows and the copied path.
  */
-function relativeToCwd(path, cwd) {
+function relativeToCwd(path: string, cwd: string): string {
   if (typeof path !== 'string' || path === '') return ''
   return isAtOrUnder(path, cwd) ? path.slice(cwd.length).replace(/^[\\/]+/, '') : path
 }
@@ -126,7 +386,7 @@ function relativeToCwd(path, cwd) {
  * @param directory - whether the path names a directory.
  * @returns the mention, or the bare path when the grammar cannot represent it.
  */
-function referenceMention(path, directory) {
+function referenceMention(path: string, directory: boolean): string {
   const raw = typeof path === 'string' ? path : ''
   const spelled = directory === true ? `${raw}/` : raw
   // Control characters and an embedded quote have no quoted spelling; a bare
@@ -157,7 +417,7 @@ function referenceMention(path, directory) {
  * @param path - the file to preview.
  * @returns true when the official preview took the file.
  */
-function openInDocumentPreview(sidebarRight, sessionId, cwd, path) {
+function openInDocumentPreview(sidebarRight: DSH.SidebarRight, sessionId: string, cwd: string, path: string): boolean {
   if (typeof sidebarRight?.openResource !== 'function') return false
   try {
     sidebarRight.openResource(fileAddressFor(sessionId, cwd, path))
@@ -184,7 +444,7 @@ function openInDocumentPreview(sidebarRight, sessionId, cwd, path) {
  * @param sidebarRight - the right-sidebar navigation controller, or undefined.
  * @returns true when the panel was asked for a terminal.
  */
-function openWorkspaceTerminal(sidebarRight) {
+function openWorkspaceTerminal(sidebarRight: DSH.SidebarRight): boolean {
   if (typeof sidebarRight?.openTab !== 'function') return false
   try {
     sidebarRight.openTab('terminal')
@@ -195,12 +455,12 @@ function openWorkspaceTerminal(sidebarRight) {
 }
 
 /** The drag payload for one tree row. */
-function treeDragPayload(path, cwd, isDir) {
+function treeDragPayload(path: string, cwd: string, isDir: boolean): string {
   return `${isDir ? 'd' : 'f'}${relativeToCwd(path, cwd) || '.'}`
 }
 
 /** Decode a {@link TREE_DRAG_MIME} payload back into a reference's `ref`. */
-function parseTreeDragPayload(raw) {
+function parseTreeDragPayload(raw: string): { path: string; directory: boolean } | null {
   if (typeof raw !== 'string' || raw.length < 2) return null
   const kind = raw[0]
   if (kind !== 'd' && kind !== 'f') return null
@@ -210,7 +470,7 @@ function parseTreeDragPayload(raw) {
 }
 
 /** Whether a path is the given directory or sits inside it. */
-function isAtOrUnder(path, directory) {
+function isAtOrUnder(path: string, directory: string): boolean {
   return path === directory || path.startsWith(`${directory}/`) || path.startsWith(`${directory}\\`)
 }
 
@@ -229,7 +489,7 @@ function isAtOrUnder(path, directory) {
  * @param to - where it lands.
  * @returns the rewritten paths, without duplicates.
  */
-function rewriteOpenPaths(paths, from, to) {
+function rewriteOpenPaths(paths: string[], from: string, to: string): string[] {
   return [...new Set(paths.map((path) => isAtOrUnder(path, from) ? to + path.slice(from.length) : path))]
 }
 
@@ -243,27 +503,57 @@ const T = {
   fgMuted: 'var(--dsw-alias-label-secondary)',
   accent: 'var(--dsw-alias-brand-primary)',
   danger: 'var(--dsw-alias-state-error-primary, #e5484d)',
+} as const
+
+/**
+ * How serious a status line is.
+ *
+ * `idle` is the default and paints nothing: the dot exists to mark the states a
+ * person has to notice — a failure, a warning, work still running — not to
+ * decorate every save. A marker that shows on every success stops meaning
+ * anything.
+ */
+type StatusLevel = 'idle' | 'busy' | 'done' | 'warn' | 'error'
+
+/** The status dot's colour per level. `idle` is transparent, so nothing paints. */
+const STATUS_DOT: Record<StatusLevel, string> = {
+  idle: 'transparent',
+  busy: 'var(--dsw-alias-state-idle-primary, #8b949e)',
+  done: 'var(--dsw-alias-state-success-primary, #2da44e)',
+  warn: 'var(--dsw-alias-state-warn-primary, #d29922)',
+  error: 'var(--dsw-alias-state-error-primary, #e5484d)',
 }
 
 // ---------------------------------------------------------------------------
 // Monaco plumbing
 // ---------------------------------------------------------------------------
 
-/** extension → monaco language id, derived once from the loaded grammars. */
-let EXT_TO_LANG = null
-function languageForPath(monaco, path) {
+/**
+ * extension → monaco language id, derived once from the loaded grammars.
+ *
+ * A Map carrying one extra member, so `fileToLang` travels with the index it
+ * belongs to rather than in a second module-level variable that could go stale
+ * independently.
+ */
+interface LanguageIndex extends Map<string, string> {
+  fileToLang: Map<string, string>
+}
+
+let EXT_TO_LANG: LanguageIndex | null = null
+function languageForPath(monaco: MonacoApi, path: string): string {
   if (EXT_TO_LANG === null) {
-    EXT_TO_LANG = new Map()
+    const index = new Map<string, string>() as LanguageIndex
     for (const lang of monaco.languages.getLanguages()) {
-      for (const ext of lang.extensions ?? []) EXT_TO_LANG.set(ext.toLowerCase(), lang.id)
+      for (const ext of lang.extensions ?? []) index.set(ext.toLowerCase(), lang.id)
     }
-    const fileToLang = new Map()
+    const fileToLang = new Map<string, string>()
     for (const lang of monaco.languages.getLanguages()) {
       for (const name of lang.filenames ?? []) fileToLang.set(name.toLowerCase(), lang.id)
     }
-    EXT_TO_LANG.fileToLang = fileToLang
+    index.fileToLang = fileToLang
+    EXT_TO_LANG = index
   }
-  const base = path.split(/[\\/]/).pop().toLowerCase()
+  const base = path.split(/[\\/]/).pop()?.toLowerCase() ?? ''
   const byName = EXT_TO_LANG.fileToLang.get(base)
   if (byName !== undefined) return byName
   const dot = base.lastIndexOf('.')
@@ -271,9 +561,78 @@ function languageForPath(monaco, path) {
   return EXT_TO_LANG.get(base.slice(dot)) ?? 'plaintext'
 }
 
-/** Follow the shell theme: `vs-dark` on dark, `vs` on light. */
-function monacoTheme() {
-  return document.body.hasAttribute('data-ds-dark-theme') ? 'vs-dark' : 'vs'
+/** One DSH theme token's computed value, or an empty string when the host cannot resolve it. */
+function themeToken(name: string): string {
+  if (typeof getComputedStyle !== 'function') return ''
+  return getComputedStyle(document.body).getPropertyValue(name).trim()
+}
+
+/**
+ * The editor's chrome, expressed in DSH's own palette.
+ *
+ * Monaco's built-in `vs` / `vs-dark` supply the syntax colours — those are
+ * tuned, and re-deriving them is not this plugin's business — while the `colors`
+ * map overrides the surfaces around them. That is the whole point: without it
+ * the editor paints its own white (or black) inside a panel painted from
+ * `--dsw-alias-*`, so the two read as two products sharing an edge rather than
+ * as one. `inherit: true` is what lets the syntax rules stay put while the
+ * chrome moves.
+ *
+ * `editor.background` is the code surface rather than the panel surface: DSH
+ * already uses that token for fenced code in the transcript, so the editor
+ * matches every other place in the product that shows code.
+ *
+ * Tokens that do not resolve are left out rather than written as empty strings,
+ * which Monaco rejects — an unresolved palette degrades to the built-in theme
+ * instead of to a broken one.
+ * @param monacoApi - the loaded namespace.
+ * @param dark - whether the shell is in its dark palette.
+ * @returns the theme name to hand `setTheme` and `editor.create`.
+ */
+function workbenchTheme(monacoApi: MonacoApi, dark: boolean): string {
+  const name = dark ? 'dsh-code-workbench-dark' : 'dsh-code-workbench-light'
+  const colors: Record<string, string> = {}
+  const take = (monacoKey: string, token: string): void => {
+    const value = themeToken(token)
+    if (value !== '') colors[monacoKey] = value
+  }
+  take('editor.background', '--dsw-alias-markdown-code-block')
+  take('editor.foreground', '--dsw-alias-label-primary')
+  take('editorGutter.background', '--dsw-alias-markdown-code-block')
+  take('editorLineNumber.foreground', '--dsw-alias-label-tertiary')
+  take('editorLineNumber.activeForeground', '--dsw-alias-label-secondary')
+  take('editor.lineHighlightBackground', '--dsw-alias-fill-l1')
+  take('editor.selectionBackground', '--dsw-alias-bg-document-selection')
+  take('editorCursor.foreground', '--dsw-alias-brand-primary')
+  take('editorIndentGuide.background1', '--dsw-alias-border-l1')
+  take('editorIndentGuide.activeBackground1', '--dsw-alias-border-l2')
+  take('editorWidget.background', '--dsw-alias-bg-layer-1')
+  take('editorWidget.border', '--dsw-alias-border-l2')
+  take('editorSuggestWidget.background', '--dsw-alias-bg-layer-1')
+  take('editorSuggestWidget.selectedBackground', '--dsw-alias-interactive-bg-hover')
+  take('editorHoverWidget.background', '--dsw-alias-bg-layer-1')
+  take('scrollbarSlider.background', '--dsw-alias-scrollbar-bg-l1')
+  take('scrollbarSlider.hoverBackground', '--dsw-alias-scrollbar-hover-l1')
+  monacoApi.editor.defineTheme(name, { base: dark ? 'vs-dark' : 'vs', inherit: true, rules: [], colors })
+  return name
+}
+
+/**
+ * The theme to mount the editor with: this plugin's DSH-matched theme when the
+ * namespace can build one, Monaco's built-in otherwise.
+ *
+ * The fallback is not decoration. `defineTheme` and `getComputedStyle` are both
+ * host APIs, and the render smoke suite drives this code against a fake
+ * namespace and a DOM stub that has neither — the same reason
+ * `requestAnimationFrame` and `navigator.clipboard` are guarded elsewhere in
+ * this file.
+ * @param monacoApi - the loaded namespace, or null before it has loaded.
+ * @returns the theme name.
+ */
+function monacoTheme(monacoApi: MonacoApi | null): string {
+  const dark = document.body.hasAttribute('data-ds-dark-theme')
+  if (monacoApi !== null && typeof monacoApi.editor.defineTheme === 'function') return workbenchTheme(monacoApi, dark)
+  return dark ? 'vs-dark' : 'vs'
 }
 
 // ---------------------------------------------------------------------------
@@ -289,7 +648,7 @@ const COMPLETION_STATUS_PATH = '/api/code-workbench/completion-status'
 /** Host route answering this installation's own version and repository (the About panel). */
 const ABOUT_PATH = '/api/code-workbench/about'
 /** How each credential source is described to the person configuring the plugin. */
-const CREDENTIAL_SOURCE_LABELS = {
+const CREDENTIAL_SOURCE_LABELS: Record<string, string> = {
   manual: '设置页填写的 API Key',
   store: 'DSH 凭据库 · DEEPSEEK_API_KEY',
   account: 'DSH 登录账号',
@@ -319,6 +678,40 @@ const POLL_INTERVAL_MS = 1500
 const POLL_NET_MS = 15000
 
 /**
+ * How long a drag must rest on a collapsed folder before it opens.
+ *
+ * Long enough that dragging *across* a folder on the way somewhere else does
+ * not open it, short enough that aiming at one feels like one gesture rather
+ * than two. Dropping into a folder you cannot see inside is a guess, which is
+ * what this removes.
+ */
+const DRAG_HOVER_EXPAND_MS = 700
+
+/**
+ * How long typing must pause before the codebase search runs.
+ *
+ * The search walks the workspace, so running it per keystroke spends the whole
+ * budget on prefixes nobody asked about. Enter still searches immediately — the
+ * debounce is for the pause, not for the intent.
+ */
+const SEARCH_DEBOUNCE_MS = 300
+
+/** The completion-status payload the settings page renders. */
+interface CompletionStatus {
+  mode?: string
+  endpoint?: string
+  addressValid?: boolean
+  model?: string
+  source?: string
+}
+
+/** The About payload. */
+interface AboutInfo {
+  version: string
+  repository: string
+}
+
+/**
  * Ask the Host for one Tab completion.
  *
  * One request, one response — nothing is streamed. Ghost text is only ever
@@ -333,14 +726,14 @@ const POLL_NET_MS = 15000
  * @param signal - cancellation when typing invalidates the suggestion.
  * @returns the completion text, possibly empty.
  */
-async function streamCompletion(body, signal) {
+async function streamCompletion(body: CompletionRequest, signal: AbortSignal): Promise<string> {
   const response = await fetch(COMPLETE_PATH, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
     signal,
   })
-  const payload = await response.json().catch(() => undefined)
+  const payload = await response.json().catch(() => undefined) as { text?: unknown; error?: { message?: string; code?: string } } | undefined
   if (!response.ok || payload === undefined) {
     throw new Error(payload?.error?.message ?? payload?.error?.code ?? `HTTP ${response.status}`)
   }
@@ -348,7 +741,7 @@ async function streamCompletion(body, signal) {
 }
 
 /** Models occasionally fence despite instructions; strip one wrapping fence. */
-function stripFences(text, preserveWhitespace = false) {
+function stripFences(text: string, preserveWhitespace = false): string {
   if (preserveWhitespace && !text.trimStart().startsWith('```')) return text
   let t = text.trim()
   if (t.startsWith('```')) {
@@ -361,13 +754,32 @@ function stripFences(text, preserveWhitespace = false) {
 }
 
 /**
+ * Whether an answer carries nothing to insert: empty, or only whitespace.
+ *
+ * A caret at the end of a line is exactly where a line ends, so "break the line
+ * and indent" is a perfectly likely continuation and this model does return it —
+ * a lone `\n`, a trailing indent, a fence whose body is blank. {@link
+ * stripFences} with `preserveWhitespace` hands that back verbatim, which is
+ * right: the leading blank of a real completion is part of the completion. But
+ * whitespace *alone* is not a suggestion — Monaco would paint those spaces as
+ * ghost text and Tab would insert them, leaving the caret on an indented empty
+ * line and no code. So a blank answer reads the same way an empty one does:
+ * nothing to suggest here.
+ * @param text - the completion as it came back, fences already stripped.
+ * @returns true when there is no content at all, only whitespace.
+ */
+function isBlankAnswer(text: string): boolean {
+  return text.trim() === ''
+}
+
+/**
  * Format an expanded chat chip as model context: the file:line anchor line,
  * then the code in one fence.
  * @param anchor - `path:start` or `path:start-end` (workspace-relative).
  * @param range - `{ language, code }`.
  * @returns the text spliced into the prompt at submit time.
  */
-function formatSnippet(anchor, range) {
+function formatSnippet(anchor: string, range: { language: string; code: string }): string {
   return serializeSnippet(anchor, range.language, range.code)
 }
 
@@ -375,7 +787,7 @@ function formatSnippet(anchor, range) {
 // Small UI atoms (no external UI imports; theme tokens only)
 // ---------------------------------------------------------------------------
 
-const rowStyle = (depth) => ({
+const rowStyle = (depth: number): React.CSSProperties => ({
   display: 'flex',
   alignItems: 'center',
   gap: '6px',
@@ -409,8 +821,8 @@ const ROW_PADDING = 8
  * @param onCount - how many rails, counting from the innermost, should paint.
  * @returns an array of rail spans, outermost first.
  */
-const guideRails = (depth, onCount) => {
-  const rails = []
+const guideRails = (depth: number, onCount: number): React.ReactNode[] => {
+  const rails: React.ReactNode[] = []
   for (let level = 0; level < depth; level++) {
     // The innermost rail is `depth - 1`; a rail counts as on when it is within
     // `onCount` of the innermost one.
@@ -425,31 +837,74 @@ const guideRails = (depth, onCount) => {
   return rails
 }
 
-function icon(kind) {
-  return kind === 'directory' ? '▸' : '·'
+/** The toolbar glyphs, as SVG path data. */
+const ICON_PATHS = {
+  files: 'M8 3h10v14H8z M5 7H3v14h11v-2',
+  search: 'M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14 M16 16l5 5',
+  history: 'M3 10a9 9 0 1 1 1 7 M3 4v6h6 M12 7v5l3 2',
+  createFile: 'M14 3H5v18h8 M14 3v6h6 M14 3l6 6 M18 14v8 M14 18h8',
+  createDirectory: 'M13 19H3V5h7l2 3h9v5 M18 14v8 M14 18h8',
+  refresh: 'M20 7a9 9 0 1 0 1 8 M20 3v5h-5',
+  collapse: 'M8 3h13v13 M3 8h13v13H3z M6 14h7',
+} as const
+
+function workbenchIcon(name: keyof typeof ICON_PATHS): React.ReactElement {
+  return h('svg', { width: 18, height: 18, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.6, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true }, h('path', { d: ICON_PATHS[name] }))
+}
+
+/**
+ * The marker a file row shows where a folder shows its twisty.
+ *
+ * Coloured by language family rather than drawn as an icon set: the point is
+ * that the *shape* of a tree — how much of it is code, config, markup, assets —
+ * reads at a glance, and seven pixels of colour does that without shipping a
+ * sprite sheet or a font. The hues are the languages' own, which is what makes
+ * them recognisable, so they are literal values rather than DSH tokens.
+ */
+const FILE_KIND_COLOR: Record<string, string> = {
+  js: '#d4a017', mjs: '#d4a017', cjs: '#d4a017', jsx: '#d4a017',
+  ts: '#3178c6', mts: '#3178c6', cts: '#3178c6', tsx: '#3178c6',
+  css: '#a45bd6', scss: '#a45bd6', less: '#a45bd6',
+  html: '#e34c26', htm: '#e34c26', xml: '#e34c26', svg: '#e34c26',
+  json: '#cbcb41', jsonc: '#cbcb41', yaml: '#cbcb41', yml: '#cbcb41', toml: '#cbcb41',
+  md: '#7d8590', mdx: '#7d8590', txt: '#7d8590', rst: '#7d8590',
+  py: '#3572a5', rb: '#701516', go: '#00add8', rs: '#dea584',
+  java: '#b07219', kt: '#a97bff', swift: '#f05138', php: '#4f5d95',
+  c: '#8a8a8a', h: '#8a8a8a', cpp: '#f34b7d', cs: '#178600',
+  sh: '#89e051', bash: '#89e051', zsh: '#89e051', ps1: '#4a7fbd', lua: '#5b6fbd', dart: '#00b4ab',
+  sql: '#e38c00', graphql: '#e10098', vue: '#41b883', svelte: '#ff3e00',
+}
+
+/** A file's language colour, or the muted token when the extension says nothing. */
+function fileKindColor(name: string): string {
+  const base = name.toLowerCase()
+  const dot = base.lastIndexOf('.')
+  if (dot < 0) return 'var(--dsw-alias-label-quaternary, #8b949e)'
+  return FILE_KIND_COLOR[base.slice(dot + 1)] ?? 'var(--dsw-alias-label-quaternary, #8b949e)'
 }
 
 // ---------------------------------------------------------------------------
 // File tree (lazy, recursive)
 // ---------------------------------------------------------------------------
 
-function workbenchIcon(name) {
-  const paths = {
-    files: 'M8 3h10v14H8z M5 7H3v14h11v-2',
-    search: 'M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14 M16 16l5 5',
-    history: 'M3 10a9 9 0 1 1 1 7 M3 4v6h6 M12 7v5l3 2',
-    createFile: 'M14 3H5v18h8 M14 3v6h6 M14 3l6 6 M18 14v8 M14 18h8',
-    createDirectory: 'M13 19H3V5h7l2 3h9v5 M18 14v8 M14 18h8',
-    refresh: 'M20 7a9 9 0 1 0 1 8 M20 3v5h-5',
-    collapse: 'M8 3h13v13 M3 8h13v13H3z M6 14h7',
-  }
-  return h('svg', { width: 18, height: 18, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.6, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true }, h('path', { d: paths[name] }))
+/** What the tree asks the panel to do. */
+interface FileTreeProps {
+  list: (dir: string) => Promise<TreeEntry[]>
+  cwd: string
+  activePath: string | null
+  onOpen: (path: string) => void
+  joinPath: (dir: string, name: string) => string
+  onAction: (action: TreeAction, target: TreeActionTarget) => Promise<ActionResult | undefined>
+  refreshRevision: number
+  clipboard: TreeClipboard | null
+  closeMenuSignal: string | null
+  onMenuOpen: () => void
 }
 
-function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRevision, clipboard, closeMenuSignal, onMenuOpen }) {
-  const [expanded, setExpanded] = useState(() => new Set([cwd]))
-  const [children, setChildren] = useState({}) // dir path -> entries | 'loading' | error string
-  const [menu, setMenu] = useState(null)
+function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRevision, clipboard, closeMenuSignal, onMenuOpen }: FileTreeProps): React.ReactNode {
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set([cwd]))
+  const [children, setChildren] = useState<TreeChildren>({}) // dir path -> entries | 'loading' | error string
+  const [menu, setMenu] = useState<TreeMenu | null>(null)
   /**
    * The row the toolbar's create actions target.
    *
@@ -458,7 +913,7 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
    * target rule matches the context menu exactly: a directory creates inside
    * itself, a file creates alongside it.
    */
-  const [selected, setSelected] = useState(null)
+  const [selected, setSelected] = useState<Selection | null>(null)
   /**
    * The extra rows a modifier-click has added to the selection.
    *
@@ -468,9 +923,9 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
    * plain click (which clears it) restores single-selection semantics exactly.
    * Entries are `{path, isDir}` keyed by `path:isDir`, matching `selectedKey`.
    */
-  const [extraSelection, setExtraSelection] = useState(() => new Set())
+  const [extraSelection, setExtraSelection] = useState<Set<string>>(() => new Set())
   /** Where a Shift range starts from; see `selectRow`. */
-  const selectionAnchorRef = useRef(null)
+  const selectionAnchorRef = useRef<string | null>(null)
   /**
    * Whether the pointer is currently over the row list.
    *
@@ -482,7 +937,7 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
    */
   const [pointerInTree, setPointerInTree] = useState(false)
   /** The folder a drag is currently hovering, so its row can show a drop hint. */
-  const [dropTarget, setDropTarget] = useState(null)
+  const [dropTarget, setDropTarget] = useState<string | null>(null)
   /**
    * The in-flight drag, or null.
    *
@@ -490,9 +945,9 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
    * remembers what it is dragging in a ref. `path` drives the "cannot drop into
    * yourself" check and `sources` is what a drop actually moves.
    */
-  const dragRef = useRef(null)
+  const dragRef = useRef<TreeDrag | null>(null)
   /** The scrolling row list, so a refresh can hold the user's place. */
-  const scrollerRef = useRef(null)
+  const scrollerRef = useRef<HTMLDivElement | null>(null)
   /**
    * An in-tree name field, in place of a modal dialog.
    *
@@ -502,26 +957,26 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
    * `{ mode: 'createFile'|'createDirectory', parent } | { mode: 'rename', path, isDir } | null`.
    * Indentation is derived when the tree renders, not stored here.
    */
-  const [editor, setEditor] = useState(null)
+  const [editor, setEditor] = useState<TreeEditor | null>(null)
   const [editorValue, setEditorValue] = useState('')
   /** Set when a commit fails, so the field stays open and explains itself. */
-  const [editorError, setEditorError] = useState(null)
-  const editorInputRef = useRef(null)
+  const [editorError, setEditorError] = useState<string | null>(null)
+  const editorInputRef = useRef<HTMLInputElement | null>(null)
   /** Guards against onBlur firing a second commit after Enter already did. */
   const editorSettledRef = useRef(false)
   useEffect(() => {
     const close = () => setMenu(null)
-    const keydown = (event) => { if (event.key === 'Escape') close() }
+    const keydown = (event: KeyboardEvent) => { if (event.key === 'Escape') close() }
     document.addEventListener?.('click', close)
     document.addEventListener?.('keydown', keydown)
     return () => { document.removeEventListener?.('click', close); document.removeEventListener?.('keydown', keydown) }
   }, [])
 
-  const load = useCallback((dir) => {
+  const load = useCallback((dir: string) => {
     setChildren((prev) => (prev[dir] !== undefined ? prev : { ...prev, [dir]: 'loading' }))
     list(dir).then(
       (entries) => setChildren((prev) => ({ ...prev, [dir]: entries })),
-      (error) => setChildren((prev) => ({ ...prev, [dir]: `加载失败: ${error}` })),
+      (error: unknown) => setChildren((prev) => ({ ...prev, [dir]: `加载失败: ${String(error)}` })),
     )
   }, [list])
 
@@ -554,21 +1009,28 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
     for (const dir of expandedRef.current) load(dir)
     // Restore after paint, once the rebuilt list has its new height. Guarded
     // because `requestAnimationFrame` does not exist in a bare Node test host.
-    const raf = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : (fn) => setTimeout(fn, 0)
-    const cancel = typeof cancelAnimationFrame === 'function' ? cancelAnimationFrame : clearTimeout
+    const raf: (callback: () => void) => number = typeof requestAnimationFrame === 'function'
+      ? requestAnimationFrame
+      : (fn) => { setTimeout(fn, 0); return 0 }
+    const cancel: (handle: number) => void = typeof cancelAnimationFrame === 'function'
+      ? cancelAnimationFrame
+      : (handle) => { clearTimeout(handle) }
     const frame = raf(() => { if (scroller) scroller.scrollTop = offset })
     return () => cancel(frame)
   }, [refreshRevision, list, load])
   useEffect(() => { setMenu(null) }, [closeMenuSignal])
-  const contextMenu = (event, path, isDir) => {
+  const contextMenu = (event: React.MouseEvent, path: string, isDir: boolean) => {
     event.preventDefault()
     event.stopPropagation()
     onMenuOpen?.()
     setMenu({ path, isDir, element: event.currentTarget, x: Math.max(0, Math.min(event.clientX, window.innerWidth - 230)), y: Math.max(0, Math.min(event.clientY, window.innerHeight - 380)) })
   }
 
+  /** Row path → its live DOM node, so a selection can be focused and revealed. */
+  const nodesRef = useRef(new Map<string, HTMLElement>())
+
   /** Put DOM focus on a row and keep it inside the scroller. */
-  const focusRow = (path) => {
+  const focusRow = (path: string) => {
     const node = nodesRef.current.get(path)
     if (!node) return
     node.focus?.()
@@ -576,7 +1038,7 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
   }
 
   /** A row's identity in the selection: the same path can never be both a file and a directory. */
-  const selectedKey = (row) => `${row.path}:${row.isDir ? 'd' : 'f'}`
+  const selectedKey = (row: Selection): string => `${row.path}:${row.isDir ? 'd' : 'f'}`
 
   /**
    * Every row currently selected, primary first.
@@ -585,7 +1047,7 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
    * read this instead of `selected`, so multi-select reaches them without each
    * call site learning about `extraSelection`.
    */
-  const selectionRows = () => {
+  const selectionRows = (): Selection[] => {
     if (selected === null) return []
     // The primary row is filtered out of the extras on purpose: the two sets are
     // maintained separately, so a row that is somehow in both would otherwise be
@@ -602,7 +1064,7 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
    * Shift-click takes everything between the anchor and the clicked row in
    * *visual* order — `flat` is what the user sees, so it is what a range means.
    */
-  const selectRow = (row, event) => {
+  const selectRow = (row: Selection, event?: React.MouseEvent | React.KeyboardEvent) => {
     const additive = event?.ctrlKey === true || event?.metaKey === true
     const range = event?.shiftKey === true
     if (range && selectionAnchorRef.current !== null) {
@@ -667,7 +1129,7 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
    * — the row itself plus each of its ancestors — so the tree keeps showing
    * where the selection came from without the rest of the noise.
    */
-  const railCountFor = (depth, isAncestorOfSelection) => {
+  const railCountFor = (depth: number, isAncestorOfSelection: boolean): number => {
     if (pointerInTree) return depth
     return isAncestorOfSelection ? depth : 0
   }
@@ -681,12 +1143,12 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
    * count as extension-less: `.gitignore` selects entirely rather than
    * preselecting the empty stem before the dot.
    */
-  const selectableEnd = (name) => {
+  const selectableEnd = (name: string): number => {
     const dot = name.lastIndexOf('.')
     return dot > 0 ? dot : name.length
   }
   /** Open the in-tree field for a create, anchored on the destination folder. */
-  const openCreate = (action, target) => {
+  const openCreate = (action: 'createFile' | 'createDirectory', target: Selection) => {
     const isDir = target?.isDir === true
     const parent = isDir
       ? target.path
@@ -701,9 +1163,9 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
     editorSettledRef.current = false
   }
   /** Open the in-tree field over an existing row to rename it. */
-  const openRename = (target) => {
+  const openRename = (target: Selection) => {
     setEditor({ mode: 'rename', path: target.path, isDir: target.isDir })
-    setEditorValue(target.path.split(/[\\/]/).at(-1))
+    setEditorValue(target.path.split(/[\\/]/).at(-1) ?? '')
     setEditorError(null)
     editorSettledRef.current = false
   }
@@ -754,7 +1216,7 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
       field.setSelectionRange?.(0, end)
     }
   }, [editor])
-  const toggle = useCallback((dir) => {
+  const toggle = useCallback((dir: string) => {
     setExpanded((prev) => {
       const next = new Set(prev)
       if (next.has(dir)) next.delete(dir)
@@ -763,32 +1225,38 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
     })
   }, [load])
 
+  /** The collapsed folder a drag is resting on, and the timer that will open it. */
+  const dragHoverRef = useRef<{ path: string; timer: ReturnType<typeof setTimeout> } | null>(null)
+  /** Abandon a pending hover-open, whatever ended the hover. */
+  const cancelDragHover = () => {
+    if (dragHoverRef.current === null) return
+    clearTimeout(dragHoverRef.current.timer)
+    dragHoverRef.current = null
+  }
+
   /**
    * Where a toolbar create action should land, mirroring the context menu's
    * rule: a directory holds the new entry, a file shares its parent folder, and
    * with no selection the workspace root is the fallback.
    */
-  const createTarget = (() => {
+  const createTarget: Selection = (() => {
     if (selected === null) return { path: cwd, isDir: true }
     if (selected.isDir) return { path: selected.path, isDir: true }
     const parent = selected.path.slice(0, Math.max(selected.path.lastIndexOf('/'), selected.path.lastIndexOf('\\')))
     return { path: parent === '' ? cwd : parent, isDir: true }
   })()
 
-  const rows = []
+  const rows: React.ReactNode[] = []
   /**
    * Every row that is actually on screen, in visual order, as the data a
    * movement key needs rather than as a DOM node. `walk` fills this in the same
    * pass that builds `rows`, so the two can never disagree.
-   * @type {{key: string, path: string, isDir: boolean, isOpen: boolean, depth: number, parent: string|null}[]}
    */
-  const flat = []
-  /** Row path → its live DOM node, so a selection can be focused and revealed. */
-  const nodesRef = useRef(new Map())
+  const flat: FlatRow[] = []
   // Cleared, not reallocated: the commit's ref callbacks refill it in this same
   // pass, so a fresh Map per render was pure garbage.
   nodesRef.current.clear()
-  const pushRow = (spec) => {
+  const pushRow = (spec: FlatRow) => {
     flat.push(spec)
   }
   /**
@@ -798,7 +1266,8 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
    * around it stay visible and the field sits exactly where the name will land.
    * Escape and blur both abandon the edit; Enter commits it.
    */
-  const pushEditorRow = (depth) => {
+  const pushEditorRow = (depth: number) => {
+    if (editor === null) return
     const isRename = editor.mode === 'rename'
     const placeholder = editor.mode === 'createDirectory' ? '文件夹名' : '文件名'
     rows.push(h('div', {
@@ -819,19 +1288,19 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
         spellCheck: false,
         autoComplete: 'off',
         // The tree's own key handler must not treat typing as navigation.
-        onKeyDown: (event) => {
+        onKeyDown: (event: React.KeyboardEvent) => {
           event.stopPropagation()
           if (event.key === 'Escape') { event.preventDefault(); closeEditor() }
-          else if (event.key === 'Enter') { event.preventDefault(); commitEditor() }
+          else if (event.key === 'Enter') { event.preventDefault(); void commitEditor() }
         },
-        onChange: (event) => { setEditorValue(event.target.value); if (editorError !== null) setEditorError(null) },
+        onChange: (event: React.ChangeEvent<HTMLInputElement>) => { setEditorValue(event.target.value); if (editorError !== null) setEditorError(null) },
         // Clicking away commits an explicit name but silently drops an empty
         // one, so opening the field by accident costs nothing.
-        onBlur: () => { commitEditor() },
+        onBlur: () => { void commitEditor() },
       })),
     editorError === null ? null : h('div', { key: 'code-workbench-inline-error', className: 'code-workbench-tree-editor-error', style: { color: T.danger } }, editorError))
   }
-  const walk = (dir, depth, parent) => {
+  const walk = (dir: string, depth: number, parent: string | null) => {
     const entries = children[dir]
     if (entries === undefined || entries === 'loading') {
       rows.push(h('div', { key: `${dir}#loading`, style: rowStyle(depth) }, '加载中…'))
@@ -851,7 +1320,7 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
       // Renaming replaces the row: the field stands where the old name was.
       if (editor?.mode === 'rename' && editor.path === full) { pushEditorRow(depth) }
       else {
-        const row = { path: full, isDir }
+        const row: Selection = { path: full, isDir }
         const isPrimary = selected?.path === full && selected.isDir === isDir
         const isExtra = extraSelection.has(selectedKey(row))
         // An ancestor of the primary selection keeps its rails once the pointer
@@ -871,7 +1340,7 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
           // The focus target for keyboard navigation. The callback ref files the
           // node under its path and clears itself on unmount, so the map only ever
           // holds rows that are on screen right now.
-          ref: (node) => { if (node === null) nodesRef.current.delete(full); else nodesRef.current.set(full, node) },
+          ref: (node: HTMLDivElement | null) => { if (node === null) nodesRef.current.delete(full); else nodesRef.current.set(full, node) },
           'aria-level': depth + 1,
           'aria-selected': isPrimary || isExtra,
           'aria-expanded': isDir ? isOpen : undefined,
@@ -879,7 +1348,7 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
           // The drop target for a drag-to-move. Only directories accept a drop --
           // a file has no children to move into -- and the guard lives in the
           // handler because the browser fires dragenter/dragover on every row.
-          onDragOver: (event) => {
+          onDragOver: (event: React.DragEvent) => {
             if (!isDir || dragRef.current === null) return
             // Dropping a folder into itself (or into its own descendant) would
             // detach that subtree from the tree, so those targets stay inert.
@@ -887,11 +1356,26 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
             event.preventDefault()
             event.dataTransfer.dropEffect = 'move'
             if (dropTarget !== full) setDropTarget(full)
+            // Resting on a collapsed folder opens it, the way every file manager
+            // does: dropping into a folder whose contents you cannot see is a
+            // guess. Only a *new* target restarts the clock, so travelling
+            // across a folder on the way elsewhere never opens it.
+            if (!isOpen && dragHoverRef.current?.path !== full) {
+              cancelDragHover()
+              dragHoverRef.current = {
+                path: full,
+                timer: setTimeout(() => {
+                  dragHoverRef.current = null
+                  toggle(full)
+                }, DRAG_HOVER_EXPAND_MS),
+              }
+            }
           },
           onDragLeave: () => {
+            cancelDragHover()
             if (dropTarget === full) setDropTarget(null)
           },
-          onDrop: (event) => {
+          onDrop: (event: React.DragEvent) => {
             if (!isDir || dragRef.current === null) return
             const drag = dragRef.current
             if (isAtOrUnder(full, drag.path)) return
@@ -899,16 +1383,17 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
             event.stopPropagation()
             dragRef.current = null
             setDropTarget(null)
+            cancelDragHover()
             // The tree's own drop is a move into the folder. The composer's drop
             // target reads the same drag but claims a different flavor, so both
             // gestures share one drag source without colliding.
-            onAction('move', { path: drag.path, isDir: drag.isDir, sources: drag.sources, destination: full })
+            void onAction('move', { path: drag.path, isDir: drag.isDir, sources: drag.sources, destination: full })
           },
           style: { ...rowStyle(depth), position: 'relative', ...(dropTarget === full ? { boxShadow: `inset 0 0 0 1px ${T.accent}` } : {}) },
           // Selecting and opening are separate concerns: a click both marks the
           // row (so the toolbar knows where to create) and does what the row
           // normally does -- expand a directory, or open a file.
-          onClick: (event) => {
+          onClick: (event: React.MouseEvent) => {
             selectRow(row, event)
             // A modifier-click is about building a selection, so it must not
             // also toggle a folder or swap the open file out from under the user.
@@ -918,13 +1403,13 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
           // Only Enter/space belong to the row itself. Movement keys bubble to the
           // container handler, which is what makes the arrow keys work while a
           // row has focus.
-          onKeyDown: (event) => {
+          onKeyDown: (event: React.KeyboardEvent) => {
             if (event.key !== 'Enter' && event.key !== ' ') return
             event.preventDefault()
             selectRow(row, event)
             isDir ? toggle(full) : onOpen(full)
           },
-          onContextMenu: (event) => {
+          onContextMenu: (event: React.MouseEvent) => {
             // Right-clicking inside an existing multi-selection acts on all of
             // it; right-clicking outside retargets to the row under the pointer.
             if (!isExtra && !isPrimary) selectRow(row, event)
@@ -935,7 +1420,7 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
           // itself uses the same gesture to move the file into a folder. The
           // private flavor keeps this disjoint from DSH's own file-drop pipeline.
           draggable: true,
-          onDragStart: (event) => {
+          onDragStart: (event: React.DragEvent) => {
             // Dragging a selected row carries the whole selection; dragging an
             // unselected row carries just that row, as every file manager does.
             const inSelection = isPrimary || isExtra
@@ -950,10 +1435,21 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
           onDragEnd: () => {
             dragRef.current = null
             setDropTarget(null)
+            cancelDragHover()
           },
           title: full,
         }, guideRails(depth, railCountFor(depth, carriesChain)),
-          h('span', { style: { color: T.fgMuted, width: '10px', display: 'inline-block' } }, isDir ? (isOpen ? '▾' : '▸') : ' '),
+          // A folder turns its twisty; a file shows what kind of file it is.
+          // Both sit in the same 12px box so names stay on one column.
+          isDir
+            ? h('svg', {
+              className: 'code-workbench-tree-twisty',
+              'data-open': isOpen ? 'true' : 'false',
+              width: 12, height: 12, viewBox: '0 0 12 12',
+              'aria-hidden': true,
+              style: { color: T.fgMuted },
+            }, h('path', { d: 'M4 2.5 L8 6 L4 9.5', fill: 'none', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round' }))
+            : h('span', { className: 'code-workbench-tree-kind', 'aria-hidden': true, style: { color: fileKindColor(entry.name) } }),
           h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis' } }, entry.name)))
       }
       if (isOpen) walk(full, depth + 1, full)
@@ -972,7 +1468,7 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
   // memo could never hit — it only paid for a dependency array that was new each
   // time. The handler is read straight from this render's scope, which is what it
   // needs to be anyway (it must see the rows that are on screen right now).
-  const moveSelection = (step, extend) => {
+  const moveSelection = (step: number, extend: boolean) => {
     const current = selected === null ? -1 : flat.findIndex((row) => row.path === selected.path && row.isDir === selected.isDir)
     if (current < 0) {
       const edge = step > 0 ? flat[0] : flat.at(-1)
@@ -982,10 +1478,11 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
     const nextIndex = current + step
     if (nextIndex < 0 || nextIndex >= flat.length) return
     const next = flat[nextIndex]
+    if (next === undefined) return
     // Shift+arrow grows the selection instead of replacing it, anchored where
     // the plain-key navigation last started.
     if (extend) {
-      if (selectionAnchorRef.current === null) selectionAnchorRef.current = selectedKey(flat[current])
+      if (selectionAnchorRef.current === null) selectionAnchorRef.current = selectedKey(flat[current] ?? next)
       setSelected({ path: next.path, isDir: next.isDir })
       const anchor = flat.findIndex((row) => selectedKey(row) === selectionAnchorRef.current)
       if (anchor >= 0) {
@@ -1002,13 +1499,13 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
     // waiting for the re-render that `setSelected` schedules.
     focusRow(next.path)
   }
-  const handleTreeKeys = (event) => {
+  const handleTreeKeys = (event: React.KeyboardEvent) => {
     // While the name field is open it owns every key — arrows move the caret,
     // Delete erases characters. `stopPropagation` in the field usually keeps
     // events from arriving here, but this guard makes it airtight.
     if (editor !== null) return
     const row = selected === null ? -1 : flat.findIndex((item) => item.path === selected.path && item.isDir === selected.isDir)
-    const target = row >= 0 ? flat[row] : null
+    const target = row >= 0 ? flat[row] ?? null : null
     switch (event.key) {
       case 'ArrowDown':
         // Focus is about to move to another row; that is not a typing context.
@@ -1051,7 +1548,7 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
         // on the whole selection, so a multi-select is one confirmation.
         if (target && !(target.path === cwd && target.isDir)) {
           const rowsToDelete = selectionRows().filter((row) => !(row.path === cwd && row.isDir))
-          onAction('delete', rowsToDelete.length > 1
+          void onAction('delete', rowsToDelete.length > 1
             ? { path: target.path, isDir: target.isDir, sources: rowsToDelete.map((row) => row.path) }
             : { path: target.path, isDir: target.isDir })
         }
@@ -1068,7 +1565,7 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
     if (selected === null) return
     focusRow(selected.path)
   }, [selected?.path, selected?.isDir])
-  const items = menu ? [
+  const items: Array<[TreeAction, string]> = menu ? [
     ['createFile', '新建文件…'], ['createDirectory', '新建文件夹…'],
     ['reveal', '在资源管理器中显示'],
     ['addToChat', menu.isDir ? '添加目录到对话' : '添加文件到对话'],
@@ -1087,7 +1584,7 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
    * way the toolbar does — no dialog. The host action is only called once the
    * name is committed, so the menu stays a pure front-end.
    */
-  const menuAction = (action, target) => {
+  const menuAction = (action: TreeAction, target: Selection) => {
     if (action === 'createFile' || action === 'createDirectory') return openCreate(action, target)
     if (action === 'rename') {
       // Renaming several rows to one name is not a rename. The field edits a
@@ -1100,11 +1597,12 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
       // selection in one go; right-clicking outside it deletes just that row.
       const rowsToDelete = selectionRows().filter((row) => !(row.path === cwd && row.isDir))
       const inSelection = rowsToDelete.some((row) => row.path === target.path && row.isDir === target.isDir)
-      return onAction('delete', inSelection && rowsToDelete.length > 1
+      void onAction('delete', inSelection && rowsToDelete.length > 1
         ? { ...target, sources: rowsToDelete.map((row) => row.path) }
         : target)
+      return
     }
-    return onAction(action, target)
+    void onAction(action, target)
   }
   /**
    * Clear the selection when a click lands on blank space.
@@ -1119,8 +1617,8 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
    * anchor hang off it, so leaving either behind would make the next Shift-click
    * measure a range from a row the user can no longer see as selected.
    */
-  const clearSelection = (event) => {
-    const target = event?.target
+  const clearSelection = (event: React.MouseEvent) => {
+    const target = event?.target as (EventTarget & { closest?: (selector: string) => Element | null }) | null
     // Spare the rows, the controls inside them, and the toolbar — including the
     // toolbar's own empty space. Moving up to press "new file" is the common
     // next move after selecting a folder, so a near miss has to keep the
@@ -1141,7 +1639,7 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
     // scrolling belongs to the row list inside, not to this box: see there.
     style: { display: 'flex', flexDirection: 'column', flex: '1 1 auto', minHeight: 0, overflow: 'hidden', padding: '4px 0' },
     onClick: clearSelection,
-    onContextMenu: (event) => contextMenu(event, cwd, true),
+    onContextMenu: (event: React.MouseEvent) => contextMenu(event, cwd, true),
   },
     h('div', { className: 'code-workbench-tree-toolbar' },
       h('button', {
@@ -1157,7 +1655,7 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
       h('button', { title: '刷新', 'aria-label': '刷新文件树', onClick: () => { for (const dir of expanded) load(dir) } }, workbenchIcon('refresh')),
       h('button', { title: '全部折叠', 'aria-label': '全部折叠', onClick: () => setExpanded(new Set([cwd])) }, workbenchIcon('collapse')),
     ),
-    h('div', { style: rowStyle(0), onContextMenu: (event) => contextMenu(event, cwd, true) }, cwd.split(/[\\/]/).filter(Boolean).at(-1)),
+    h('div', { style: rowStyle(0), onContextMenu: (event: React.MouseEvent) => contextMenu(event, cwd, true) }, cwd.split(/[\\/]/).filter(Boolean).at(-1)),
     // The keyboard handler sits on the scroller, not on each row: with focus on
     // a row, ↑/↓/←/→/F2/Delete bubble here, so every row shares one
     // implementation and there is no per-row listener to keep in sync.
@@ -1179,9 +1677,9 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
       ref: scrollerRef,
       onKeyDown: handleTreeKeys,
       onMouseEnter: () => setPointerInTree(true),
-      onMouseLeave: () => { setPointerInTree(false); setDropTarget(null) },
+      onMouseLeave: () => { setPointerInTree(false); setDropTarget(null); cancelDragHover() },
     }, rows),
-    menu ? h('div', { role: 'menu', className: 'code-workbench-context-menu', style: { left: menu.x, top: menu.y }, onClick: (event) => event.stopPropagation() },
+    menu ? h('div', { role: 'menu', className: 'code-workbench-context-menu', style: { left: menu.x, top: menu.y }, onClick: (event: React.MouseEvent) => event.stopPropagation() },
       items.map(([action, label]) => h('button', { key: action, type: 'button', role: 'menuitem', disabled: action === 'paste' && !clipboard || ['cut', 'rename', 'delete'].includes(action) && menu.path === cwd, onClick: () => { const target = menu; setMenu(null); menuAction(action, target) } }, label))) : null)
 }
 
@@ -1189,7 +1687,7 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
 // The tab body
 // ---------------------------------------------------------------------------
 
-function CodePanel(props) {
+function CodePanel(props: DSH.CodePanelProps): React.ReactNode {
   const {
     sessionId,
     sidebarRight,
@@ -1201,61 +1699,87 @@ function CodePanel(props) {
     'sessions.scope': sessionsScope,
     'settings.form': settingsForm,
   } = props
-  const pluginSettings = usePluginSettings(settingsForm).value ?? defaultSettings
+  const pluginSettings: PluginSettings = usePluginSettings(settingsForm).value ?? defaultSettings
   const settingsRef = useRef(pluginSettings)
   settingsRef.current = pluginSettings
   const cwd = useSessions((sessions) => sessions.byId?.[sessionId]?.cwd) ?? ''
 
-  const hostRef = useRef(null)      // monaco container
-  const editorRef = useRef(null)    // monaco editor instance
-  const stateRef = useRef({ path: null, version: null, dirty: false, text: '' })
-  const saveRef = useRef(null)      // latest save, for the editor keybinding
-  const openFileRef = useRef(null)  // latest openFile, for the change watch
-  const addToChatRef = useRef(null) // latest Add-to-Chat, for the editor keybinding
+  const hostRef = useRef<HTMLDivElement | null>(null)   // monaco container
+  const editorRef = useRef<Editor | null>(null)         // monaco editor instance
+  const stateRef = useRef<EditorState>({ path: null, version: null, dirty: false, text: '', model: null })
+  const saveRef = useRef<((note?: string, target?: EditorState) => Promise<void>) | null>(null)  // latest save, for the editor keybinding
+  const openFileRef = useRef<((path: string, reveal?: Reveal, reload?: boolean) => Promise<void>) | null>(null)  // latest openFile, for the change watch
+  const addToChatRef = useRef<(() => void) | null>(null)  // latest Add-to-Chat, for the editor keybinding
+  // The provider's one official "ask me again" channel, published by the editor
+  // effect below. It is not a keystroke — see the note where it is called.
+  const refreshCompletionsRef = useRef<(() => void) | null>(null)
   // The ghost-text round trips currently on the wire, keyed by completion
   // context. A second ask for the same caret joins the first instead of
   // answering "no suggestion": Monaco records an empty answer as the verdict for
   // that model version, so a busy moment would cost the user another keystroke.
-  const inFlightRef = useRef(new Map())
+  const inFlightRef = useRef(new Map<string, Promise<CompletionAnswer>>())
   // Whether the official change stream for the open file is delivering, and since
   // when. It decides how much the version fallback below is allowed to ask, so
   // the two effects share it through a ref — a state update would re-render.
   const watchHealthRef = useRef({ healthy: false, since: 0 })
   const openRequestRef = useRef(0)
-  const buffersRef = useRef(new Map())
-  const dialogResolveRef = useRef(null)
-  const [dialog, setDialog] = useState(null)
+  const buffersRef = useRef(new Map<string, Buffer>())
+  const dialogResolveRef = useRef<((value: boolean | string | null) => void) | null>(null)
+  const [dialog, setDialog] = useState<Dialog | null>(null)
   const [dialogValue, setDialogValue] = useState('')
-  const askDialog = (title, value) => new Promise((resolve) => {
+  const askDialog = (title: string, value?: string): Promise<boolean | string | null> => new Promise((resolve) => {
     dialogResolveRef.current?.(null)
     dialogResolveRef.current = resolve
     setDialogValue(value ?? '')
     setDialog({ title, input: value !== undefined })
   })
-  const finishDialog = (accepted) => {
+  const finishDialog = (accepted: boolean) => {
+    // Unreachable: both call sites live inside the `dialog ? …` branch below, so
+    // a dialog is always mounted when this runs. Stated rather than assumed,
+    // because the resolver below reads `dialog.input`.
+    if (dialog === null) return
     dialogResolveRef.current?.(accepted ? dialog.input ? dialogValue : true : null)
     dialogResolveRef.current = null
     setDialog(null)
   }
   useEffect(() => () => { dialogResolveRef.current?.(null) }, [])
 
-  const [monaco, setMonaco] = useState(null)
-  const [activePath, setActivePath] = useState(null)
-  const [openPaths, setOpenPaths] = useState([])
-  const [status, setStatus] = useState('就绪')
+  const [monaco, setMonaco] = useState<MonacoApi | null>(null)
+  const [activePath, setActivePath] = useState<string | null>(null)
+  const [openPaths, setOpenPaths] = useState<string[]>([])
+  const [status, setStatusText] = useState('就绪')
+  /**
+   * How the status line should read.
+   *
+   * `idle` paints nothing, and that is the point: the dot marks the states a
+   * person has to *notice* — a failure, a warning, something still running —
+   * rather than decorating every save. A marker that appears on every success
+   * stops carrying information.
+   */
+  const [statusLevel, setStatusLevel] = useState<StatusLevel>('idle')
+  /**
+   * Report what just happened, and how it went.
+   *
+   * The level only drives the status dot; the sentence is unchanged, so every
+   * existing caller keeps working by saying nothing about severity at all.
+   */
+  const setStatus = (text: string, level: StatusLevel = 'idle'): void => {
+    setStatusText(text)
+    setStatusLevel(level)
+  }
   const [dirty, setDirty] = useState(false)
-  const [leftMode, setLeftMode] = useState('tree')  // 'tree' | 'search' | 'history'
+  const [leftMode, setLeftMode] = useState<'tree' | 'search' | 'history'>('tree')
   const [query, setQuery] = useState('')
   const [searching, setSearching] = useState(false)
-  const [result, setResult] = useState(null)        // match report | { error }
-  const [history, setHistory] = useState(null)      // { entries } | { error }
+  const [result, setResult] = useState<SearchReport | { error: string } | null>(null)
+  const [history, setHistory] = useState<HistoryReport | { error: string } | null>(null)
   const [hasSelection, setHasSelection] = useState(false)
   const [navigationOpen, setNavigationOpen] = useState(true)
   const [completionStatus, setCompletionStatus] = useState('AI 补全就绪')
   const [editRevision, setEditRevision] = useState(0)
   const [treeRevision, setTreeRevision] = useState(0)
-  const [treeClipboard, setTreeClipboard] = useState(null)
-  const [tabMenu, setTabMenu] = useState(null)
+  const [treeClipboard, setTreeClipboard] = useState<TreeClipboard | null>(null)
+  const [tabMenu, setTabMenu] = useState<{ path: string; x: number; y: number } | null>(null)
   /**
    * The tab strip's in-flight drag and where it would land.
    *
@@ -1264,13 +1788,26 @@ function CodePanel(props) {
    * which is what draws the insertion marker. Both are cleared on drag end,
    * including a drag that ended over the composer instead of the strip.
    */
-  const tabDragRef = useRef(null)
-  const [tabDrop, setTabDrop] = useState(null)
+  const tabDragRef = useRef<string | null>(null)
+  const [tabDrop, setTabDrop] = useState<{ path: string; side: 'before' | 'after' } | null>(null)
+  /** The active tab's element, so the strip can keep it in view. */
+  const activeTabRef = useRef<HTMLElement | null>(null)
+  /**
+   * Keep the tab you are editing inside the strip.
+   *
+   * The strip scrolls, and a tab opened from the tree or a search hit lands at
+   * its far end — which is how "which file am I in" stops being answerable at a
+   * glance, the one question the strip exists to answer. `block: 'nearest'`
+   * keeps this from scrolling the panel vertically on the way past.
+   */
+  useEffect(() => {
+    activeTabRef.current?.scrollIntoView?.({ inline: 'nearest', block: 'nearest' })
+  }, [activePath])
 
   // ---- published updates ---------------------------------------------------
   // Asked once per mount: the panel is opened constantly and a release is rare,
   // so one read per mount is the whole budget this costs anyone.
-  const [release, setRelease] = useState(null) // { latest, needsRestart } | null
+  const [release, setRelease] = useState<Release | null>(null)
   const [updateBusy, setUpdateBusy] = useState(false)
   const [updateNote, setUpdateNote] = useState('')
 
@@ -1279,9 +1816,9 @@ function CodePanel(props) {
     const controller = new AbortController()
     fetch(UPDATE_CHECK_PATH, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}', signal: controller.signal })
       .then((response) => response.json())
-      .then((answer) => {
+      .then((answer: { ok?: boolean; hasUpdate?: boolean; latest?: string; needsRestart?: boolean }) => {
         if (cancelled || answer?.ok !== true || answer.hasUpdate !== true) return
-        setRelease({ latest: answer.latest, needsRestart: answer.needsRestart === true })
+        setRelease({ latest: answer.latest ?? '', needsRestart: answer.needsRestart === true })
       })
       // A check that cannot run is not news: silence is the entire fallback, for
       // the same reason the completion route has one — nobody opened the panel
@@ -1308,7 +1845,7 @@ function CodePanel(props) {
     setUpdateNote('正在下载新版本…')
     try {
       const response = await fetch(UPDATE_APPLY_PATH, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
-      const answer = await response.json()
+      const answer = await response.json() as { ok?: boolean; applied?: boolean; version?: string; needsRestart?: boolean; error?: { message?: string } }
       if (answer?.ok !== true) {
         setUpdateNote(answer?.error?.message ?? '更新失败，请稍后重试')
         return
@@ -1339,17 +1876,17 @@ function CodePanel(props) {
 
   useEffect(() => {
     let live = true
-    loadMonaco().then((m) => { if (live) setMonaco(m) }, (error) => setStatus(`Monaco 加载失败: ${error.message ?? error}`))
+    loadMonaco().then((m) => { if (live) setMonaco(m) }, (error: unknown) => setStatus(`Monaco 加载失败: ${error instanceof Error ? error.message : String(error)}`, 'error'))
     return () => { live = false }
   }, [])
 
-  const joinPath = useCallback((dir, name) => {
+  const joinPath = useCallback((dir: string, name: string): string => {
     const sep = dir.includes('\\') && !dir.includes('/') ? '\\' : '/'
     return dir.endsWith(sep) ? dir + name : dir + sep + name
   }, [])
 
   /** Resolve the wire path (absolute under the workspace). */
-  const list = useCallback((dir) => files.list(sessionId, dir, undefined).then((res) => {
+  const list = useCallback((dir: string): Promise<TreeEntry[]> => files.list(sessionId, dir, undefined).then((res) => {
     if (res?.ok) return res.value.entries
     throw new Error(res?.error?.code ?? 'list failed')
   }), [files, sessionId])
@@ -1360,7 +1897,7 @@ function CodePanel(props) {
     const editor = monaco.editor.create(hostRef.current, {
       value: '',
       language: 'plaintext',
-      theme: monacoTheme(),
+      theme: monacoTheme(monaco),
       automaticLayout: true,
       fontSize: 13,
       minimap: { enabled: false },
@@ -1375,7 +1912,7 @@ function CodePanel(props) {
     editorRef.current = editor
     // Keybindings register exactly once per editor; the handlers read the
     // latest closures through refs.
-    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => { saveRef.current?.() })
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => { void saveRef.current?.() })
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyL, () => { addToChatRef.current?.() })
     // The same action, in the editor's own context menu. Ctrl+L was the only way
     // to reach Add to Chat, and a right-click on a selection is where people look
@@ -1398,13 +1935,26 @@ function CodePanel(props) {
       run: () => addToChatRef.current?.(),
     })
     const selectionListener = editor.onDidChangeCursorSelection(() => {
-      setHasSelection(!editor.getSelection().isEmpty())
+      setHasSelection(!editor.getSelection()?.isEmpty())
     })
     // Tab-completion ghost text: Monaco renders the preview and accepts on Tab;
     // this provider only answers "what should be inserted at the caret".
+    // `refreshListeners` holds the listeners Monaco attaches to the provider's
+    // change announcement, declared below.
+    const refreshListeners = new Set<CompletionsChangedListener>()
     const completions = monaco.languages.registerInlineCompletionsProvider('*', {
       debounceDelayMs: 180,
-      async provideInlineCompletions(model, position, context, token) {
+      // Monaco wires this up only for a provider that declares it, and only for
+      // the focused editor. The trigger it fires is a plain one rather than an
+      // *Explicit* one, so a request already in flight for the same caret is
+      // reused instead of cancelled — which is precisely what the removed 400ms
+      // nudge got wrong. This is the only channel through which this provider is
+      // allowed to ask to be asked again.
+      onDidChangeInlineCompletions(listener) {
+        refreshListeners.add(listener)
+        return { dispose() { refreshListeners.delete(listener) } }
+      },
+      async provideInlineCompletions(model, position, _context, token) {
         const settings = settingsRef.current
         if (settings.completionEnabled === false) return { items: [] }
         const st = stateRef.current
@@ -1416,7 +1966,7 @@ function CodePanel(props) {
         if (prefix.trim() === '') return { items: [] }
         const cacheKey = `${sessionId}\u0000${st.path}\u0000${settings.completionBaseUrl}\u0000${settings.completionApiModel}\u0000${model.getLanguageId()}\u0000${prefix}\u0000${suffix}`
         // Monaco only needs the text at the caret; the range is a caret insert.
-        const ghostText = (text) => ({
+        const ghostText = (text: string): Monaco.languages.InlineCompletions => ({
           items: [{
             insertText: text,
             range: new monaco.Range(position.lineNumber, position.column, position.lineNumber, position.column),
@@ -1442,15 +1992,17 @@ function CodePanel(props) {
             setCompletionStatus('Tab 接受 AI 建议')
             return ghostText(answered)
           }
-          // The request we joined was abandoned before it answered; fall through
-          // and ask again under this request's own cancellation.
+          // The request we joined answered nothing worth showing: abandoned, or
+          // blank — and a blank answer is not remembered, for the reason the
+          // cache write gives. Fall through and ask again under this request's
+          // own cancellation.
         }
         const controller = new AbortController()
         const onCancel = token.onCancellationRequested?.(() => controller.abort())
         setCompletionStatus('AI 补全生成中…')
         // Never rejects, so a joined ask can await it bare, and the text reaches
         // the cache no matter which ask happened to own the connection.
-        const pending = (async () => {
+        const pending: Promise<CompletionAnswer> = (async () => {
           try {
             const text = await streamCompletion({
               sessionId,
@@ -1460,13 +2012,16 @@ function CodePanel(props) {
               suffix,
             }, controller.signal)
             const insertText = stripFences(text, true).slice(0, 2000)
-            if (insertText !== '') {
+            // Only an answer with something to insert is remembered. The cache
+            // means "this caret has already been answered", and a remembered
+            // blank would hand those spaces back to every later ask for it.
+            if (!isBlankAnswer(insertText)) {
               completionCache.set(cacheKey, insertText)
-              while (completionCache.size > 40) completionCache.delete(completionCache.keys().next().value)
+              while (completionCache.size > 40) completionCache.delete(completionCache.keys().next().value as string)
             }
             return { ok: true, text: insertText }
-          } catch (error) {
-            setCompletionStatus(controller.signal.aborted ? 'AI 补全已取消' : `AI 补全失败：${error.message ?? error}`)
+          } catch (error: unknown) {
+            setCompletionStatus(controller.signal.aborted ? 'AI 补全已取消' : `AI 补全失败：${error instanceof Error ? error.message : String(error)}`)
             return { ok: false, text: '' }
           }
         })()
@@ -1478,7 +2033,9 @@ function CodePanel(props) {
             setCompletionStatus('AI 补全已取消')
             return { items: [] }
           }
-          if (answer.text === '') {
+          // An empty answer and a blank one are the same news; the predicate
+          // carries the reason a blank is one of them.
+          if (isBlankAnswer(answer.text)) {
             setCompletionStatus('AI 未返回补全')
             return { items: [] }
           }
@@ -1491,10 +2048,23 @@ function CodePanel(props) {
       },
       disposeInlineCompletions: () => {},
     })
-    const observer = new MutationObserver(() => monaco.editor.setTheme(monacoTheme()))
+    // Announcing a change is how this plugin asks for a suggestion at a moment
+    // Monaco would not ask at all. Monaco asks on a typed character, on paste,
+    // and on Tab and Delete; it does *not* ask when the caret arrives by any
+    // other route, and a cursor move actively drops the ghost text that is
+    // showing. So opening a file, switching to its tab, watching it reload from
+    // disk or rolling it back all left the caret bare until a keystroke. A 400ms
+    // nudge after every content change used to cover those by accident — a load
+    // is a content change — but so is a keystroke, and there the nudge cancelled
+    // the automatic request that keystroke had just made. This announces the
+    // change only where the content settled without typing.
+    refreshCompletionsRef.current = () => { for (const listener of [...refreshListeners]) listener() }
+    const observer = new MutationObserver(() => monaco.editor.setTheme(monacoTheme(monaco)))
     observer.observe(document.body, { attributes: true, attributeFilter: ['data-ds-dark-theme'] })
     return () => {
       completions.dispose()
+      refreshListeners.clear()
+      refreshCompletionsRef.current = null
       // The map outlives the editor; drop it so a torn-down panel cannot hand a
       // later instance a promise from the previous one.
       inFlightRef.current.clear()
@@ -1508,14 +2078,14 @@ function CodePanel(props) {
   }, [monaco, sessionId])
 
   // ---- save (Ctrl+S + button) ------------------------------------------
-  const save = useCallback(async (note, target) => {
+  const save = useCallback(async (note?: string, target?: EditorState): Promise<void> => {
     const st = target ?? stateRef.current
     const editor = editorRef.current
     if (!editor || st.path === null) return
     if (st.saving) return
     st.saving = true
     const text = st.model.getValue()
-    setStatus('保存中…')
+    setStatus('保存中…', 'busy')
     try {
       const response = await fetch('/api/code-workbench/write', {
         method: 'POST',
@@ -1528,7 +2098,7 @@ function CodePanel(props) {
           note: typeof note === 'string' ? note : undefined,
         }),
       })
-      const body = await response.json().catch(() => ({}))
+      const body = await response.json().catch(() => ({})) as { ok?: boolean; version?: unknown; error?: { code?: string } }
       if (!response.ok || body.ok === false) {
         const code = body.error?.code ?? `HTTP ${response.status}`
         const message = code === 'FS_STALE_VERSION'
@@ -1536,7 +2106,7 @@ function CodePanel(props) {
           : code === 'FS_SANDBOX_DENIED'
             ? '保存失败: 沙箱策略拒绝写入（会话文件策略为只读时无法保存；请在对话区把权限切到可写）'
             : `保存失败: ${code}`
-        setStatus(message)
+        setStatus(message, 'error')
         return
       }
       st.text = text
@@ -1547,8 +2117,8 @@ function CodePanel(props) {
         setDirty(st.dirty)
         setStatus(`已保存 ${st.path}`)
       }
-    } catch (error) {
-      setStatus(`保存失败: ${error.message ?? error}`)
+    } catch (error: unknown) {
+      setStatus(`保存失败: ${error instanceof Error ? error.message : String(error)}`, 'error')
     } finally {
       st.saving = false
     }
@@ -1556,79 +2126,84 @@ function CodePanel(props) {
 
   useEffect(() => {
     if (!pluginSettings.autoSave || !dirty || activePath === null) return
-    const timer = setTimeout(() => save('自动保存'), 900)
+    const timer = setTimeout(() => { void save('自动保存') }, 900)
     return () => clearTimeout(timer)
   }, [activePath, dirty, editRevision, pluginSettings.autoSave, save])
 
   // ---- open a file ------------------------------------------------------
-  const openFile = useCallback(async (path, reveal, reload = false) => {
+  const openFile = useCallback(async (path: string, reveal?: Reveal, reload = false): Promise<void> => {
     const editor = editorRef.current
-    if (!editor) return
+    // The editor is created from this namespace, so an editor implies it is
+    // bound — but the guard below only narrows `editor`, and every use of the
+    // namespace inside this closure would otherwise need a `!`. Binding it once
+    // keeps that invariant stated in one place instead of asserted at each use.
+    const monacoApi = monaco
+    if (!editor || !monacoApi) return
     const requestId = ++openRequestRef.current
     const previous = stateRef.current
     const previousText = editor.getValue()
     if (previous.model) previous.viewState = editor.saveViewState?.()
-    if (previous.path !== path && previous.dirty && settingsRef.current.autoSave) saveRef.current?.('自动保存', previous)
-    setStatus(`读取 ${path} …`)
+    if (previous.path !== path && previous.dirty && settingsRef.current.autoSave) void saveRef.current?.('自动保存', previous)
+    setStatus(`读取 ${path} …`, 'busy')
     try {
       let buffer = buffersRef.current.get(path)
       if (!buffer || reload) {
-      let offset = 1
-      let text = ''
-      let version = null
-      for (let page = 0; page < 40; page++) {
-        const res = await files.read(sessionId, path, { offset }, undefined)
-        if (!res?.ok) {
-          // Carry the code, not just the message: whether this file belongs to
-          // the official preview is a decision on the code (`NON_TEXT_CODES`).
-          const failure = new Error(res?.error?.code ?? 'read failed')
-          failure.code = res?.error?.code
-          throw failure
+        let offset = 1
+        let text = ''
+        let version: unknown = null
+        for (let page = 0; page < 40; page++) {
+          const res = await files.read(sessionId, path, { offset }, undefined)
+          if (!res?.ok) {
+            // Carry the code, not just the message: whether this file belongs to
+            // the official preview is a decision on the code (`NON_TEXT_CODES`).
+            const failure = new Error(res?.error?.code ?? 'read failed') as Error & { code?: string }
+            failure.code = res?.error?.code
+            throw failure
+          }
+          text += res.value.text
+          version = res.value.version ?? version
+          if (res.value.eof) break
+          offset += res.value.lines
         }
-        text += res.value.text
-        version = res.value.version ?? version
-        if (res.value.eof) break
-        offset += res.value.lines
-      }
-      if (requestId !== openRequestRef.current || editorRef.current !== editor) return
-      if (previous.path === path && editor.getValue() !== previousText) {
-        setStatus('文件读取期间发生编辑，保留未保存内容')
-        return
-      }
-      const uri = monaco.Uri.parse(`inmemory://code-workbench/${sessionId}/${path}`)
-      if (buffer?.dirty) {
-        setStatus('磁盘文件已更新，保留未保存修改')
-        return
-      }
-      if (buffer) {
-        if (buffer.model.getValue() !== text) buffer.model.setValue(text)
-        buffer.text = text
-        buffer.version = version
-        buffer.dirty = false
-      } else {
-      const existing = monaco.editor.getModel(uri)
-      if (existing) existing.dispose()
-      const model = monaco.editor.createModel(text, languageForPath(monaco, path), uri)
-      buffer = { path, version, dirty: false, text, model }
-      buffersRef.current.set(path, buffer)
-      model.onDidChangeContent(() => {
-        const st = buffer
-        st.dirty = model.getValue() !== st.text
-        setEditRevision((revision) => revision + 1)
-        if (editor.getModel() !== model) return
-        setDirty(st.dirty)
-        // No nudge here on purpose. Monaco already asks on its own for every
-        // typed character, for backspace and delete (they sit in its
-        // `triggerCommands` list precisely because they never reach
-        // `onDidType`), and for Tab and paste. Nudging it arrives as an
-        // *Explicit* trigger, which never satisfies the automatic request
-        // already on the wire: Monaco (`UpdateRequest.satisfies`) drops that one
-        // and starts over, so every completion paid a second round trip plus a
-        // fixed 400ms, and every extra keystroke pushed the ghost text another
-        // 400ms out. That was the "I have to press space or delete to make it
-        // appear" report.
-      })
-      }
+        if (requestId !== openRequestRef.current || editorRef.current !== editor) return
+        if (previous.path === path && editor.getValue() !== previousText) {
+          setStatus('文件读取期间发生编辑，保留未保存内容', 'warn')
+          return
+        }
+        const uri = monacoApi.Uri.parse(`inmemory://code-workbench/${sessionId}/${path}`)
+        if (buffer?.dirty) {
+          setStatus('磁盘文件已更新，保留未保存修改', 'warn')
+          return
+        }
+        if (buffer) {
+          if (buffer.model.getValue() !== text) buffer.model.setValue(text)
+          buffer.text = text
+          buffer.version = version
+          buffer.dirty = false
+        } else {
+          const existing = monacoApi.editor.getModel(uri)
+          if (existing) existing.dispose()
+          const model = monacoApi.editor.createModel(text, languageForPath(monacoApi, path), uri)
+          buffer = { path, version, dirty: false, text, model }
+          buffersRef.current.set(path, buffer)
+          model.onDidChangeContent(() => {
+            const st = buffer!
+            st.dirty = model.getValue() !== st.text
+            setEditRevision((revision) => revision + 1)
+            if (editor.getModel() !== model) return
+            setDirty(st.dirty)
+            // No nudge here on purpose. Monaco already asks on its own for every
+            // typed character, for backspace and delete (they sit in its
+            // `triggerCommands` list precisely because they never reach
+            // `onDidType`), and for Tab and paste. Nudging it arrives as an
+            // *Explicit* trigger, which never satisfies the automatic request
+            // already on the wire: Monaco (`UpdateRequest.satisfies`) drops that one
+            // and starts over, so every completion paid a second round trip plus a
+            // fixed 400ms, and every extra keystroke pushed the ghost text another
+            // 400ms out. That was the "I have to press space or delete to make it
+            // appear" report.
+          })
+        }
       }
       if (requestId !== openRequestRef.current || editorRef.current !== editor) return
       const model = buffer.model
@@ -1643,23 +2218,28 @@ function CodePanel(props) {
         const lineNumber = Math.min(Math.max(1, reveal.line), model.getLineCount())
         const column = Math.min(Math.max(1, reveal.column ?? 1), model.getLineMaxColumn(lineNumber))
         const endColumn = Math.min(model.getLineMaxColumn(lineNumber), column + (reveal.length ?? 0))
-        const range = new monaco.Range(lineNumber, column, lineNumber, Math.max(column, endColumn))
+        const range = new monacoApi.Range(lineNumber, column, lineNumber, Math.max(column, endColumn))
         editor.setSelection(range)
         editor.revealLineInCenter(lineNumber)
         const decorations = editor.deltaDecorations([], [{ range, options: { className: 'code-workbench-flash' } }])
         setTimeout(() => { editor.deltaDecorations(decorations, []) }, 1500)
       }
-    } catch (error) {
+      // Arriving at a file is the case Monaco never asks about: the text came
+      // from the read route, not from a keystroke. Announce the change so the
+      // suggestion can appear where the caret was left, without typing first.
+      refreshCompletionsRef.current?.()
+    } catch (error: unknown) {
       // A file the text channel refuses is not a dead end. Hand it to the
       // official document preview instead of reporting a raw code the user can
       // do nothing with — and leave this panel exactly as it was: no tab, no
       // model, the open file still open.
-      if (NON_TEXT_CODES.has(error?.code) && openInDocumentPreview(sidebarRight, sessionId, cwd, path)) {
+      const code = (error as { code?: string })?.code
+      if (code !== undefined && NON_TEXT_CODES.has(code) && openInDocumentPreview(sidebarRight, sessionId, cwd, path)) {
         setStatus(NON_TEXT_HANDOFF_STATUS)
         return
       }
-      const hint = NON_TEXT_CODES.has(error?.code) ? NON_TEXT_NO_PREVIEW_SUFFIX : ''
-      setStatus(`读取失败: ${error.message ?? error}${hint}`)
+      const hint = code !== undefined && NON_TEXT_CODES.has(code) ? NON_TEXT_NO_PREVIEW_SUFFIX : ''
+      setStatus(`读取失败: ${error instanceof Error ? error.message : String(error)}${hint}`, 'error')
     }
   }, [files, monaco, sessionId])
 
@@ -1668,10 +2248,10 @@ function CodePanel(props) {
     const path = activePath
     if (!path || typeof watchStream !== 'function') return
     let cancelled = false
-    let dispose = null
-    ;(async () => {
+    let dispose: (() => void) | null = null
+    void (async () => {
       try {
-        const stream = watchStream({
+        const stream = watchStream<DSH.WorkspaceFileWatchFrame>({
           name: `code-workbench watch ${path}`,
           open: (signal) => files.changes(sessionId, path, signal),
           ended: () => new Error('watch ended'),
@@ -1679,13 +2259,16 @@ function CodePanel(props) {
         dispose = () => stream.dispose()
         for await (const item of stream) {
           if (cancelled) break
+          // A bare frame, not a `RemoteResult`: the transport reports a stream
+          // failure by ending the iteration, so there is no error frame to
+          // unwrap and an `ok === true` test here would drop every one of them.
           const frame = item.value
           if (frame?.kind === 'ready') {
             watchHealthRef.current = { healthy: true, since: Date.now() }
             item.accept()
           } else if (frame?.kind === 'change') {
             if (stateRef.current.dirty) {
-              setStatus('⚠ 文件已在磁盘上更改；你有未保存的修改（重新点开文件可查看最新内容）')
+              setStatus('⚠ 文件已在磁盘上更改；你有未保存的修改（重新点开文件可查看最新内容）', 'warn')
             } else {
               await openFileRef.current?.(path, undefined, true)
               setStatus(`已自动刷新 ${path}（磁盘上发生了更改）`)
@@ -1725,20 +2308,20 @@ function CodePanel(props) {
         if (controller.signal.aborted || current.path !== path || !metadata?.ok) return
         if (JSON.stringify(metadata.value.version) === JSON.stringify(current.version)) return
         if (current.dirty) {
-          setStatus('⚠ 磁盘文件已更新，保留你的未保存修改')
+          setStatus('⚠ 磁盘文件已更新，保留你的未保存修改', 'warn')
         } else {
           await openFileRef.current?.(path, undefined, true)
         }
-      } catch (error) {
-        if (!controller.signal.aborted) setStatus(`文件同步检查失败：${error.message ?? error}`)
+      } catch (error: unknown) {
+        if (!controller.signal.aborted) setStatus(`文件同步检查失败：${error instanceof Error ? error.message : String(error)}`, 'error')
       } finally {
         checking = false
       }
     }
-    const onFocus = () => checkVersion(true)
-    const timer = setInterval(checkVersion, POLL_INTERVAL_MS)
+    const onFocus = () => { void checkVersion(true) }
+    const timer = setInterval(() => { void checkVersion() }, POLL_INTERVAL_MS)
     window.addEventListener?.('focus', onFocus)
-    checkVersion()
+    void checkVersion()
     return () => {
       controller.abort()
       clearInterval(timer)
@@ -1747,9 +2330,18 @@ function CodePanel(props) {
   }, [activePath, files, sessionId])
 
   // ---- codebase search (@codebase retrieval) ----------
-  const runSearch = useCallback(async () => {
+  /**
+   * The query the most recent search was issued for.
+   *
+   * The debounce below and Enter both want to run a search, and this is what
+   * keeps them from running the same one twice: Enter marks the query here as it
+   * fires, so the pending timer finds its work already done and stands down.
+   */
+  const lastSearchedRef = useRef<string | null>(null)
+  const runSearch = useCallback(async (): Promise<void> => {
     const q = query.trim()
     if (q === '') return
+    lastSearchedRef.current = q
     setSearching(true)
     setResult(null)
     try {
@@ -1760,20 +2352,34 @@ function CodePanel(props) {
         // the whole workspace. The Host route still accepts one.
         body: JSON.stringify({ sessionId, query: q }),
       })
-      const body = await response.json().catch(() => ({}))
+      const body = await response.json().catch(() => ({})) as SearchReport & { ok?: boolean; error?: { message?: string; code?: string } }
       if (!response.ok || body.ok === false) {
         throw new Error(body.error?.message ?? body.error?.code ?? `HTTP ${response.status}`)
       }
       setResult(body)
-    } catch (error) {
-      setResult({ error: String(error?.message ?? error) })
+    } catch (error: unknown) {
+      setResult({ error: String(error instanceof Error ? error.message : error) })
     } finally {
       setSearching(false)
     }
   }, [query, sessionId])
 
+  // Typing pauses into a search; Enter does not wait for the pause. Keyed on the
+  // query, so each keystroke restarts the clock and only the last pause is ever
+  // spent — and the guard inside means a search Enter already ran is not
+  // repeated when the abandoned timer would have fired.
+  useEffect(() => {
+    const q = query.trim()
+    if (q === '' || q === lastSearchedRef.current) return
+    const timer = setTimeout(() => {
+      if (lastSearchedRef.current === q) return
+      void runSearch()
+    }, SEARCH_DEBOUNCE_MS)
+    return () => clearTimeout(timer)
+  }, [query, runSearch])
+
   // ---- save journal (checkpoints) --------------------------------------
-  const loadHistory = useCallback(async () => {
+  const loadHistory = useCallback(async (): Promise<void> => {
     const path = stateRef.current.path
     if (path === null) {
       setHistory({ error: '先打开一个文件' })
@@ -1786,54 +2392,54 @@ function CodePanel(props) {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ sessionId, path }),
       })
-      const body = await response.json().catch(() => ({}))
+      const body = await response.json().catch(() => ({})) as { ok?: boolean; entries?: HistoryEntry[]; error?: { message?: string; code?: string } }
       if (!response.ok || body.ok === false) {
         throw new Error(body.error?.message ?? body.error?.code ?? `HTTP ${response.status}`)
       }
-      setHistory({ entries: body.entries })
-    } catch (error) {
-      setHistory({ error: String(error?.message ?? error) })
+      setHistory({ entries: body.entries ?? [] })
+    } catch (error: unknown) {
+      setHistory({ error: String(error instanceof Error ? error.message : error) })
     }
   }, [sessionId])
 
-  const rollback = useCallback(async (id) => {
+  const rollback = useCallback(async (id: string): Promise<void> => {
     const path = stateRef.current.path
     if (path === null) return
-    if (stateRef.current.dirty || stateRef.current.saving) { setStatus('请先保存当前文件的修改，并等待保存完成后回滚'); return }
-    setStatus('回滚中…')
+    if (stateRef.current.dirty || stateRef.current.saving) { setStatus('请先保存当前文件的修改，并等待保存完成后回滚', 'warn'); return }
+    setStatus('回滚中…', 'busy')
     try {
       const response = await fetch(ROLLBACK_PATH, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ sessionId, path, id }),
       })
-      const body = await response.json().catch(() => ({}))
+      const body = await response.json().catch(() => ({})) as { ok?: boolean; error?: { message?: string; code?: string } }
       if (!response.ok || body.ok === false) {
         throw new Error(body.error?.message ?? body.error?.code ?? `HTTP ${response.status}`)
       }
       setStatus('已回滚：文件恢复到该次保存之前的内容')
       await openFile(path, undefined, true)
       await loadHistory()
-    } catch (error) {
-      setStatus(`回滚失败: ${error?.message ?? error}`)
+    } catch (error: unknown) {
+      setStatus(`回滚失败: ${error instanceof Error ? error.message : String(error)}`, 'error')
     }
   }, [loadHistory, openFile, sessionId])
 
   // ---- Add to Chat (selection → a reference chip in the main draft) -----
   // The chip look: the draft shows a small chip (`a.js:3-5 · 3 行`), and the
   // code expands only at submit through this plugin's reference codec.
-  const addToChat = useCallback(() => {
+  const addToChat = useCallback((): void => {
     const editor = editorRef.current
     const model = editor?.getModel()
     if (!editor || !model) return
     const selection = editor.getSelection()
-    if (selection.isEmpty()) {
-      setStatus('先选中要添加到对话的代码，再按 Ctrl+L')
+    if (!selection || selection.isEmpty()) {
+      setStatus('先选中要添加到对话的代码，再按 Ctrl+L', 'warn')
       return
     }
     const scope = typeof sessionsScope === 'function' ? sessionsScope(sessionId) : undefined
     if (scope === undefined || typeof inputActions?.captureInsertion !== 'function') {
-      setStatus('对话输入框尚不可用，请稍后再试')
+      setStatus('对话输入框尚不可用，请稍后再试', 'warn')
       return
     }
     const code = model.getValueInRange(selection)
@@ -1843,7 +2449,7 @@ function CodePanel(props) {
     const endLine = selection.endLineNumber
     const lines = endLine - startLine + 1
     const anchor = lines === 1 ? `${rel}:${startLine}` : `${rel}:${startLine}-${endLine}`
-    const reference = {
+    const reference: ChatReference = {
       source: 'code-workbench',
       ref: { path: rel, startLine, endLine, language: model.getLanguageId(), code },
       label: `${anchor} · ${lines} 行`,
@@ -1854,7 +2460,7 @@ function CodePanel(props) {
     const applied = scope.bail(scope, 'slash/input-insert-reference', { reference, span }) === true
     setStatus(applied
       ? `已添加到对话：${anchor}（${lines} 行）— 去主对话输入你的问题`
-      : '添加失败：对话输入框正忙（正在提交？），请重试')
+      : '添加失败：对话输入框正忙（正在提交？），请重试', applied ? 'done' : 'error')
   }, [cwd, inputActions, sessionId, sessionsScope])
 
   // ---- Drop a tree row onto the composer → a reference chip --------------
@@ -1868,29 +2474,29 @@ function CodePanel(props) {
   // Interception is deliberately narrow — our private flavor AND a composer
   // target — so file drops keep flowing to DSH's attachment pipeline untouched.
   useEffect(() => {
-    const accepts = (event) => {
+    const accepts = (event: DragEvent): DataTransfer | null => {
       const types = event.dataTransfer?.types
       if (!types) return null
       // `types` is a DOMStringList in some engines; normalize before probing.
       const has = typeof types.includes === 'function'
-        ? (name) => types.includes(name)
-        : (name) => Array.from(types).includes(name)
+        ? (name: string) => types.includes(name)
+        : (name: string) => Array.from(types).includes(name)
       // Our flavor must be present *and* no real file payload, so an OS file
       // drag that merely passes over the tree is never hijacked.
       if (!has(TREE_DRAG_MIME) || has('Files')) return null
-      const target = event.target
+      const target = event.target as (EventTarget & { closest?: (selector: string) => Element | null }) | null
       if (!target || typeof target.closest !== 'function') return null
       return target.closest('[data-composer-input]') !== null ? event.dataTransfer : null
     }
-    const onDragOver = (event) => {
+    const onDragOver = (event: DragEvent) => {
       const dataTransfer = accepts(event)
       if (dataTransfer === null) return
       event.preventDefault()
       event.stopPropagation()
       dataTransfer.dropEffect = 'copy'
-      setStatus(`松开即把文件加入对话`)
+      setStatus(`松开即把文件加入对话`, 'busy')
     }
-    const onDrop = (event) => {
+    const onDrop = (event: DragEvent) => {
       const dataTransfer = accepts(event)
       if (dataTransfer === null) return
       // Claim the gesture from Lexical before it can insert raw text.
@@ -1898,16 +2504,16 @@ function CodePanel(props) {
       event.stopPropagation()
       const parsed = parseTreeDragPayload(dataTransfer.getData(TREE_DRAG_MIME))
       if (parsed === null) {
-        setStatus('拖入的文件无法识别，请重试')
+        setStatus('拖入的文件无法识别，请重试', 'warn')
         return
       }
       const scope = typeof sessionsScope === 'function' ? sessionsScope(sessionId) : undefined
       if (scope === undefined || typeof inputActions?.captureInsertion !== 'function') {
-        setStatus('对话输入框尚不可用，请稍后再试')
+        setStatus('对话输入框尚不可用，请稍后再试', 'warn')
         return
       }
       const label = `${parsed.path}${parsed.directory ? '/' : ''}`
-      const reference = {
+      const reference: ChatReference = {
         source: 'code-workbench',
         ref: { path: parsed.path, directory: parsed.directory, pathOnly: true },
         label,
@@ -1918,7 +2524,7 @@ function CodePanel(props) {
       const applied = scope.bail(scope, 'slash/input-insert-reference', { reference, span }) === true
       setStatus(applied
         ? `已添加到对话：${label} — 去主对话输入你的问题`
-        : '添加失败：对话输入框正忙（正在提交？），请重试')
+        : '添加失败：对话输入框正忙（正在提交？），请重试', applied ? 'done' : 'error')
     }
     // Capture phase, so these outrank Lexical's bubble-phase listeners.
     document.addEventListener?.('dragover', onDragOver, true)
@@ -1929,7 +2535,7 @@ function CodePanel(props) {
     }
   }, [inputActions, sessionId, sessionsScope])
 
-  const treeAction = async (action, target) => {
+  const treeAction = async (action: TreeAction, target: TreeActionTarget): Promise<ActionResult | undefined> => {
     const path = target.path
     const parent = path.slice(0, Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\')))
     const directory = target.isDir ? path : parent
@@ -1946,7 +2552,7 @@ function CodePanel(props) {
         const scope = sessionsScope?.(sessionId)
         if (!scope || !inputActions?.captureInsertion) throw new Error('对话输入框尚未就绪')
         const relative = relativeToCwd(path, cwd) || '.'
-        const reference = { source: 'code-workbench', ref: { path: relative, directory: target.isDir, pathOnly: true }, label: relative, appearance: 'file', clipboardText: referenceMention(relative, target.isDir === true) }
+        const reference: ChatReference = { source: 'code-workbench', ref: { path: relative, directory: target.isDir, pathOnly: true }, label: relative, appearance: 'file', clipboardText: referenceMention(relative, target.isDir === true) }
         if (scope.bail(scope, 'slash/input-insert-reference', { reference, span: inputActions.captureInsertion() }) !== true) throw new Error('对话输入框正忙')
       } else if (action === 'openTerminal') {
         if (!openWorkspaceTerminal(sidebarRight)) throw new Error('无法打开终端：宿主未提供终端面板')
@@ -1959,18 +2565,18 @@ function CodePanel(props) {
         // Drag-to-move. Each source is a rename into the dropped folder, so it
         // reuses the rename path the host already guards; doing them one at a
         // time keeps a partial failure recoverable rather than all-or-nothing.
-        const folder = target.destination
+        const folder = target.destination ?? path
         const sources = target.sources ?? [path]
         const moves = sources
           .filter((item) => !isAtOrUnder(folder, item))
-          .map((item) => ({ from: item, to: joinPath(folder, item.split(/[\\/]/).at(-1)) }))
+          .map((item) => ({ from: item, to: joinPath(folder, item.split(/[\\/]/).at(-1) ?? '') }))
           .filter((item) => item.to !== item.from)
-        if (moves.length === 0) { setStatus('文件已经位于这个文件夹'); return { ok: true } }
-        const moved = []
+        if (moves.length === 0) { setStatus('文件已经位于这个文件夹', 'warn'); return { ok: true } }
+        const moved: Array<{ from: string; to: string }> = []
         for (const move of moves) {
           const response = await fetch('/api/code-workbench/file-operation', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId, operation: 'rename', path: move.from, destination: move.to }) })
-          const result = await response.json()
-          if (!response.ok || !result.ok) { setStatus(`移动失败：${result.error?.message ?? `HTTP ${response.status}`}`); break }
+          const result = await response.json() as { ok?: boolean; error?: { message?: string } }
+          if (!response.ok || !result.ok) { setStatus(`移动失败：${result.error?.message ?? `HTTP ${response.status}`}`, 'error'); break }
           moved.push(move)
         }
         if (moved.length === 0) return { ok: false, error: '移动失败' }
@@ -1991,8 +2597,8 @@ function CodePanel(props) {
         }
         const current = stateRef.current.path
         const followed = moved.find((move) => current !== null && isAtOrUnder(current, move.from))
-        if (followed) {
-          stateRef.current = { path: null, version: null, dirty: false, text: '' }
+        if (followed && current !== null) {
+          stateRef.current = { path: null, version: null, dirty: false, text: '', model: null }
           setActivePath(null)
           setDirty(false)
           await openFile(followed.to + current.slice(followed.from.length))
@@ -2000,22 +2606,22 @@ function CodePanel(props) {
         setStatus(moved.length === 1 ? '已移动' : `已移动 ${moved.length} 项`)
         return { ok: true }
       } else {
-        let operation = action
+        let operation: string = action
         let source = path
-        let destination
+        let destination: string | undefined
         if (action === 'paste') {
           if (!treeClipboard) return
           source = treeClipboard.path
-          destination = joinPath(directory, source.split(/[\\/]/).at(-1))
+          destination = joinPath(directory, source.split(/[\\/]/).at(-1) ?? '')
           operation = treeClipboard.operation === 'cut' ? 'rename' : 'copy'
           if (operation === 'rename' && destination === source) {
-            setStatus('文件已经位于这个文件夹，请选择其他目标文件夹')
+            setStatus('文件已经位于这个文件夹，请选择其他目标文件夹', 'warn')
             return
           }
           if (operation === 'copy') {
             const entries = await list(directory)
             const names = new Set(entries.map((entry) => entry.name.toLowerCase()))
-            const originalName = source.split(/[\\/]/).at(-1)
+            const originalName = source.split(/[\\/]/).at(-1) ?? ''
             let name = originalName
             for (let index = 1; names.has(name.toLowerCase()); index++) {
               const dot = treeClipboard.isDir ? -1 : originalName.lastIndexOf('.')
@@ -2034,11 +2640,11 @@ function CodePanel(props) {
           const listing = sources.length === 1 ? path : `${sources.length} 个项目（${sources.map((item) => item.split(/[\\/]/).at(-1)).join('、')}）`
           if (!await askDialog(`确定删除 ${listing}？此操作无法撤销。`)) return
           if (sources.length > 1) {
-            const done = []
+            const done: string[] = []
             for (const item of sources) {
               const response = await fetch('/api/code-workbench/file-operation', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId, operation: 'delete', path: item }) })
-              const result = await response.json()
-              if (!response.ok || !result.ok) { setStatus(`删除 ${item} 失败：${result.error?.message ?? `HTTP ${response.status}`}`); break }
+              const result = await response.json() as { ok?: boolean; error?: { message?: string } }
+              if (!response.ok || !result.ok) { setStatus(`删除 ${item} 失败：${result.error?.message ?? `HTTP ${response.status}`}`, 'error'); break }
               done.push(item)
             }
             if (done.length === 0) return { ok: false, error: '删除失败' }
@@ -2055,7 +2661,7 @@ function CodePanel(props) {
             const stillOpen = stateRef.current.path
             if (stillOpen !== null && done.some((item) => isAtOrUnder(stillOpen, item))) {
               editorRef.current?.setModel(null)
-              stateRef.current = { path: null, version: null, dirty: false, text: '' }
+              stateRef.current = { path: null, version: null, dirty: false, text: '', model: null }
               setActivePath(null)
               setDirty(false)
             }
@@ -2078,7 +2684,7 @@ function CodePanel(props) {
             // below would answer with "请先保存受影响文件的修改", which misreports
             // an unchanged name as a save problem. Committing the prefilled name
             // is simply "nothing to do": report it and close the field.
-            if (destination === path) { setStatus('名称未改变'); return { ok: true } }
+            if (destination === path) { setStatus('名称未改变', 'warn'); return { ok: true } }
             // A destination nested under the source is refused by the host too,
             // but there it is a bare rejection. Catch it here so the field can
             // explain itself and keep the typed name.
@@ -2088,9 +2694,9 @@ function CodePanel(props) {
         const affected = [...buffersRef.current.values()].filter((buffer) => isAtOrUnder(buffer.path, source))
         if (['rename', 'delete'].includes(operation) && affected.some((buffer) => buffer.dirty || buffer.saving)) throw new Error('请先保存受影响文件的修改，并等待保存完成')
         const response = await fetch('/api/code-workbench/file-operation', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId, operation, path: source, destination }) })
-        const result = await response.json()
+        const result = await response.json() as { ok?: boolean; error?: { message?: string } }
         if (!response.ok || !result.ok) throw new Error(result.error?.message ?? `HTTP ${response.status}`)
-        if (action === 'paste' && treeClipboard.operation === 'cut') setTreeClipboard(null)
+        if (action === 'paste' && treeClipboard?.operation === 'cut') setTreeClipboard(null)
         setTreeRevision((revision) => revision + 1)
         const current = stateRef.current.path
         if (operation === 'rename' || operation === 'delete') {
@@ -2100,19 +2706,19 @@ function CodePanel(props) {
             buffer.model.dispose()
           }
           setOpenPaths((paths) => operation === 'rename'
-            ? rewriteOpenPaths(paths, source, destination)
+            ? rewriteOpenPaths(paths, source, destination ?? source)
             : paths.filter((item) => !isAtOrUnder(item, source)))
         }
         if (current && isAtOrUnder(current, source)) {
           if (operation === 'rename') {
-            stateRef.current = { path: null, version: null, dirty: false, text: '' }
+            stateRef.current = { path: null, version: null, dirty: false, text: '', model: null }
             setActivePath(null)
             setDirty(false)
-            await openFile(destination + current.slice(source.length))
+            await openFile((destination ?? source) + current.slice(source.length))
           }
           else if (operation === 'delete') {
             editorRef.current?.setModel(null)
-            stateRef.current = { path: null, version: null, dirty: false, text: '' }
+            stateRef.current = { path: null, version: null, dirty: false, text: '', model: null }
             setActivePath(null)
             setDirty(false)
           }
@@ -2121,17 +2727,17 @@ function CodePanel(props) {
       }
       setStatus('操作完成')
       return { ok: true }
-    } catch (error) {
-      const message = error.message ?? String(error)
-      setStatus(`操作失败：${message}`)
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error)
+      setStatus(`操作失败：${message}`, 'error')
       // The in-tree field reads this to explain itself and stay open.
       return { ok: false, error: message }
     }
   }
 
-  const closeFile = useCallback(async (path) => {
+  const closeFile = useCallback(async (path: string): Promise<void> => {
     const buffer = buffersRef.current.get(path)
-    if (buffer?.saving) { setStatus('文件正在保存，请稍后关闭'); return }
+    if (buffer?.saving) { setStatus('文件正在保存，请稍后关闭', 'warn'); return }
     if (buffer?.dirty && !await askDialog(`关闭 ${path} 并放弃未保存的修改？取消后可先按 Ctrl+S 保存。`)) return
     ++openRequestRef.current
     const remaining = openPaths.filter((item) => item !== path)
@@ -2139,27 +2745,27 @@ function CodePanel(props) {
     buffersRef.current.delete(path)
     if (activePath !== path) { buffer?.model.dispose(); return }
     editorRef.current?.setModel(null)
-    stateRef.current = { path: null, version: null, dirty: false, text: '' }
+    stateRef.current = { path: null, version: null, dirty: false, text: '', model: null }
     buffer?.model.dispose()
     const next = remaining.at(-1)
     if (next) await openFile(next)
     else {
       editorRef.current?.setModel(null)
-      stateRef.current = { path: null, version: null, dirty: false, text: '' }
+      stateRef.current = { path: null, version: null, dirty: false, text: '', model: null }
       setActivePath(null)
       setDirty(false)
     }
   }, [activePath, openFile, openPaths])
 
-  const copyPath = useCallback(async (path, relative = false) => {
+  const copyPath = useCallback(async (path: string, relative = false): Promise<void> => {
     const value = relative && cwd ? relativeToCwd(path, cwd) : path
     try {
       await globalThis.navigator?.clipboard?.writeText?.(value)
       setStatus(relative ? '已复制相对路径' : '已复制路径')
-    } catch { setStatus('复制路径失败') }
+    } catch { setStatus('复制路径失败', 'error') }
   }, [cwd])
 
-  const closeTabSet = useCallback(async (paths) => {
+  const closeTabSet = useCallback(async (paths: string[]): Promise<void> => {
     const selected = openPaths.filter((path) => paths.includes(path))
     if (!selected.length) return
     const dirtyPaths = selected.filter((path) => buffersRef.current.get(path)?.dirty)
@@ -2172,10 +2778,10 @@ function CodePanel(props) {
       buffer?.model.dispose()
     }
     setOpenPaths(remaining)
-    if (selected.includes(activePath)) {
+    if (activePath !== null && selected.includes(activePath)) {
       const next = remaining.at(-1)
       editorRef.current?.setModel(null)
-      stateRef.current = { path: null, version: null, dirty: false, text: '' }
+      stateRef.current = { path: null, version: null, dirty: false, text: '', model: null }
       setActivePath(null)
       setDirty(false)
       if (next) await openFile(next)
@@ -2190,24 +2796,26 @@ function CodePanel(props) {
   }, [addToChat, openFile, save])
 
   // ---- render ----------------------------------------------------------
-  const header = {
+  const header: React.CSSProperties = {
     display: 'flex', alignItems: 'center', gap: '8px', padding: '10px 12px',
     borderBottom: `1px solid ${T.border}`, fontSize: '12px', color: T.fgMuted, flex: '0 0 auto',
   }
-  const button = {
+  const button: React.CSSProperties = {
     padding: '6px 10px', borderRadius: '8px', border: `1px solid ${T.border}`,
     background: T.bgRaised, color: T.fg, cursor: 'pointer', fontSize: '12px',
   }
 
   // ---- search panel (left column, mode = search) ------------------------
-  const searchRows = []
-  if (result?.matches) {
-    for (const [index, hit] of result.matches.entries()) {
+  const searchRows: React.ReactNode[] = []
+  const searchReport = result !== null && 'matches' in result ? result : null
+  const searchError = result !== null && 'error' in result ? result.error : null
+  if (searchReport?.matches) {
+    for (const [index, hit] of searchReport.matches.entries()) {
       const rel = relativeToCwd(hit.path, cwd)
       searchRows.push(h('div', {
         key: `${hit.path}#${hit.line}#${index}`,
         style: { ...rowStyle(0), flexDirection: 'column', alignItems: 'flex-start', gap: '1px', padding: '4px 8px' },
-        onClick: () => openFile(hit.path, { line: hit.line, column: hit.column, length: hit.length }),
+        onClick: () => { void openFile(hit.path, { line: hit.line, column: hit.column, length: hit.length }) },
         title: hit.path,
       },
         h('span', { style: { color: T.fgMuted, fontSize: '10.5px' } }, `${rel}:${hit.line}`),
@@ -2220,8 +2828,8 @@ function CodePanel(props) {
       h('input', {
         value: query,
         placeholder: '在代码库中搜索… (Enter)',
-        onChange: (e) => setQuery(e.target.value),
-        onKeyDown: (e) => { if (e.key === 'Enter') runSearch() },
+        onChange: (e: React.ChangeEvent<HTMLInputElement>) => setQuery(e.target.value),
+        onKeyDown: (e: React.KeyboardEvent) => { if (e.key === 'Enter') void runSearch() },
         style: {
           flex: '1 1 auto', minWidth: 0, padding: '3px 6px', fontSize: '11.5px',
           borderRadius: '4px', border: `1px solid ${T.border}`, background: T.bg, color: T.fg, outline: 'none',
@@ -2230,21 +2838,23 @@ function CodePanel(props) {
     ),
     h('div', { style: { padding: '4px 8px', fontSize: '10.5px', color: T.fgMuted, flex: '0 0 auto' } },
       searching ? '搜索中…'
-        : result?.error ? h('span', { style: { color: T.danger } }, result.error)
-          : result?.matches
-            ? `${result.matches.length} 处${result.truncated ? '+' : ''} · ${result.filesScanned} 文件 · ${result.elapsedMs}ms`
+        : searchError ? h('span', { style: { color: T.danger } }, searchError)
+          : searchReport?.matches
+            ? `${searchReport.matches.length} 处${searchReport.truncated ? '+' : ''} · ${searchReport.filesScanned} 文件 · ${searchReport.elapsedMs}ms`
             : '输入后回车搜索'),
     h('div', { style: { overflow: 'auto', minHeight: 0, flex: '1 1 auto' } }, searchRows),
   )
 
   // ---- history panel (left column, mode = history) ---------------------
-  const tinyButton = {
+  const tinyButton: React.CSSProperties = {
     padding: '1px 8px', borderRadius: '4px', border: `1px solid ${T.border}`,
     background: T.bg, color: T.fg, cursor: 'pointer', fontSize: '10.5px',
   }
-  const historyRows = []
-  if (history?.entries) {
-    for (const entry of history.entries) {
+  const historyRows: React.ReactNode[] = []
+  const historyReport = history !== null && 'entries' in history ? history : null
+  const historyError = history !== null && 'error' in history ? history.error : null
+  if (historyReport?.entries) {
+    for (const entry of historyReport.entries) {
       historyRows.push(h('div', {
         key: entry.id,
         style: { ...rowStyle(0), flexDirection: 'column', alignItems: 'flex-start', gap: '2px', padding: '5px 8px' },
@@ -2256,19 +2866,19 @@ function CodePanel(props) {
         h('button', {
           style: { ...tinyButton, opacity: entry.rollbackable ? 1 : 0.4 },
           disabled: !entry.rollbackable,
-          onClick: () => rollback(entry.id),
+          onClick: () => { void rollback(entry.id) },
         }, '回滚到此保存前'),
       ))
     }
   }
   const historyPanel = h('div', { style: { display: 'flex', flexDirection: 'column', flex: '1 1 auto', minHeight: 0 } },
     h('div', { style: { padding: '6px 8px', borderBottom: `1px solid ${T.border}`, display: 'flex', gap: '4px', flex: '0 0 auto' } },
-      h('button', { style: tinyButton, onClick: loadHistory }, '刷新'),
+      h('button', { style: tinyButton, onClick: () => { void loadHistory() } }, '刷新'),
       h('span', { style: { color: T.fgMuted, fontSize: '10.5px', alignSelf: 'center' } }, '每次保存都是一个检查点'),
     ),
     h('div', { style: { overflow: 'auto', minHeight: 0, flex: '1 1 auto' } },
-      history?.error ? h('div', { style: { padding: '8px', color: T.danger, fontSize: '11px' } }, history.error)
-        : history?.entries
+      historyError ? h('div', { style: { padding: '8px', color: T.danger, fontSize: '11px' } }, historyError)
+        : historyReport?.entries
           ? (historyRows.length > 0
               ? historyRows
               : h('div', { style: { padding: '8px', color: T.fgMuted, fontSize: '11px' } }, '还没有保存记录'))
@@ -2276,7 +2886,7 @@ function CodePanel(props) {
   )
 
   const relativePath = typeof activePath === 'string' ? relativeToCwd(activePath, cwd) : activePath
-  const showTabMenu = (event, path) => {
+  const showTabMenu = (event: React.MouseEvent, path: string) => {
     event.preventDefault()
     event.stopPropagation()
     setTabMenu({ path, x: Math.max(0, Math.min(event.clientX, window.innerWidth - 230)), y: Math.max(0, Math.min(event.clientY, window.innerHeight - 220)) })
@@ -2288,7 +2898,7 @@ function CodePanel(props) {
    * strip: a drop can arrive after a close has already shifted the indices, and
    * a stale pair would silently move the wrong tab.
    */
-  const moveTab = (from, to) => {
+  const moveTab = (from: string, to: string) => {
     setOpenPaths((paths) => {
       const fromIndex = paths.indexOf(from)
       const toIndex = paths.indexOf(to)
@@ -2305,16 +2915,19 @@ function CodePanel(props) {
     const side = tabDrop?.path === path ? tabDrop.side : null
     return h('div', {
       key: path,
+      // Only the active tab carries the ref: the effect above is about the tab
+      // being edited, and a ref on every tab would just be churn.
+      ref: path === activePath ? activeTabRef : undefined,
       className: `code-workbench-tab${path === activePath ? ' active' : ''}${side === null ? '' : ` code-workbench-tab-drop-${side}`}`,
-      onClick: () => openFile(path),
-      onContextMenu: (event) => showTabMenu(event, path),
+      onClick: () => { void openFile(path) },
+      onContextMenu: (event: React.MouseEvent) => showTabMenu(event, path),
       // A tab is a drag source for the same two gestures a tree row offers: it
       // carries a workspace path to the composer, and it reorders the strip.
       // The private flavor is what keeps both disjoint from DSH's own file-drop
       // pipeline, so the composer's interceptor claims the drop and nothing else
       // does.
       draggable: true,
-      onDragStart: (event) => {
+      onDragStart: (event: React.DragEvent) => {
         tabDragRef.current = path
         event.dataTransfer.effectAllowed = 'copyMove'
         event.dataTransfer.setData(TREE_DRAG_MIME, treeDragPayload(path, cwd, false))
@@ -2322,7 +2935,7 @@ function CodePanel(props) {
         // interceptor ever declined the drop, the text is still the path.
         event.dataTransfer.setData('text/plain', relativeToCwd(path, cwd) || path)
       },
-      onDragOver: (event) => {
+      onDragOver: (event: React.DragEvent) => {
         const from = tabDragRef.current
         // A tree row's drag carries the same flavor but never sets this ref, so
         // it passes over the strip without reordering anything.
@@ -2332,16 +2945,16 @@ function CodePanel(props) {
         event.dataTransfer.dropEffect = 'move'
         // Which edge the marker goes on is decided by direction: a tab dragged
         // rightwards lands after the one it is over, and the other way round.
-        const nextSide = openPaths.indexOf(from) < openPaths.indexOf(path) ? 'after' : 'before'
+        const nextSide: 'before' | 'after' = openPaths.indexOf(from) < openPaths.indexOf(path) ? 'after' : 'before'
         if (tabDrop?.path !== path || tabDrop.side !== nextSide) setTabDrop({ path, side: nextSide })
       },
-      onDragLeave: (event) => {
+      onDragLeave: (event: React.DragEvent) => {
         // Moving onto the tab's own name or close button fires `dragleave` too;
         // only a departure from the whole tab clears its marker.
-        if (typeof event?.currentTarget?.contains === 'function' && event.currentTarget.contains(event.relatedTarget)) return
+        if (typeof event?.currentTarget?.contains === 'function' && event.currentTarget.contains(event.relatedTarget as Node | null)) return
         if (tabDrop?.path === path) setTabDrop(null)
       },
-      onDrop: (event) => {
+      onDrop: (event: React.DragEvent) => {
         const from = tabDragRef.current
         if (from === null || from === path) return
         event.preventDefault()
@@ -2356,13 +2969,13 @@ function CodePanel(props) {
       },
     },
       h('span', { title: path }, `${name}${tabDirty ? ' ●' : ''}`),
-      h('button', { title: `关闭 ${name}`, onClick: (event) => { event.stopPropagation(); closeFile(path) } }, '×'))
+      h('button', { title: `关闭 ${name}`, onClick: (event: React.MouseEvent) => { event.stopPropagation(); void closeFile(path) } }, '×'))
   })
   return h('div', { className: 'code-workbench', onContextMenuCapture: () => setTabMenu(null), style: { display: 'flex', flexDirection: 'column', height: '100%', minWidth: 0, background: T.bg, color: T.fg } },
-    dialog ? h('div', { className: 'code-workbench-dialog-backdrop', onKeyDown: (event) => { if (event.key === 'Escape') finishDialog(false) } },
-      h('form', { className: 'code-workbench-dialog', role: 'dialog', 'aria-modal': true, 'aria-label': dialog.title, onSubmit: (event) => { event.preventDefault(); finishDialog(true) } },
+    dialog ? h('div', { className: 'code-workbench-dialog-backdrop', onKeyDown: (event: React.KeyboardEvent) => { if (event.key === 'Escape') finishDialog(false) } },
+      h('form', { className: 'code-workbench-dialog', role: 'dialog', 'aria-modal': true, 'aria-label': dialog.title, onSubmit: (event: React.FormEvent) => { event.preventDefault(); finishDialog(true) } },
         h('div', { className: 'code-workbench-dialog-title' }, dialog.title),
-        dialog.input ? h('input', { autoFocus: true, value: dialogValue, 'aria-label': '名称', onChange: (event) => setDialogValue(event.target.value) }) : null,
+        dialog.input ? h('input', { autoFocus: true, value: dialogValue, 'aria-label': '名称', onChange: (event: React.ChangeEvent<HTMLInputElement>) => setDialogValue(event.target.value) }) : null,
         h('div', { className: 'code-workbench-dialog-actions' },
           h('button', { type: 'button', style: button, onClick: () => finishDialog(false) }, '取消'),
           h('button', { type: 'submit', autoFocus: !dialog.input, style: button, disabled: dialog.input && !dialogValue.trim() }, '确定')))) : null,
@@ -2379,7 +2992,7 @@ function CodePanel(props) {
         disabled: !hasSelection,
         title: '把选中代码添加到主对话输入框（Ctrl+L）',
       }, '加到对话'),
-      h('button', { style: button, onClick: () => save(), disabled: !dirty }, '保存 (Ctrl+S)'),
+      h('button', { style: button, onClick: () => { void save() }, disabled: !dirty }, '保存 (Ctrl+S)'),
     ),
     release === null && updateNote === '' ? null : h('div', {
       className: 'code-workbench-update',
@@ -2397,14 +3010,14 @@ function CodePanel(props) {
         type: 'button',
         style: { ...button, opacity: updateBusy ? 0.6 : 1, cursor: updateBusy ? 'default' : 'pointer' },
         disabled: updateBusy,
-        onClick: runUpdate,
+        onClick: () => { void runUpdate() },
       }, updateBusy ? '更新中…' : '升级'),
     ),
     h('div', { className: 'code-workbench-body', style: { display: 'flex', flex: '1 1 auto', minHeight: 0 } },
       h('div', { className: 'code-workbench-activity', role: 'toolbar', 'aria-label': '工作区视图' },
-        [['tree', '文件', 'files'], ['search', '搜索', 'search'], ['history', '历史', 'history']].map(([mode, label, icon]) => h('button', {
+        ([['tree', '文件', 'files'], ['search', '搜索', 'search'], ['history', '历史', 'history']] as Array<['tree' | 'search' | 'history', string, keyof typeof ICON_PATHS]>).map(([mode, label, icon]) => h('button', {
           key: mode, title: label, 'aria-label': label, 'aria-pressed': navigationOpen && leftMode === mode,
-          onClick: () => { setNavigationOpen(leftMode === mode ? !navigationOpen : true); setLeftMode(mode); if (mode === 'history') loadHistory() },
+          onClick: () => { setNavigationOpen(leftMode === mode ? !navigationOpen : true); setLeftMode(mode); if (mode === 'history') void loadHistory() },
         }, workbenchIcon(icon)))),
       h('div', { className: 'code-workbench-navigation', style: { width: 'clamp(150px, 28%, 210px)', flex: '0 0 auto', borderRight: `1px solid ${T.border}`, background: T.bgRaised, display: navigationOpen ? 'flex' : 'none', flexDirection: 'column', minHeight: 0 } },
         h('div', { className: 'code-workbench-navigation-title' }, leftMode === 'tree' ? '文件' : leftMode === 'search' ? '搜索' : '历史'),
@@ -2419,20 +3032,20 @@ function CodePanel(props) {
             // tree's click handler cannot see it.
             : h('div', { className: 'code-workbench-tree-column', style: { display: 'flex', flexDirection: 'column', flex: '1 1 auto', minHeight: 0 } },
               cwd
-                ? h(FileTree, { list, cwd, activePath, onOpen: openFile, joinPath, onAction: treeAction, refreshRevision: treeRevision, clipboard: treeClipboard, closeMenuSignal: tabMenu?.path ?? null, onMenuOpen: () => setTabMenu(null) })
+                ? h(FileTree, { list, cwd, activePath, onOpen: (path: string) => { void openFile(path) }, joinPath, onAction: treeAction, refreshRevision: treeRevision, clipboard: treeClipboard, closeMenuSignal: tabMenu?.path ?? null, onMenuOpen: () => setTabMenu(null) })
                 : h('div', { style: { padding: '12px', color: T.fgMuted, fontSize: '12px' } }, '会话没有工作区目录')),
       ),
       h('div', { style: { display: 'flex', flexDirection: 'column', flex: '1 1 auto', minHeight: 0, minWidth: 0 } },
-        h('div', { className: 'code-workbench-tabs', onClick: () => tabMenu && setTabMenu(null) }, tabs.length ? tabs : h('span', { className: 'code-workbench-no-tabs' }, '未打开文件')),
-        tabMenu ? h('div', { role: 'menu', className: 'code-workbench-context-menu', style: { left: tabMenu.x, top: tabMenu.y }, onClick: (event) => event.stopPropagation() }, [
-          ['close', '关闭', () => closeFile(tabMenu.path)],
-          ['closeOthers', '关闭其他', () => closeTabSet(openPaths.filter((path) => path !== tabMenu.path))],
-          ['closeRight', '关闭右侧标签页', () => closeTabSet(openPaths.slice(openPaths.indexOf(tabMenu.path) + 1))],
-          ['closeSaved', '关闭已保存', () => closeTabSet(openPaths.filter((path) => !buffersRef.current.get(path)?.dirty))],
-          ['closeAll', '全部关闭', () => closeTabSet(openPaths)],
-          ['copyPath', '复制路径', () => copyPath(tabMenu.path)],
-          ['copyRelativePath', '复制相对路径', () => copyPath(tabMenu.path, true)],
-        ].map(([action, label, handler]) => h('button', { key: action, type: 'button', role: 'menuitem', onClick: () => { setTabMenu(null); handler() } }, label))) : null,
+        h('div', { className: 'code-workbench-tabs', onClick: () => { if (tabMenu) setTabMenu(null) } }, tabs.length ? tabs : h('span', { className: 'code-workbench-no-tabs' }, '未打开文件')),
+        tabMenu ? h('div', { role: 'menu', className: 'code-workbench-context-menu', style: { left: tabMenu.x, top: tabMenu.y }, onClick: (event: React.MouseEvent) => event.stopPropagation() }, ([
+          ['close', '关闭', () => { void closeFile(tabMenu.path) }],
+          ['closeOthers', '关闭其他', () => { void closeTabSet(openPaths.filter((path) => path !== tabMenu.path)) }],
+          ['closeRight', '关闭右侧标签页', () => { void closeTabSet(openPaths.slice(openPaths.indexOf(tabMenu.path) + 1)) }],
+          ['closeSaved', '关闭已保存', () => { void closeTabSet(openPaths.filter((path) => !buffersRef.current.get(path)?.dirty)) }],
+          ['closeAll', '全部关闭', () => { void closeTabSet(openPaths) }],
+          ['copyPath', '复制路径', () => { void copyPath(tabMenu.path) }],
+          ['copyRelativePath', '复制相对路径', () => { void copyPath(tabMenu.path, true) }],
+        ] as Array<[string, string, () => void]>).map(([action, label, handler]) => h('button', { key: action, type: 'button', role: 'menuitem', onClick: () => { setTabMenu(null); handler() } }, label))) : null,
         h('div', { className: 'code-workbench-breadcrumb', title: relativePath ?? '' },
           (relativePath ?? '代码工作台').split(/[\\/]/).filter(Boolean).map((part, index) => h('span', { key: `${part}-${index}` }, index > 0 ? ` › ${part}` : part))),
         h('div', { style: { position: 'relative', display: 'flex', flex: '1 1 auto', minHeight: 0, minWidth: 0 } },
@@ -2442,11 +3055,22 @@ function CodePanel(props) {
           h('div', null, '从工作区选择一个文件'),
           h('div', { style: { fontSize: '11px', lineHeight: 2 } }, 'Ctrl+L 加到对话', h('br'), '输入代码获取 AI 建议，Tab 接受'),
         ) : null,
+        // Monaco is five megabytes of JavaScript and its first parse is not
+        // instant. Until it lands the editor host is an empty rectangle, and
+        // saying so is the difference between "starting" and "broken".
+        monaco === null ? h('div', { className: 'code-workbench-editor-boot' },
+          h('span', { className: 'code-workbench-spinner', 'aria-hidden': true }),
+          h('span', null, '正在启动编辑器…'),
+        ) : null,
         ),
       ),
     ),
     h('div', { style: { ...header, borderTop: `1px solid ${T.border}`, borderBottom: 'none', flexWrap: 'wrap', fontSize: '11px', padding: '6px 12px' } },
-      h('span', { style: { flex: '1 1 auto', minWidth: 0, overflowWrap: 'anywhere' } }, status),
+      // The dot carries the severity; the sentence is unchanged, so a failure
+      // is visible without reading the line at all.
+      h('span', { className: 'code-workbench-status', style: { flex: '1 1 auto', minWidth: 0, overflowWrap: 'anywhere' } },
+        h('span', { className: 'code-workbench-status-dot', 'data-level': statusLevel, 'aria-hidden': true, style: { background: STATUS_DOT[statusLevel] } }),
+        h('span', null, status)),
       h('span', { role: 'status', title: completionStatus }, completionStatus),
     ),
   )
@@ -2458,24 +3082,24 @@ function CodePanel(props) {
 
 const inject = ['slots', 'sidebarRightTabs', 'sidebarRight', 'remote.workspaceFiles', 'remote.session', 'shortcuts', 'sessions', 'inputTriggers', 'configForms']
 
-function CodeWorkbenchSettings({ form }) {
+function CodeWorkbenchSettings({ form }: DSH.SettingsItemProps): React.ReactNode {
   const snapshot = usePluginSettings(form)
-  const value = snapshot.value ?? defaultSettings
+  const value: PluginSettings = snapshot.value ?? defaultSettings
   const [autoSave, setAutoSave] = useState(value.autoSave === true)
   const [completionEnabled, setCompletionEnabled] = useState(value.completionEnabled !== false)
-  const [baseUrl, setBaseUrl] = useState(value.completionBaseUrl ?? defaultSettings.completionBaseUrl)
-  const [apiModel, setApiModel] = useState(value.completionApiModel ?? defaultSettings.completionApiModel)
+  const [baseUrl, setBaseUrl] = useState(value.completionBaseUrl ?? defaultSettings.completionBaseUrl ?? '')
+  const [apiModel, setApiModel] = useState(value.completionApiModel ?? defaultSettings.completionApiModel ?? '')
   const [apiKey, setApiKey] = useState('')
   const [clearApiKey, setClearApiKey] = useState(false)
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState('')
-  const [status, setStatus] = useState(null)
+  const [status, setStatus] = useState<CompletionStatus | null>(null)
   const [statusTick, setStatusTick] = useState(0)
   useEffect(() => {
     setAutoSave(value.autoSave === true)
     setCompletionEnabled(value.completionEnabled !== false)
-    setBaseUrl(value.completionBaseUrl ?? defaultSettings.completionBaseUrl)
-    setApiModel(value.completionApiModel ?? defaultSettings.completionApiModel)
+    setBaseUrl(value.completionBaseUrl ?? defaultSettings.completionBaseUrl ?? '')
+    setApiModel(value.completionApiModel ?? defaultSettings.completionApiModel ?? '')
   }, [value.autoSave, value.completionEnabled, value.completionBaseUrl, value.completionApiModel])
   // The credential lives Host-side only, so the editor cannot tell which source
   // a completion would use — it has to ask. Showing the Host's answer is the
@@ -2484,18 +3108,18 @@ function CodeWorkbenchSettings({ form }) {
     let live = true
     fetch(COMPLETION_STATUS_PATH, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
       .then((response) => (response.ok ? response.json() : null))
-      .then((payload) => { if (live) setStatus(payload?.ok === true ? payload : null) })
+      .then((payload: (CompletionStatus & { ok?: boolean }) | null) => { if (live) setStatus(payload?.ok === true ? payload : null) })
       .catch(() => { if (live) setStatus(null) })
     return () => { live = false }
   }, [snapshot.revision, statusTick])
-  const persist = async (operation) => {
+  const persist = async (operation: () => Promise<boolean>): Promise<void> => {
     if (busy) return
     setBusy(true)
     setNotice('')
     try {
       if (!await operation()) throw new Error('设置未保存，请检查配置权限或重试')
       setNotice('设置已保存')
-    } catch (error) { setNotice(error.message ?? String(error)) }
+    } catch (error: unknown) { setNotice(error instanceof Error ? error.message : String(error)) }
     finally { setBusy(false) }
   }
   const toggleAutoSave = () => {
@@ -2504,12 +3128,12 @@ function CodeWorkbenchSettings({ form }) {
     const previous = autoSave
     const next = !previous
     setAutoSave(next)
-    persist(async () => {
+    void persist(async () => {
       try {
         const saved = await form.set('autoSave', next)
         if (!saved) setAutoSave(previous)
         return saved
-      } catch (error) {
+      } catch (error: unknown) {
         setAutoSave(previous)
         throw error
       }
@@ -2521,17 +3145,17 @@ function CodeWorkbenchSettings({ form }) {
     const previous = completionEnabled
     const next = !previous
     setCompletionEnabled(next)
-    persist(async () => {
+    void persist(async () => {
       try {
         const saved = await form.set('completionEnabled', next)
         if (!saved) setCompletionEnabled(previous)
         if (saved) completionCache.clear()
         return saved
-      } catch (error) { setCompletionEnabled(previous); throw error }
+      } catch (error: unknown) { setCompletionEnabled(previous); throw error }
     })
   }
   const disabled = busy
-  const input = { width: '100%', boxSizing: 'border-box', padding: '7px 9px', borderRadius: '7px', border: `1px solid ${T.border}`, background: T.bg, color: T.fg, font: 'inherit' }
+  const input: React.CSSProperties = { width: '100%', boxSizing: 'border-box', padding: '7px 9px', borderRadius: '7px', border: `1px solid ${T.border}`, background: T.bg, color: T.fg, font: 'inherit' }
   return h('section', { className: 'code-workbench-settings', style: { color: T.fg, background: T.bgRaised, padding: '14px', borderBottom: `1px solid ${T.border}`, flexShrink: 0 } },
     h('div', { style: { fontSize: '14px', fontWeight: 500, marginBottom: '12px' } }, '代码工作台 · 插件设置'),
     h('div', { className: 'code-workbench-setting-row' },
@@ -2548,17 +3172,17 @@ function CodeWorkbenchSettings({ form }) {
         h('span', { className: 'code-workbench-switch-thumb' }))),
     h('div', { style: { display: 'grid', gap: '12px', marginTop: '12px' } },
       h('p', { style: { color: T.fgMuted, fontSize: '12px', margin: 0 } }, '补全走 FIM（fill-in-the-middle）接口：把光标前后的代码直接交给服务端，由它补出中间部分，不需要提示词。'),
-      h('label', null, 'API Base URL', h('input', { style: input, value: baseUrl, placeholder: 'https://api.deepseek.com/beta', disabled, onChange: (event) => setBaseUrl(event.target.value) })),
-      h('label', null, '补全模型 ID', h('input', { style: input, value: apiModel, placeholder: 'deepseek-flash', disabled, onChange: (event) => setApiModel(event.target.value) })),
-      h('label', null, 'API Key', h('input', { type: 'password', autoComplete: 'new-password', style: input, value: apiKey, placeholder: '留空则自动取用 DSH 凭据库或登录账号', disabled, onChange: (event) => { setApiKey(event.target.value); setClearApiKey(false) } })),
-      h('label', null, h('input', { type: 'checkbox', checked: clearApiKey, disabled, onChange: (event) => { setClearApiKey(event.target.checked); setApiKey('') } }), '清除已保存的 API Key'),
+      h('label', null, 'API Base URL', h('input', { style: input, value: baseUrl, placeholder: 'https://api.deepseek.com/beta', disabled, onChange: (event: React.ChangeEvent<HTMLInputElement>) => setBaseUrl(event.target.value) })),
+      h('label', null, '补全模型 ID', h('input', { style: input, value: apiModel, placeholder: 'deepseek-flash', disabled, onChange: (event: React.ChangeEvent<HTMLInputElement>) => setApiModel(event.target.value) })),
+      h('label', null, 'API Key', h('input', { type: 'password', autoComplete: 'new-password', style: input, value: apiKey, placeholder: '留空则自动取用 DSH 凭据库或登录账号', disabled, onChange: (event: React.ChangeEvent<HTMLInputElement>) => { setApiKey(event.target.value); setClearApiKey(false) } })),
+      h('label', null, h('input', { type: 'checkbox', checked: clearApiKey, disabled, onChange: (event: React.ChangeEvent<HTMLInputElement>) => { setClearApiKey(event.target.checked); setApiKey('') } }), '清除已保存的 API Key'),
       h('p', { style: { color: T.fgMuted, fontSize: '12px', margin: 0 } }, '留空时依次尝试：DSH 凭据库的 DEEPSEEK_API_KEY → 已登录的 DSH 账号。密钥由 Host 保存和使用，不回显到设置页。'),
       h('div', { style: { display: 'grid', gap: '4px', paddingTop: '6px', borderTop: `1px solid ${T.border}` } },
         h('div', { className: 'code-workbench-setting-title' }, '当前补全链路'),
         h('dl', { style: { margin: 0, fontSize: '12px', color: T.fgMuted, display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '2px 10px' } },
           h('dt', null, '接口'), h('dd', { style: { margin: 0, wordBreak: 'break-all' } }, status?.addressValid === false ? '地址无效' : (status?.endpoint || '读取中…')),
           h('dt', null, '模型'), h('dd', { style: { margin: 0 } }, status?.model || '—'),
-          h('dt', null, '凭据'), h('dd', { style: { margin: 0, color: status !== null && status.source === 'none' ? T.danger : T.fg } }, status === null ? '读取中…' : (CREDENTIAL_SOURCE_LABELS[status.source] ?? status.source)))),
+          h('dt', null, '凭据'), h('dd', { style: { margin: 0, color: status !== null && status.source === 'none' ? T.danger : T.fg } }, status === null ? '读取中…' : (CREDENTIAL_SOURCE_LABELS[status.source ?? ''] ?? status.source)))),
       h('p', { style: { color: T.fgMuted, fontSize: '12px', margin: 0 } }, '凭据缺失或接口不可用时，Tab 补全会静默停用，不弹错误提示。')),
     h('button', { disabled, onClick: () => {
       if (form === undefined || snapshot.status === 'unavailable') { setNotice('设置服务尚未同步，请重新打开设置页后重试'); return }
@@ -2566,9 +3190,9 @@ function CodeWorkbenchSettings({ form }) {
         const endpoint = new URL(baseUrl.trim())
         if (!['http:', 'https:'].includes(endpoint.protocol) || endpoint.username || endpoint.password || !apiModel.trim()) throw new Error()
       } catch { setNotice('请填写有效的 HTTP(S) API 地址和补全模型 ID'); return }
-      const ops = Object.entries({ completionEnabled, completionBaseUrl: baseUrl.trim(), completionApiModel: apiModel.trim() }).map(([field, setting]) => ({ op: 'set', path: [field], value: setting }))
+      const ops: DSH.ConfigOperation[] = Object.entries({ completionEnabled, completionBaseUrl: baseUrl.trim(), completionApiModel: apiModel.trim() }).map(([field, setting]) => ({ op: 'set', path: [field], value: setting }))
       if (clearApiKey || apiKey.trim()) ops.push({ op: 'set', path: ['completionApiKey'], value: clearApiKey ? '' : apiKey.trim() })
-      persist(async () => {
+      void persist(async () => {
         const saved = await form.mutate(ops, snapshot.revision)
         if (saved) { setApiKey(''); setClearApiKey(false); completionCache.clear(); setStatusTick((tick) => tick + 1) }
         return saved
@@ -2586,13 +3210,13 @@ function CodeWorkbenchSettings({ form }) {
  * cannot run is not news: the row stays collapsed to its label, the same quiet
  * fallback the completion-status read uses.
  */
-function CodeWorkbenchAbout() {
-  const [about, setAbout] = useState(null) // { version, repository } | false | null
+function CodeWorkbenchAbout(): React.ReactNode {
+  const [about, setAbout] = useState<AboutInfo | false | null>(null)
   useEffect(() => {
     let live = true
     fetch(ABOUT_PATH, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
       .then((response) => (response.ok ? response.json() : null))
-      .then((payload) => { if (live) setAbout(payload?.ok === true ? payload : false) })
+      .then((payload: (AboutInfo & { ok?: boolean }) | null) => { if (live) setAbout(payload?.ok === true ? payload : false) })
       .catch(() => { if (live) setAbout(false) })
     return () => { live = false }
   }, [])
@@ -2609,7 +3233,7 @@ function CodeWorkbenchAbout() {
   )
 }
 
-function CodeWorkbenchSection({ renderSlot }) {
+function CodeWorkbenchSection({ renderSlot }: DSH.SettingsSectionProps): React.ReactNode {
   return h('div', { style: { display: 'flex', flexDirection: 'column', minHeight: 0 } },
     h('h2', { style: { margin: '0 0 18px', fontSize: '20px', fontWeight: 500, color: T.fg } }, '代码工作台'),
     renderSlot('settings.code-workbench.item', {}),
@@ -2622,8 +3246,8 @@ function CodeWorkbenchSection({ renderSlot }) {
  * (`registerFixed`) so they show up in the shell's shortcut settings with the
  * rest of DSH's keyboard map. They are editor-reserved and not rebindable.
  */
-function registerShortcuts(ctx) {
-  const fixed = [
+function registerShortcuts(ctx: DSH.ClientContext): void {
+  const fixed: DSH.ShortcutCommand[] = [
     {
       id: 'code-workbench.save',
       label: () => '保存文件（代码工作台）',
@@ -2651,18 +3275,18 @@ function registerShortcuts(ctx) {
   }
 }
 
-function apply(ctx) {
+function apply(ctx: DSH.ClientContext): void {
   registerShortcuts(ctx)
   const settingsForm = ctx.configForms?.get(SETTINGS_NS)
   if (ctx.configForms) {
-    ctx.effect(() => ctx.slots.inject('settings.section', () => ctx.slots.register({
+    ctx.effect(() => ctx.slots.inject('settings.section', () => ctx.slots.register<DSH.SettingsSectionProps>({
       name: 'settings.section',
       id: 'code-workbench',
       order: 25,
       label: () => '代码工作台',
       children: { 'settings.code-workbench.item': { kind: 'list', scope: 'root' } },
     }, CodeWorkbenchSection)), 'code-workbench: settings section')
-    ctx.effect(() => ctx.slots.inject('settings.code-workbench.item', () => ctx.slots.register({
+    ctx.effect(() => ctx.slots.inject('settings.code-workbench.item', () => ctx.slots.register<DSH.SettingsItemProps>({
       name: 'settings.code-workbench.item',
       id: SETTINGS_NS,
       order: 0,
@@ -2670,35 +3294,36 @@ function apply(ctx) {
     }, CodeWorkbenchSettings)), 'code-workbench: settings content')
   }
   ctx.effect(() => ctx.slots.inject('conversation.chat.node', () => {
-    const disposers = []
-    const entries = typeof ctx.slots.entries === 'function'
+    const disposers: DSH.Disposer[] = []
+    const entries: DSH.SlotEntry[] = typeof ctx.slots.entries === 'function'
       ? ctx.slots.entries('conversation.chat.node')
       : []
     for (const key of ['user', 'steering']) {
       const options = { name: 'conversation.chat.node', key, priority: -10 }
       const original = entries.find((entry) => entry.options.key === key && (entry.options.priority ?? 0) >= 0)
-      const Original = original?.component
-      disposers.push(ctx.slots.register(options, (props) => {
+      const Original = original?.component as StoredComponent | undefined
+      disposers.push(ctx.slots.register<ChatNodeProps>(options, (props) => {
         const content = props.node?.data?.content
         const hasOriginal = typeof Original === 'function' || (typeof Original === 'object' && Original !== null && Original.$$typeof !== undefined)
+        const RenderOriginal = Original as React.ComponentType<Record<string, unknown>> | undefined
         if (!Array.isArray(content)) {
           return h('div', { className: 'code-workbench-chat-fallback' },
-            hasOriginal ? h(Original, props) : typeof content === 'string' ? content : '',
+            hasOriginal && RenderOriginal ? h(RenderOriginal, props) : typeof content === 'string' ? content : '',
           )
         }
-        const snippets = []
-        const compactContent = content.flatMap((part) => {
+        const snippets: Array<{ anchor: string; code: string }> = []
+        const compactContent = (content as Array<{ type?: string; text?: string }>).flatMap((part) => {
           if (part.type !== 'text') return [part]
-          return splitSnippets(part.text).flatMap((piece) => {
+          return splitSnippets(part.text ?? '').flatMap((piece) => {
             if (piece.anchor === undefined) return [{ ...part, text: piece.text }]
-            snippets.push(piece)
+            snippets.push({ anchor: piece.anchor, code: piece.code })
             return []
           })
         })
-        const renderMessage = (messageContent) => hasOriginal
-          ? h(Original, { ...props, node: { ...props.node, data: { ...props.node.data, content: messageContent } } })
+        const renderMessage = (messageContent: Array<{ type?: string; text?: string }>) => hasOriginal && RenderOriginal
+          ? h(RenderOriginal, { ...props, node: { ...props.node, data: { ...props.node?.data, content: messageContent } } })
           : h('div', { className: 'code-workbench-chat-fallback' }, messageContent.map((part) => part.type === 'text' ? part.text : '').join('\n'))
-        if (snippets.length === 0) return renderMessage(content)
+        if (snippets.length === 0) return renderMessage(content as Array<{ type?: string; text?: string }>)
         return h('div', { className: 'code-workbench-chat-reference' },
           renderMessage(compactContent),
           snippets.map((snippet, index) => h('details', { key: index, className: 'code-workbench-chat-snippet' },
@@ -2732,8 +3357,9 @@ function apply(ctx) {
           name: 'code-workbench',
           label: () => '选中代码',
           codec: {
-            serialize: async (ref) => {
-              if (ref?.pathOnly) return referenceMention(ref.path, ref.directory === true)
+            serialize: async (reference) => {
+              const ref = reference as { pathOnly?: boolean; path?: string; directory?: boolean; startLine?: number; endLine?: number; language?: string; code?: string }
+              if (ref?.pathOnly) return referenceMention(ref.path ?? '', ref.directory === true)
               const startLine = ref?.startLine ?? 1
               const endLine = ref?.endLine ?? startLine
               const anchor = endLine === startLine
@@ -2746,7 +3372,7 @@ function apply(ctx) {
             },
           },
         })
-      } catch (error) {
+      } catch (error: unknown) {
         console.error('[code-workbench] reference codec registration failed:', error)
         return () => {}
       }
@@ -2764,7 +3390,7 @@ function apply(ctx) {
     }],
   }), 'code-workbench: tab type')
 
-  ctx.effect(() => ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({
+  ctx.effect(() => ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register<DSH.CodePanelProps>({
     name: 'sidebar.right.pane.tab',
     key: TAB_ID,
     // The renderer calls entry.inject(sessionId, actions) and hands the returned
@@ -2779,8 +3405,8 @@ function apply(ctx) {
       // preview; without it the panel keeps its own read error.
       'sidebarRight': ctx.sidebarRight,
       'settings.form': settingsForm,
-      'remote.stream': (spec) => ctx.remote.$stream(spec),
-      'sessions.scope': (id) => ctx.sessions.scope(id),
+      'remote.stream': (spec: DSH.StreamSpec<unknown>) => ctx.remote.$stream(spec),
+      'sessions.scope': (id: string) => ctx.sessions.scope(id),
     }),
   }, CodePanel)), 'code-workbench: tab body')
 }

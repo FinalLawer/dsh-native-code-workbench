@@ -1,18 +1,25 @@
 {
   "files": {
     "LICENSE": "1d19a36206ef5ea6136f713dc5ea7200a4432290e369a24e43e91fc9b49257d5",
-    "build.mjs": "c185c60a6f2cfdce3aceb9cf024d35a6fb83fd81c2457e120a4f11c0e3a9ee3c",
-    "client.js": "94b0663f695450e1b608ce62d914d95591d4523c4d37c43b9cebee304281e361",
-    "completion-api.mjs": "ca3b73e563449dfd0f8e49aac275107fa1ff2b390a5b417fddb9145d1babbc05",
+    "README.md": "d1b5899006eacaaf83c7995b05b938a8dd629af4da777b8c1a22945273b4899e",
+    "build.mjs": "f2138344459573e36246f507063080e8b40bdf340b00a3cf9cc1c2d8b186d270",
+    "client.js": "3dd060a2251cb111bdd71e0fc419df4cfedf45ae8c501202fd9212bee9f6c867",
+    "completion-api.mjs": "85cd1d328d4fd520689356822a827fb3f883355c5ca1311268ac85b21d1ac25e",
+    "completion-api.mts": "37a8f5fadf1f995ef925ccc248e0b876141b25c5a08d262559c24b6fe8a77349",
     "cordis.patch.yml": "4ba0c560522cb7a2e49621db347e2224b422a5725c89d446f27310fe78d194c8",
-    "index.js": "481ac767a2ea41e409b2c8d6faebc104982364ea774a8ca4c4f9c82b57f0faee",
-    "package.json": "49fd073e3a3fd234fbecc45a152be443dd7d109e2e75ff9ea62a72775f04e39e",
-    "src/client.mjs": "58449d39be5c4e613921f8b07be2be754e39d7398d21b766f8ae30aa149841df",
-    "src/completion-window.mjs": "a9ee42a9ce38a11ee047ab2e8f7612a5c72d386b0b312947db9f917f3a844a53",
-    "src/monaco-entry.mjs": "0f5d4b85a40ba7f49976cd2352e6df95057c83b9c02ddeeee0f5a8f07e780d53",
-    "src/snippets.mjs": "6054e0957cf016cc92ea2aaa6074abda3475193f3d4f6dd67c5d751049b7c6d6",
-    "src/workbench.css": "d217c72f3f3029a6fa9979c366be090a89f39c2dcae4211175306c8b5b46e981",
+    "index.js": "7e91d0eb546f87d0413eee69acbe545f8e834a555ae9ca94a0bdddb0bcd4d4f8",
+    "index.ts": "404dc96aa2167a5e8433025068926b8651a7d45e94e0d5d1354969a094e113d1",
+    "package.json": "0ad437ed05b70e366c5c7015f354d18c875e376ebfe58051fd26265ee8874093",
+    "src/client.ts": "dc7e87db8ac0b6bfcdc7049985aa6d34bda82cef3b7a2254e7ec693b212a5d0d",
+    "src/completion-window.mjs": "0ff0e80ebf4f4c7ce431064a5d10f48cde24f63744e1f71b4ef6d40c91e84b3f",
+    "src/completion-window.mts": "a9ee42a9ce38a11ee047ab2e8f7612a5c72d386b0b312947db9f917f3a844a53",
+    "src/monaco-entry.mjs": "ea56780651850d39e669078f72a0605b8361dec1bc9cecc75bc301aa81f4dabd",
+    "src/monaco-entry.mts": "52336351d75809127c8250ac32aed48a874e010192cc63f18239ab80219e8822",
+    "src/snippets.mjs": "3781905f0e4b1272cd8b56c120723a0e1c2c2e1a11590dac1f0b0718b3d86f4b",
+    "src/snippets.mts": "666fce4d54f8a230e49faa37743f274da287d20d75a930c0ba74c2327bf55736",
+    "src/workbench.css": "fec3b94dc6712dbee58c44a1459bcab93b1c7bf036ca301eb756f008a8af8418",
+    "vendor/schemastery.d.mts": "fca846c1420a192b7ae749da96afa0c9b5c57b2e7dff418153674f90200f4e27",
     "vendor/schemastery.mjs": "2d7a054603361bd89569101afcf997ad00bd62cf8fa6aec43d49083ce0f5dac7"
   },
-  "version": "0.5.5"
+  "version": "0.6.0"
 }

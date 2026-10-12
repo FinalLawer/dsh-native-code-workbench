@@ -518,6 +518,13 @@ check('the tree marks nothing at all for the file you have open',
   !/\[data-active="true"\]/.test(css))
 check('the selection is what it marks, filled and framed',
   /\.code-workbench-tree-row\[data-selected="true"\]\s*\{[^}]*background:\s*var\(--dsw-alias-interactive-bg-hover\);[^}]*box-shadow:\s*inset 0 0 0 1px var\(--dsw-alias-border-l2\);/s.test(css))
+// Monaco wires a provider's "ask me again" channel only when the provider
+// declares one, and it is the only way to be asked without a keystroke: opening
+// a file, switching to a tab, an external reload and a rollback all arrive with
+// no typing at all. Subscribed before the open below on purpose — the assertion
+// is that arriving at a file asks, not that some later event does.
+let completionRefreshes = 0
+calls.inlineCompletionProvider.onDidChangeInlineCompletions(() => { completionRefreshes++ })
 await act(async () => {
   fileRow.props.onClick()
 })
@@ -532,6 +539,8 @@ const activeTreeRows = findAll(tree(), (n) => n.props.className === 'code-workbe
 check('opening a file marks exactly one tree row as the open one',
   activeTreeRows.length === 1 && activeTreeRows[0].props.title === 'C:\\repo\\a.js',
   activeTreeRows.map((n) => ({ title: n.props.title, active: n.props['data-active'] })))
+check('arriving at a file asks for a suggestion without a keystroke',
+  completionRefreshes > 0, completionRefreshes)
 
 console.log('\nversion check fallback')
 const readsBeforePolling = calls.read.length
@@ -564,6 +573,33 @@ await act(async () => {
   suggestions = await calls.inlineCompletionProvider.provideInlineCompletions(currentModel, { lineNumber: 1, column: 17 }, {}, completionToken)
 })
 check('an empty completion yields no suggestion and no error', suggestions?.items?.length === 0 && allText().includes('AI 未返回补全'), allText().slice(-200))
+// A blank answer is the same news, and it needs its own case: "break the line
+// and indent" is a likely continuation for a caret at the end of a line, this
+// model does return it, `stripFences(text, true)` keeps that whitespace verbatim
+// because the leading blank of a real completion belongs to it — and Monaco
+// would paint the spaces as ghost text for Tab to accept. The two asks below use
+// one caret, so the second one also pins that a blank is not remembered: a
+// cached blank would serve those spaces back after the ask that produced it is
+// long gone.
+let blankFetches = 0
+globalThis.fetch = async (url, options) => {
+  calls.fetch.push({ url, body: JSON.parse(options.body) })
+  blankFetches++
+  return new Response(JSON.stringify({ ok: true, text: '\n      ' }), { headers: { 'content-type': 'application/json' } })
+}
+await act(async () => { currentModel.setValue(currentModel.getValue() + '\n// force a blank completion context\n') })
+await act(async () => {
+  suggestions = await calls.inlineCompletionProvider.provideInlineCompletions(currentModel, { lineNumber: 1, column: 17 }, {}, completionToken)
+})
+check('a whitespace-only completion yields no suggestion',
+  suggestions?.items?.length === 0 && allText().includes('AI 未返回补全'), suggestions)
+const blankFetchesAfterFirstAsk = blankFetches
+await act(async () => {
+  suggestions = await calls.inlineCompletionProvider.provideInlineCompletions(currentModel, { lineNumber: 1, column: 17 }, {}, completionToken)
+})
+check('a whitespace-only completion is not remembered as an answer',
+  suggestions?.items?.length === 0 && blankFetches === blankFetchesAfterFirstAsk + 1,
+  { blankFetchesAfterFirstAsk, blankFetches })
 // A transport failure is the one path that still surfaces in the editor.
 globalThis.fetch = async () => new Response(JSON.stringify({ error: { message: 'model unavailable' } }), { status: 409 })
 await act(async () => { currentModel.setValue(currentModel.getValue() + '\n// force another distinct completion context\n') })

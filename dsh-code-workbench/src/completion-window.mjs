@@ -13,8 +13,7 @@
  * context than the request claimed, which is invisible from the outside and
  * shows up only as completions that look oddly uninformed.
  */
-
 /** Characters of the file before the caret, ending at it. */
-export const COMPLETION_PREFIX_CHARS = 3200
+export const COMPLETION_PREFIX_CHARS = 3200;
 /** Characters after the caret, used to tell the model where it is going. */
-export const COMPLETION_SUFFIX_CHARS = 900
+export const COMPLETION_SUFFIX_CHARS = 900;

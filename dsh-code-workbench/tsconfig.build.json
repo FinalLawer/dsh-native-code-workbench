@@ -1,0 +1,23 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "noEmitOnError": true,
+    "outDir": ".",
+    "rootDir": ".",
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false,
+    "removeComments": false
+  },
+  "include": [
+    "index.ts",
+    "completion-api.mts",
+    "src/snippets.mts",
+    "src/completion-window.mts",
+    "src/monaco-entry.mts",
+    "types/**/*.d.ts",
+    "vendor/**/*.d.mts"
+  ],
+  "exclude": []
+}
