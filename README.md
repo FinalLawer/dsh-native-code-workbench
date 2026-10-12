@@ -1,34 +1,48 @@
 # DSH Code Workbench
 
+给 DSH Web GUI 的右侧栏加一个 **VS Code 风格的代码工作台**：用 **Monaco（VS Code 编辑器内核本体）** 浏览和编辑工作区文件——语法高亮、多光标、查找、撤销，全部与 VS Code 同款。在此之上还有代码库检索、Tab 补全、保存检查点与回滚、以及把代码加进对话。
+
+**设计原则：只组合官方机制，不自建平行协议。** 写盘走官方 Connection 通道 + `ctx.fs`，读盘走官方 `workspaceFiles` Remote，预览交给官方文档预览，聊天引用走官方 chip 通道。插件自己不发明任何协议、不复制任何注册表。
+
 ## 安装
 
-推荐直接用 GitHub 链接安装，不必先下载压缩包。在 DSH 侧边栏的**插件**页点**添加插件**，粘贴：
+在 DSH 侧边栏的**插件**页点**添加插件**，把下面任一个填进对话框，装完点**立即启用**。已安装但没启用的组合包，之后也能在插件页开启。
+
+### 从 npm 安装（最省事）
+
+```
+dsh-code-workbench
+```
+
+需要固定版本时带上版本号：
+
+```
+dsh-code-workbench@0.6.0
+```
+
+### 从 GitHub 安装
 
 ```
 https://github.com/FinalLawer/dsh-native-code-workbench#path:/dsh-code-workbench
 ```
 
-装完点**立即启用**；已安装但没启用的组合包，之后也能在插件页开启。
-
-⚠️ **`#path:/dsh-code-workbench` 这一段不能省。** 这个仓库的根目录不是包——插件在 `dsh-code-workbench/` 子目录里，根目录没有 `package.json`。省略它时 pnpm 仍会报告安装成功，但装出来的是一个名为 `dsh-native-code-workbench.git`、版本 `0.0.0` 的占位包（清单是 pnpm 生成的 `{"_pnpmPlaceholder": …}`），既没有包清单也没有 `dsh.bundle` 声明，DSH 读不到组合包，插件不会出现。这个失败发生在安装**之后**，光看安装过程看不出来。
-
 固定版本请把 tag 一起带上：
 
 ```
-https://github.com/FinalLawer/dsh-native-code-workbench#v0.5.4&path:/dsh-code-workbench
+https://github.com/FinalLawer/dsh-native-code-workbench#v0.6.0&path:/dsh-code-workbench
 ```
 
-命令行等价写法（需先完全退出 DSH）：
+⚠️ **`#path:/dsh-code-workbench` 这一段不能省。** 这个仓库的根目录不是包——插件在 `dsh-code-workbench/` 子目录里，根目录没有 `package.json`。省略它时 pnpm 仍会报告安装成功，但装出来的是一个名为 `dsh-native-code-workbench.git`、版本 `0.0.0` 的占位包（清单是 pnpm 生成的 `{"_pnpmPlaceholder": …}`），既没有包清单也没有 `dsh.bundle` 声明，DSH 读不到组合包，插件不会出现。这个失败发生在安装**之后**，光看安装过程看不出来。走 npm 或压缩包则没有这个问题。
 
-```
-dsh plugin --profile desktop add "https://github.com/FinalLawer/dsh-native-code-workbench#v0.5.4&path:/dsh-code-workbench"
-```
+### 从压缩包安装
 
-也可以从压缩包安装：把 `dsh-code-workbench-<版本>.tgz` 放到任意位置，在同一个对话框里填它的**绝对路径**。两条路径装进 profile 的内容一致（按 `files` 白名单，13 个文件）。
+把 `dsh-code-workbench-<版本>.tgz` 放到任意位置，在同一个对话框里填它的**绝对路径**。三条路径装进 profile 的内容一致（按 `files` 白名单，20 个文件）。
 
-安装需要目标机器有 **pnpm**；走 GitHub 链接还需要 **git**，压缩包不需要。包里的 `client.js` 是预构建产物，安装过程**不执行任何构建脚本**，所以不会触发 pnpm 的依赖脚本拦截。
+### 依赖与升级
 
-**升级**：官方安装器只提供安装与移除，没有 `update` 子命令；插件自带「检查更新 / 一键升级」（见下文「当前能力」）。手动升级也可以把新链接直接粘进安装框回车——对同名插件的拦截只比对**裸包名**，带完整 URL 不会被拦。对外分发建议带 tag，而不是跟最新 master。
+安装需要目标机器有 **pnpm**；走 GitHub 链接还需要 **git**，npm 和压缩包不需要。包里的 `client.js` 是预构建产物，安装过程**不执行任何构建脚本**，所以不会触发 pnpm 的依赖脚本拦截。
+
+**升级**：官方安装器只提供安装与移除，没有 `update` 子命令；插件自带「检查更新 / 一键升级」（见下文「当前能力」）。手动升级也可以把新链接直接粘进安装框回车——对同名插件的拦截只比对**裸包名**，带完整 URL 不会被拦。对外分发建议带 tag 或版本号，而不是跟最新 master。
 
 ## 工作台布局
 
@@ -67,6 +81,10 @@ POST {baseUrl}/completions        # baseUrl 已以 /completions 结尾则原样�
 
 响应对 `choices[0]` 依次识别 `text`、`message.content`、`delta.content` 三种字段，因此 DeepSeek 之外的兼容服务也能直接用。请求带 10 秒硬超时；打字打断会立即中止在途请求。
 
+触发完全交给 Monaco：它在每个输入字符（含空格）、退格/删除、Tab、粘贴和显式光标移动上都会自己发请求，插件不再额外补一枪。此前插件在内容变更后 400ms 会自己发一次 `editor.action.inlineSuggest.trigger`，而那是 **Explicit** 触发，不满足已在途的 Automatic 请求——Monaco 会丢掉在途那次并重开一次，于是每次补全都多一个往返、固定多等 400ms；更糟的是每多敲一个字终点就再后退 400ms，表现就是「要打个空格或删一下才会出来」。
+
+同一光标的并发请求现在共享一次往返：第二次询问 await 第一次的答案并优先读缓存，而不是回 `{items: []}`——空数组对 Monaco 不是「我不知道」而是「这一版没有建议」的判决，被记进 state 后后续询问会被短路，于是必须再动一次键盘才解锁。
+
 ### 设置项
 
 在 DSH 设置的「代码工作台」里：
@@ -77,6 +95,7 @@ POST {baseUrl}/completions        # baseUrl 已以 /completions 结尾则原样�
 | 补全接口地址 | `https://api.deepseek.com/beta` | 自动补 `/completions`；也接受完整端点（如 `https://api.mistral.ai/v1/fim/completions`） |
 | 补全模型 | `deepseek-flash` | 该端点只接受 `deepseek-flash` 与 `deepseek-v4-pro`，两者都支持 FIM |
 | 补全 API Key | 空 | 秘密字段，留空时不显示、不回显；填了就是最高优先级的凭据 |
+| 编辑自动保存 | 关 | 打开后停顿 900ms 自动保存 |
 
 设置页顶部有一块 **「当前补全链路」**，实际展示请求会落到哪个接口、哪个模型、用的是哪一路凭据——不用猜为什么没补全。
 
@@ -98,13 +117,7 @@ API Key 通过 Host 设置服务保存，标记为秘密字段，设置页不会
 
 所以排查补全完全不工作时，看 **DSH 主机日志**里的 `code-workbench: completion skipped — …`（那行带接口、模型和凭据来源），状态栏只告诉你「本地这一侧认为发生了什么」。
 
-给 DSH Web GUI 的右侧栏加一个 **VS Code 风格的代码工作台**：用 **Monaco（VS Code 编辑器内核本体）** 浏览和编辑工作区文件——语法高亮、多光标、查找、撤销，全部与 VS Code 同款。
-
-**设计原则：只组合官方机制，不自建平行协议。** 写盘走官方 Connection 通道 + `ctx.fs`，读盘走官方 `workspaceFiles` Remote。
-
----
-
-## 当前能力：编辑器 / 检索 / Tab 补全 / 检查点 / 加到对话
+## 当前能力
 
 | 能力 | 实现 | 机制 |
 |---|---|---|
@@ -118,7 +131,7 @@ API Key 通过 Host 设置服务保存，标记为秘密字段，设置页不会
 | **@codebase（Agent 工具）** | 对话里的 Agent 自带 `codebase_search` 工具：自然语言多词**排序检索**，返回 top 片段（补官方 `grep` 的精确正则） | `ctx.tools.register`（官方 Tool Runtime）+ 同一检索核心（terms 模式 + 词覆盖率排序） |
 | **Tab 补全** | 打字停顿 180ms 后灰色 ghost 建议，**Tab 接受**、继续打字即取消；同一时刻最多一个请求 | Monaco `registerInlineCompletionsProvider`（ghost 渲染/接受全是内建）+ `POST /api/code-workbench/complete`（**纯 FIM、非流式** `prompt`/`suffix`，128 token 预算，凭据三级兜底，10s 硬超时；失败静默）+ `POST /api/code-workbench/completion-status`（只读，回报实际链路） |
 | **检查点 / 回滚** | 每次保存自动入账本；左栏「历史」列出检查点，**一键回滚**到任意保存之前；回滚本身也是检查点，可再回滚 | `POST /api/code-workbench/history` / `rollback`（host 内存账本，每文件 20 条、每侧 200KB 上限）+ `ctx.fs.writeText` 版本守卫 |
-| **检查更新 / 一键升级** | 有新版发布时面板顶部出现提示条，点「升级」原地替换安装目录里的文件；只动了**运行期不参与启动加载**的文件（`client.js`，以及 `src/*` 构建输入、`build.mjs`、README 等）就**免重启**——`client.js` 由 HMR 自己重载面板；改了 Host 半边启动时加载过的文件（`index.js` 及其 import）才提示「重启 DSH 后生效」 | `POST /api/code-workbench/update-check`（`api.github.com` REST：`/tags` → 该 tag 的 `update.json` → 与本机逐文件摘要比对）与 `POST /api/code-workbench/update-apply`（每个文件先按清单摘要校验、再 `rename` 原子替换）。清单由 `tools/make-update-manifest.py` 生成，摘要统一对 **LF 归一化**后的字节计算 |
+| **检查更新 / 一键升级** | 有新版发布时面板顶部出现提示条，点「升级」原地替换安装目录里的文件；只动了**运行期不参与启动加载**的文件（`client.js`，以及 `src/*` 构建输入、`build.mjs`、README 等）就**免重启**——`client.js` 由 HMR 自己重载面板；改了 Host 半边启动时加载过的文件（`index.js` 及其 import）才提示「重启 DSH 后生效」 | `POST /api/code-workbench/update-check`（`api.github.com` REST：`/tags` → 该 tag 的 `update.json` → 与本机逐文件摘要比对）与 `POST /api/code-workbench/update-apply`（每个文件先按清单摘要校验、再 `rename` 原子替换） |
 | **外部改动自动重载** | Agent/外部改了盘上文件 → 干净缓冲区**自动刷新**；有未保存修改时警告不覆盖 | 官方 `workspaceFiles.changes` 流（`ctx.remote.$stream`），按打开文件订阅 |
 | **加到对话（Add to Chat）** | 右栏**选中多行代码** → `Ctrl+L`、右栏按钮、或**编辑器右键菜单「添加到对话」** → 主对话输入框里出现**引用胶囊**（只显示 `文件:行号 · N 行`），**发送时才展开**成完整代码块给 Agent | 官方 chip 机制：`slash/input-insert-reference` 事件插 `ReferenceChipNode` + 自注册 reference codec（`inputTriggers.registerSource` 的 `codec.serialize` 做提交展开）。三个入口进的是**同一个** `addToChat`，所以产出同一枚胶囊；右键菜单项由 `editor.addAction` 注册在 cut/copy/paste 组之后，**不带** `keybinding`（`Ctrl+L` 已由 `addCommand` 注册，重复注册同一个和弦是静默的）也**不带** `precondition`（本 build 未定义的 context key 恒为 false，会把菜单项永久灰掉，看起来像坏了） |
 | **拖拽行到输入框** | 文件树行（文件或目录）拖进主对话输入框 → 落成引用胶囊；**发送时展开为共享 `@路径` mention**（目录带尾斜杠、含空格走 `@"…"`），聊天记录里渲染回同一个胶囊 | 私有 MIME「三重收窄」在 document 捕获阶段接管拖放 → 同一个官方 `slash/input-insert-reference` 通道；提交展开走同一个 reference codec（`clipboardText` 与展开文案逐字一致） |
@@ -129,56 +142,22 @@ API Key 通过 Host 设置服务保存，标记为秘密字段，设置页不会
 | 主题 | 跟随 DSH 明暗主题 | `body[data-ds-dark-theme]` MutationObserver → `monaco.editor.setTheme` |
 | 快捷键 / 编辑器右键菜单 | `Ctrl+S` 保存、`Ctrl+L` 将选中代码加入对话、`Tab` 接受补全（编辑器内）；编辑器右键菜单另有一项「添加到对话」 | `editor.addCommand`（快捷键）+ `editor.addAction`（菜单项，注册在 cut/copy/paste 组之后） |
 
-## 组成
+## 组成与实现
 
-| 半体 | 文件 | 职责 |
+插件由**两个半边**构成，DSH 分别加载：
+
+| 半体 | 源码 → 产物 | 职责 |
 |---|---|---|
-| Host | [`index.js`](dsh-code-workbench/index.js) | 版本守卫写盘、文件操作、检索、Tab 补全、检查点与回滚、检查更新与升级，以及 `codebase_search` 工具 |
-| Client 源码 | [`src/client.mjs`](dsh-code-workbench/src/client.mjs) | 右栏 tab `code-workbench`：文件树 + Monaco + Tab 补全 + 代码引用 |
-| 构建 | [`build.mjs`](dsh-code-workbench/build.mjs) | esbuild：Monaco/Worker/CSS 全部内联，产出 `client.js`（`__ModuleLoader__` factory 形式） |
+| Host | [`index.ts`](dsh-code-workbench/index.ts) → `index.js` | 版本守卫写盘、文件操作、检索、Tab 补全、检查点与回滚、检查更新与升级，以及 `codebase_search` 工具 |
+| Client | [`src/client.ts`](dsh-code-workbench/src/client.ts) → `client.js` | 右栏 tab `code-workbench`：文件树 + Monaco + Tab 补全 + 代码引用 |
 
-## 开发
+**为什么客户端半边必须内联 Monaco。** DSH 的客户端模块运行时把每个插件当一段自包含的脚本加载，工厂里只允许 `require` 基线模块表（`react` 等），Monaco 不在表里。所以 `client.js` 是把 Monaco、它的 worker 和全部 CSS 打包在一起的单文件（约 5.13 MiB，懒加载）——worker 转成 Blob URL 注入，CSS 转成 `<style>`。这条契约是硬约束，不是取舍。
 
-配置位于 DSH 官方设置页中的「代码工作台」设置项：编辑自动保存（默认关闭，停顿 900ms 后保存）与 Tab 补全的接口地址 / 模型 / API Key。配置由 DSH 持久化，**首次更新 Host schema 后需要重启 DSH**（Host 半边是启动快照；`client.js` 走 HMR，改完即生效）。
+**为什么 Host 半边不打包。** 安装后的 `index.js` 是排障时唯一能读的东西，所以它由 `tsc` 逐文件转译、**保留全部注释**，而不是交给 esbuild（后者会剥掉所有注释）。类型错误会直接让构建失败，不会进入产物。
 
-```powershell
-node dsh-code-workbench/build.mjs        # 重新构建 client.js（Monaco 内联）
-node tools/test-client-contract.mjs   # 客户端契约（bundle 资产/导出/注册/注入）
-node tools/test-host-write.mjs        # 写盘路由（沙箱策略戳/版本守卫/鉴权）
-node tools/test-file-operations.mjs   # 文件操作（权限/范围/禁止覆盖）
-node tools/test-host-search.mjs       # 检索路由（有界遍历/忽略规则/正则/上限）
-node tools/test-host-tool.mjs         # codebase_search 工具（注册契约/排序/上限）
-node tools/test-host-complete.mjs     # Tab 补全路由（FIM 调用/凭据优先级/静默失败/状态路由）
-node tools/test-completion-api.mjs    # FIM 传输（端点拼接/鉴权头/取消传播/响应三形态）
-node tools/test-host-history.mjs      # 检查点账本（入账/回滚/可回滚性）
-node tools/test-host-update.mjs       # 检查更新与升级（tag 排序/摘要校验/换行归一化/原子替换/越界清单）
-node tools/test-bundle-slim.mjs       # bundle 瘦身（体积门槛/该有的在/该删的不在）
-node tools/test-client-smoke.mjs      # 客户端渲染冒烟（真实 React 渲染 + 驱动交互链路）
-node tools/analyze-bundle.mjs         # bundle 体积归因（哪个模块最胖）
-node tools/fim-mock-server.mjs        # 本地 FIM 镜像：打印真实请求形状、判定 FIM/chat、回一段合法 JSON 让 ghost text 真的出现
-node tools/probe-completion-credential.mjs          # 打印凭据链会选中哪一路（只读，不联网）
-node tools/probe-completion-credential.mjs --live    # 再对每一路真实各发一个小请求，验证真的能补
-# 改 client.js 不需要重启：HMR 按文件元数据（mtime/ctime/size）算修订号，重写即重载
-# 改 index.js（host 半体）需要重启 DSH：桌面 boot 图是启动快照
-```
+**源码与产物同名同目录。** `index.ts` → `index.js`、`src/client.ts` → `client.js`，源码就放在它产出的东西旁边。少数源文件用 `.mts` 扩展名，因为 `index.ts` 里必须逐字写 `./completion-api.mjs`——那是**产物**的真实名字，而 TypeScript 的扩展名替换规则里 `.mjs` 只映射 `.mts`。
 
-**构建管线**：`src/*.mjs` → esbuild(CJS, `react` external) → 包一层
-`window.__ModuleLoader__.load({ id, factory(require) { … } })`；Monaco 的 CSS/字体
-转成注入 `<style>`，`editor.worker` 转成 Blob URL。factory 只 `require('react')`
-（冻结模块表），其余全部内联——这是 bundle 契约。
-
-**客户端依赖**：`src/client.mjs` 只多引一个官方包 `@deepseek-ai/dsh-util-workspace-path`（版本与 DSH `0.2.0-rc.2` 对齐，devDependency），用它的 `fileAddressFor` 拼官方预览地址——地址语法归官方所有，不自建一份。构建期内联进 `client.js`，bundle 契约不变（factory 仍只 `require('react')`）。
-
-**依赖安装**：本机 npm 需走系统代理（`$env:HTTPS_PROXY='http://127.0.0.1:7897'`），否则被 DNS 劫持。
-
-**发布清单**：每次发版、改完所有要发的文件**之后**跑一次
-`python tools/make-update-manifest.py`，把 `dsh-code-workbench/update.json` 一起提交。它是
-「检查更新」唯一的版本来源：列出本版每个文件的 SHA-256，并带上 `version`。两条约束：
-
-- **`update.json` 的 `version` 必须与该 tag 上的 `package.json` 一致**（脚本从 `package.json` 读，不要手改）。不一致时，用户点升级会拿到一个「仓库从没发布过」的版本号。
-- 摘要算的是**把 CRLF 归一化成 LF 之后**的字节。仓库根 `.gitattributes` 现在把所有文件在**检出时**也钉成 LF（`* text=auto eol=lf`），所以库里的、工作区的、tarball 里的、git 安装落地的字节如今是同一条流，脚本在正常仓库里不会再打印任何「被归一化」的行。归一化本身仍然保留：它对付的是 **`.gitattributes` 之前装下来的副本**——那些副本里 `index.js`、`src/client.mjs`、`client.js` 在 Windows 上是 CRLF，不归一化就会被永久判成「有更新」。这就是 `_fault_inject_update.py` 注入 A 要守的东西。
-
-`update.json` 随仓库发布即可，**不进 npm `files`**：升级读的是 GitHub 上那个 tag 的副本，装在盘上的副本没有用处。
+**SDK 的类型是手写的。** DSH 客户端 SDK 的每个包都在 `package.json` 里声明了 `types` 路径，但**包里并没有那些文件**，所以 `types/` 下是这个插件真正调用到的那部分声明，范围刻意收窄——试图覆盖整个 SDK 只会得到它的一份无法校验的副本。
 
 ## 已知限制
 
@@ -186,27 +165,15 @@ node tools/probe-completion-credential.mjs --live    # 再对每一路真实各�
 - 新发送的代码引用在聊天记录中默认折叠为文件与行号，点击展开；模型仍收到完整选区。此前发送的普通代码块没有引用标记，保留原展示。
 - 路径引用（右键「添加路径引用」或拖拽文件树行）在聊天记录里是与输入框同形的胶囊，点按在右栏预览——因为提交时展开的就是官方 `@路径` mention，官方投影再把这段文字装饰回胶囊。目录胶囊只作展示：官方投影只给文件接跳转。
 - 非文本文件（PDF、xlsx/xls/csv/tsv、doc/docx/ppt/pptx、图片等）不在本面板渲染：工作台只把文件地址**转交**给右栏的官方文档预览，因此它们的标签页不会出现在「代码工作台」里。转交依据是读取失败的错误码（`workspace-file/not-text` / `too-large`），**不是后缀白名单**——能渲染哪些后缀由官方预览自己的注册表拥有，这里不复制一份。若当前环境没有注册能认领该地址的预览实现（`openResource` 会抛错），工作台保留自己的错误提示并注明该去哪看，不会报告一个它没能打开的文件。
-- 更新读的是 `api.github.com` REST 接口（`/tags`、`/contents`、`/git/blobs`），不走 raw 内容域——后者在部分网络下不可达。仓库没有 Release 对象，所以版本从 **tag 列表**里取：这里自己按 semver 排序（`/tags` 不承诺顺序），取最高的那个带 `update.json` 的 tag，因此本特性之前发布的 tag 会被逐个跳过而不是让整次检查失败。GitHub 不可达、仓库里没有清单、本地已是最新——三者对面板都只有一个答案：不显示任何东西。
+- 更新读的是 `api.github.com` REST 接口（`/tags`、`/contents`、`/git/blobs`），不走 raw 内容域——后者在部分网络下不可达。仓库没有 Release 对象，所以版本从 **tag 列表**里取：这里自己按 semver 排序（`/tags` 不承诺顺序），取最高的那个带 `update.json` 的 tag，因此本特性之前发布的 tag 会被逐个跳过而不是让整次检查失败。GitHub 不可达、仓库里没有清单、本地已是最新——三者对面板都只有一个答案：不显示任何东西。**从 npm 安装的副本同样靠 GitHub 上的 tag 检查更新**，因为清单是随仓库发布的。
 - 升级只写**本包自己的安装目录**，不触碰工作区。清单里出现绝对路径、`.`/`..` 段、反斜杠或空段会被直接拒绝；文件数上限 64、单文件上限 32 MiB、清单上限 256 KiB。
 - 替换是**逐文件**的 `rename`：一个文件失败不影响已经落地的那些，失败时留下的是「逐个都合法但版本混合」的树，而不是写坏的文件。校验用的是发布方在清单里给出的摘要（用 `rename` 而不是直接写，是因为安装树里每个文件都是 pnpm 硬链接到内容库的，写穿会改到其他 profile 共用的那份）。
-- ⚠️ 若某次更新提示「重启 DSH 后生效」而用户没有重启就关掉了面板：**不会**再次提示——`installedVersion()` 读的是盘上的 `package.json`，而那时盘上已经是最新版了。这是刻意的（盘上版本就是已安装版本，不制造「永远提示有更新」的假信号），代价是这次提醒是一次性的；下次启动 DSH 会让新版本全面生效。要让「待重启」也持续提醒，需要在启动时快照当前版本再与盘上比对。
+- ⚠️ 若某次更新提示「重启 DSH 后生效」而用户没有重启就关掉了面板：**不会**再次提示——`installedVersion()` 读的是盘上的 `package.json`，而那时盘上已经是最新版了。这是刻意的（盘上版本就是已安装版本，不制造「永远提示有更新」的假信号），代价是这次提醒是一次性的；下次启动 DSH 会让新版本全面生效。
 - 免重启的判定只看 `client.js` / `package.json` 是否在改动之列；只要发布里动了 Host 半边加载过的文件（`index.js`、`completion-api.mjs`、`vendor/schemastery.mjs`、`src/completion-window.mjs`、`cordis.patch.yml`），就提示重启——那些代码进程已经加载在内存里，替换文件本身不足以让它们生效。
 - 拖放的两个手势共用同一个私有 MIME，靠各自的 drag ref 分流，所以**跨手势不生效**：把标签拖到文件树的文件夹行上不会移动文件，把文件树行拖过标签条也不会换位。要移动文件请用树内拖放或右键剪切/粘贴，要换位请在标签条内拖。
 - 文件树的「选中」和编辑区的「当前文件」是两件事：清空选中不会关闭任何标签；从**标签条**打开一个文件也不改变树里的选中。但**在树里点一行会同时把该行设为选中**（新建按钮的落点始终跟着选中走），所以点开一个文件后那一行带的是**选中**标记，不是「当前文件」标记。树里不给当前打开的文件画任何东西。选中的目录不会被自动展开。
-- Tab 补全采用 180ms 请求防抖、较小的前后文（前缀 3200 字符 / 后缀 900 字符）和 128 token 预算，并缓存最近 40 个光标上下文。
-
-
-  触发完全交给 Monaco：它在每个输入字符（含空格）、退格/删除、Tab、粘贴和显式光标移动上都会自己发请求，插件不再额外补一枪。
-
-  此前插件在内容变更后 400ms 会自己发一次 `editor.action.inlineSuggest.trigger`，而那是 **Explicit** 触发，不满足已在途的 Automatic 请求（`UpdateRequest.satisfies` 要求 `this` 侧也是 Explicit）——Monaco 会丢掉在途那次并重开一次，于是每次补全都多一个往返、固定多等 400ms；更糟的是每多敲一个字终点就再后退 400ms，表现就是「要打个空格或删一下才会出来」。
-
-  同一光标的并发请求现在共享一次往返：第二次询问 await 第一次的答案并优先读缓存，而不是回 `{items: []}`——空数组对 Monaco 不是「我不知道」而是「这一版没有建议」的判决，被记进 state 后 `satisfies` 会短路掉该版本上后续的显式询问，于是必须再动一次键盘才解锁。
-
-  ⚠️ **本机网络抖动实测 ±300ms，比大部分参数效应还大**——任何「提速了」的判断都要多轮取样才作数，单次测量没有意义。目前真正能调的只剩防抖（180ms）和 `max_tokens`（128）。`max_tokens` 调小能省 150–400ms，但长建议会被截断，属于取舍不是白捡。
-
-- 凭据第三级（DSH 账号授权）已**对真实 `/beta/completions` 端点验证通过**（HTTP 200，用私有头 `x-dsh-auth-token`、不带 `Authorization`）。用 `node tools/probe-completion-credential.mjs --live` 可随时复核三条链路。注意它只在 **origin** 属于该账号服务信任的推理源时才会签发。
-- 工作台使用 DSH 官方主题变量；导航可收起，窄面板改为上下布局，顶部文件路径与操作分行显示。
-
+- Tab 补全采用 180ms 请求防抖、较小的前后文（前缀 3200 字符 / 后缀 900 字符）和 128 token 预算，并缓存最近 40 个光标上下文。⚠️ **本机网络抖动实测 ±300ms，比大部分参数效应还大**——任何「提速了」的判断都要多轮取样才作数，单次测量没有意义。
+- 凭据第三级（DSH 账号授权）已**对真实 `/beta/completions` 端点验证通过**（HTTP 200，用私有头 `x-dsh-auth-token`、不带 `Authorization`）。注意它只在 **origin** 属于该账号服务信任的推理源时才会签发。
 - bundle 5.13 MiB（Monaco 内核 minify 后 + 常用 28 种语法 + JSON 语言服务）；首次打开面板时解析（懒加载）。
 - TS/JS 语义智能未启用（砍掉了 12MB 的 TS 语言服务）：TS/JS 有语法高亮 + 编辑器全套功能，但没有语义诊断/跳转；补全为词级 + AI ghost text。
 - 单文件读取受官方 `workspaceFiles` 上限约束（默认 2 MiB / 5000 行一页，最多 40 页）。
