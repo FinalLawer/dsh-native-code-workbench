@@ -1,5 +1,7 @@
 # DSH Code Workbench
 
+**简体中文** · [English](README.en.md) · [繁體中文](README.zh-TW.md)
+
 给 DSH Web GUI 的右侧栏加一个 **VS Code 风格的代码工作台**：用 **Monaco（VS Code 编辑器内核本体）** 浏览和编辑工作区文件——语法高亮、多光标、查找、撤销，全部与 VS Code 同款。在此之上还有代码库检索、Tab 补全、保存检查点与回滚、以及把代码加进对话。
 
 **设计原则：只组合官方机制，不自建平行协议。** 写盘走官方 Connection 通道 + `ctx.fs`，读盘走官方 `workspaceFiles` Remote，预览交给官方文档预览，聊天引用走官方 chip 通道。插件自己不发明任何协议、不复制任何注册表。
