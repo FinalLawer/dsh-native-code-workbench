@@ -19,7 +19,7 @@ dsh-code-workbench
 需要固定版本時帶上版本號：
 
 ```
-dsh-code-workbench@0.6.0
+dsh-code-workbench@0.6.1
 ```
 
 ### 從 GitHub 安裝
@@ -31,7 +31,7 @@ https://github.com/FinalLawer/dsh-native-code-workbench#path:/dsh-code-workbench
 固定版本請把 tag 一起帶上：
 
 ```
-https://github.com/FinalLawer/dsh-native-code-workbench#v0.6.0&path:/dsh-code-workbench
+https://github.com/FinalLawer/dsh-native-code-workbench#v0.6.1&path:/dsh-code-workbench
 ```
 
 ⚠️ **`#path:/dsh-code-workbench` 這一段不能省。** 這個儲存庫的根目錄不是套件——外掛在 `dsh-code-workbench/` 子目錄裡，根目錄沒有 `package.json`。省略它時 pnpm 仍會回報安裝成功，但裝出來的是一個名為 `dsh-native-code-workbench.git`、版本 `0.0.0` 的佔位套件（清單是 pnpm 產生的 `{"_pnpmPlaceholder": …}`），既沒有套件清單也沒有 `dsh.bundle` 宣告，DSH 讀不到組合包，外掛不會出現。這個失敗發生在安裝**之後**，光看安裝過程看不出來。走 npm 或壓縮包則沒有這個問題。
@@ -136,12 +136,13 @@ API Key 透過 Host 設定服務儲存，標記為秘密欄位，設定頁不會
 | **檢查更新／一鍵升級** | 有新版本發佈時面板頂端出現提示列，點「升級」原地取代安裝目錄裡的檔案；只動了**執行期不參與啟動載入**的檔案（`client.js`，以及 `src/*` 建置輸入、`build.mjs`、README 等）就**免重啟**——`client.js` 由 HMR 自己重載面板；改了 Host 半邊啟動時載入過的檔案（`index.js` 及其 import）才提示「重啟 DSH 後生效」 | `POST /api/code-workbench/update-check`（`api.github.com` REST：`/tags` → 該 tag 的 `update.json` → 與本機逐檔摘要比對）與 `POST /api/code-workbench/update-apply`（每個檔案先依清單摘要驗證、再 `rename` 原子取代） |
 | **外部變更自動重載** | Agent／外部改了磁碟上的檔案 → 乾淨緩衝區**自動重新整理**；有未儲存修改時警告不覆寫 | 官方 `workspaceFiles.changes` 串流（`ctx.remote.$stream`），依開啟檔案訂閱 |
 | **加入對話（Add to Chat）** | 右側欄**選取多行程式碼** → `Ctrl+L`、右側欄按鈕、或**編輯器右鍵選單「加入至對話」** → 主對話輸入框裡出現**引用膠囊**（只顯示 `檔案:行號 · N 行`），**傳送時才展開**成完整程式碼區塊給 Agent | 官方 chip 機制：`slash/input-insert-reference` 事件插 `ReferenceChipNode` + 自註冊 reference codec（`inputTriggers.registerSource` 的 `codec.serialize` 做提交展開）。三個入口進的是**同一個** `addToChat`，所以產出同一枚膠囊；右鍵選單項由 `editor.addAction` 註冊在 cut/copy/paste 群組之後，**不帶** `keybinding`（`Ctrl+L` 已由 `addCommand` 註冊，重複註冊同一個組合鍵是靜默的）也**不帶** `precondition`（本 build 未定義的 context key 恆為 false，會把選單項永久變灰，看起來像壞了） |
+| **選取懸浮膠囊** | 在編輯器裡選取程式碼，選取範圍附近浮出「**加入至對話、Ctrl+L**」膠囊，點一下即加入對話；選取消失即收起，正在顯示 ghost 建議時讓位 | Monaco **內容部件**（`editor.addContentWidget`）—— 膠囊只給出行列錨點，像素位置由 Monaco 自己算。落點搜尋照 Cursor 的演算法複刻（在 ±2 行視窗裡挑最長的一行作錨，代價 = 行長與 5 行之差 + 25 × 行偏移），但**偏好恆為 `EXACT`**、上下偏移由外掛自算 `transform`：Monaco 的 `ABOVE`/`BELOW` 以**整個視窗**為鉗制基準，而編輯器只占右欄一條 |
 | **拖曳列到輸入框** | 檔案樹列（檔案或目錄）拖進主對話輸入框 → 落成引用膠囊；**傳送時展開為共用 `@路徑` mention**（目錄帶尾斜線、含空格走 `@"…"`），對話記錄裡渲染回同一個膠囊 | 私有 MIME「三重收窄」在 document 捕獲階段接管拖放 → 同一個官方 `slash/input-insert-reference` 通道；提交展開走同一個 reference codec（`clipboardText` 與展開文案逐字一致） |
 | **拖曳分頁** | 分頁列上的分頁同樣可拖：拖進主對話輸入框 → 與拖檔案樹列**完全相同的引用膠囊**；在分頁列內左右拖 → **換位**，落點那一側的邊緣出現插入標記 | 重用同一個私有 MIME 和同一個官方通道，因此膠囊只有一個出處；列內換位由各自的 drag ref 分流——**兩個手勢互不認領**（樹列拖過分頁列不換位，分頁拖到資料夾列也不移動檔案） |
 | **點空白處取消選取** | 點擊檔案樹空白處 → 清空選取；頂端新增按鈕隨之回到在工作區根目錄建立 | 樹的容器 `onClick`，用 `closest('.code-workbench-tree-row, button, input, .code-workbench-tree-toolbar')` 排除落在列、列內控件和工具列上的點擊：列點擊本來就會冒泡到容器，而工具列是右對齊的，**選取目錄後的下一個動作就是往右上走點「新增檔案」，擦邊落在它的空白處**——沒有這道守衛時，兩個手勢會重合成一個，近失手又會把目標悄悄打回根目錄。清空 `selected` 的同時一併清掉 Shift 多選集合與錨點 |
 | **樹只標記選取** | 檔案樹裡只有**選取**（新增按鈕的落點、右鍵選單與拖曳的作用目標）會畫底色 + 細框；**目前開啟的檔案在樹裡零標記** | 一次點擊會**同時**開啟檔案並把它設為選取，兩種狀態疊在同一列：給它任何標記都會被讀成「選取標記的一部分」——兩個畫得一模一樣的框就是「取消不掉的框」，框上再疊一根豎條就是多了一個東西。哪個檔案開著由分頁列回答（恰好一個作用中分頁），樹不回答第二遍。`:hover` 保留——那是游標自己的瞬時回饋，不掛在任何狀態上 |
 | 可追溯 | 每次儲存記 Session 備註 | `sessionFeedback.record` |
-| 主題 | 跟隨 DSH 明暗主題 | `body[data-ds-dark-theme]` MutationObserver → `monaco.editor.setTheme` |
+| 主題 | 跟隨 DSH 明暗主題 | `body[data-ds-dark-theme]` MutationObserver → `monaco.editor.setTheme`；調色盤取自 `--dsw-alias-*`，但**先正規化為 `#RRGGBB[AA]` 再交給 Monaco**——它的主題解析只認 hex 拼寫，認不出的值不會報錯，而是靜默塗成純 `#ff0000` |
 | 快速鍵／編輯器右鍵選單 | `Ctrl+S` 儲存、`Ctrl+L` 將選取程式碼加入對話、`Tab` 接受補全（編輯器內）；編輯器右鍵選單另有一項「加入至對話」 | `editor.addCommand`（快速鍵）+ `editor.addAction`（選單項，註冊在 cut/copy/paste 群組之後） |
 
 ## 組成與實作

@@ -220,6 +220,54 @@
 }
 @keyframes code-workbench-spin { to { transform: rotate(360deg); } }
 
+/* The Add to Chat capsule. Geometry is Cursor's own — an 8px shell holding a
+   24px button at 12px with the same lift — and only the colours are ours, so
+   the capsule follows the light and dark themes the panel already tracks.
+   Monaco owns this node: it sets `position: absolute`, the top/left, the
+   `widgetId` the hit test reads, and the `display`/`visibility` that hide the
+   capsule when its line scrolls away. The `transform` that picks which side of
+   the line it hangs on is written by the capsule itself. So nothing here may
+   set `transform`, `top`, `left`, `display` or `visibility`.
+   The node is also hit-testable as a whole — no `pointer-events: none` — so a
+   mousedown anywhere on it, padding ring included, is swallowed by Monaco's
+   `suppressMouseDown` instead of starting a selection drag underneath. */
+.code-workbench-pill { font-family: var(--dsw-font-family, sans-serif); }
+.code-workbench-pill-body {
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  /* The placement search keeps exactly this much room to the right of the line
+     it hangs the capsule on (`PILL_RESERVE_PX`), so a wider capsule could be
+     clipped by the clamp at the panel's edge. Held to the same number here. */
+  max-width: 128px;
+  padding: 3px 4px;
+  overflow: hidden;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-layer-1);
+  box-shadow: 0 6px 18px #0003;
+}
+.code-workbench-pill-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 7px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--dsw-alias-label-primary);
+  font-size: 12px;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+}
+/* The key hint is a reminder, not a label, so it sits a step back from the words
+   it follows. Cursor looks the chord up through its keybinding service; this one
+   is the chord this file registers. */
+.code-workbench-pill-key { color: var(--dsw-alias-label-secondary); font-size: 11px; }
+
 /* The status line. The dot is the whole point: the same 11px sentence used to
    carry "已保存" and "保存失败: 版本冲突" in the same grey, so a failure was
    only visible to someone who read it. */

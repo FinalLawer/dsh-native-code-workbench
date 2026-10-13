@@ -567,6 +567,86 @@ function themeToken(name: string): string {
   return getComputedStyle(document.body).getPropertyValue(name).trim()
 }
 
+/** The spellings Monaco's theme parser reads: `#RGB`, `#RGBA`, `#RRGGBB`, `#RRGGBBAA`. */
+const HEX_COLOR = /^#(?:[0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8})$/i
+
+/**
+ * A serialised colour — `rgb()`, `rgba()` or `color(srgb …)` — back to hex.
+ *
+ * Those three are what a browser hands back as the computed value of `color`.
+ * Anything else (a named colour, `currentColor`, a system colour) answers with
+ * an empty string rather than a guess, and the caller then leaves the theme key
+ * out.
+ * @param css - the serialised colour.
+ * @returns `#RRGGBB` or `#RRGGBBAA`, or `''` when the string is not one of the three.
+ */
+function channelHex(css: string): string {
+  const srgb = /^color\(srgb\s+([^)]+)\)$/i.exec(css)
+  const rgb = srgb === null ? /^rgba?\(([^)]+)\)$/i.exec(css) : null
+  const body = srgb?.[1] ?? rgb?.[1]
+  if (body === undefined) return ''
+  const [redPart = '', greenPart = '', bluePart = '', alphaPart] = body.split(/[\s,/]+/).filter((part) => part !== '')
+  // `rgb()` counts its channels in 0..255, `color(srgb …)` in 0..1. A percentage
+  // means the same thing to either, so it is scaled by whichever full it belongs to.
+  const full = srgb === null ? 255 : 1
+  const channel = (part: string): number => {
+    const value = Number.parseFloat(part)
+    if (!Number.isFinite(value)) return -1
+    const scaled = part.endsWith('%') ? (value / 100) * full : value
+    return Math.round(Math.max(0, Math.min(full, scaled)) * (255 / full))
+  }
+  const red = channel(redPart)
+  const green = channel(greenPart)
+  const blue = channel(bluePart)
+  if (red < 0 || green < 0 || blue < 0) return ''
+  let alpha = 255
+  if (alphaPart !== undefined) {
+    const value = Number.parseFloat(alphaPart)
+    if (!Number.isFinite(value)) return ''
+    alpha = Math.round(Math.max(0, Math.min(1, alphaPart.endsWith('%') ? value / 100 : value)) * 255)
+  }
+  const byte = (value: number): string => value.toString(16).padStart(2, '0')
+  return `#${byte(red)}${byte(green)}${byte(blue)}${alpha === 255 ? '' : byte(alpha)}`
+}
+
+/**
+ * A theme token as a colour Monaco can actually read, or `''` to leave the key out.
+ *
+ * Reading a custom property substitutes its `var()` indirection but does not
+ * evaluate colour *functions* — value computation happens where a token is
+ * used — so a token spelled `color-mix(in srgb, var(--dsw-static-blue-500) 40%,
+ * transparent)` arrives with the `color-mix()` still standing. Monaco's theme
+ * parser reads hex and only hex (`Color.fromHex` → `Color.Format.CSS.parseHex`),
+ * and its fallback for anything else is not a rejection or a warning but
+ * `Color.red`: the key paints solid `#ff0000`, silently. That was the whole of a
+ * red selection — `--dsw-alias-bg-document-selection` is the one token in this
+ * palette whose value is a colour function rather than a literal, which is why
+ * it was the only surface that broke.
+ *
+ * Using the token in a real `color` property is what makes the browser compute
+ * it, so a throwaway span borrows that computation and `channelHex` reads the
+ * answer back. When nothing readable comes out the key is dropped, and
+ * `inherit: true` supplies Monaco's own colour — the same degradation an
+ * unresolved token already gets.
+ * @param value - the token's value, as the cascade reports it.
+ * @returns a `#RRGGBB[AA]` string, or `''` when the value cannot be read as a colour.
+ */
+function monacoColor(value: string): string {
+  // An empty value would leave the probe inheriting the page's colour, which
+  // reads back as a perfectly valid colour that means nothing here.
+  if (value === '') return ''
+  if (HEX_COLOR.test(value)) return value
+  if (typeof getComputedStyle !== 'function' || typeof document.createElement !== 'function') return ''
+  const probe = document.createElement('span')
+  probe.style.position = 'absolute'
+  probe.style.display = 'none'
+  probe.style.color = value
+  document.body.appendChild(probe)
+  const resolved = getComputedStyle(probe).color
+  probe.remove()
+  return channelHex(resolved)
+}
+
 /**
  * The editor's chrome, expressed in DSH's own palette.
  *
@@ -582,9 +662,10 @@ function themeToken(name: string): string {
  * already uses that token for fenced code in the transcript, so the editor
  * matches every other place in the product that shows code.
  *
- * Tokens that do not resolve are left out rather than written as empty strings,
- * which Monaco rejects — an unresolved palette degrades to the built-in theme
- * instead of to a broken one.
+ * Only colours Monaco can read are claimed. A token that resolves to nothing, or
+ * to something the parser cannot read — a colour function, say, which is what
+ * `monacoColor` explains — is left out of the map, so a palette this host cannot
+ * express degrades to the built-in theme rather than to a broken one.
  * @param monacoApi - the loaded namespace.
  * @param dark - whether the shell is in its dark palette.
  * @returns the theme name to hand `setTheme` and `editor.create`.
@@ -593,7 +674,7 @@ function workbenchTheme(monacoApi: MonacoApi, dark: boolean): string {
   const name = dark ? 'dsh-code-workbench-dark' : 'dsh-code-workbench-light'
   const colors: Record<string, string> = {}
   const take = (monacoKey: string, token: string): void => {
-    const value = themeToken(token)
+    const value = monacoColor(themeToken(token))
     if (value !== '') colors[monacoKey] = value
   }
   take('editor.background', '--dsw-alias-markdown-code-block')
@@ -770,6 +851,465 @@ function stripFences(text: string, preserveWhitespace = false): string {
  */
 function isBlankAnswer(text: string): boolean {
   return text.trim() === ''
+}
+
+// ---------------------------------------------------------------------------
+// The selection capsule — Cursor's "Add to Chat" pill, on this side's editor.
+//
+// A small capsule that appears beside the selected lines and adds them to the
+// main chat draft. The shape of it is Cursor's, read out of its shipped
+// workbench bundle; the parts worth porting are the placement search, the
+// mounting, and the rules for getting out of the way.
+//
+// **It is a Monaco content widget, not an overlay.** Cursor hands Monaco a line,
+// a column and a side, and Monaco works out the pixels — so the capsule rides
+// scrolling, wrapping and zoom without any bookkeeping of its own, and its own
+// code never asks where anything is on screen. Cursor's `hoverWidget.js` does
+// exactly this, and `IContentWidget` is public API.
+//
+// **The offset is ours, not the preference's.** Monaco lays ABOVE and BELOW out
+// by clamping the box inside `getClientArea(body)` — the *window* — and lets it
+// hang up to a box width outside the editor. In Cursor the editor is the window,
+// so that is a good approximation; here the editor is a panel in the right
+// sidebar, and the same clamp would carry the capsule over the panel's edge. The
+// preference handed to Monaco is therefore always EXACT, which does no clamping
+// and no offset at all, and the above/below/on-the-line choice is applied as a
+// `transform` on the capsule itself — measured against a width this panel knows.
+//
+// The DOM is built by hand rather than through React. A content widget's node is
+// owned by Monaco (added once, moved by Monaco, disposed by Monaco), the capsule
+// is three elements, and the styles it needs are theme variables that
+// `workbench.css` already defines.
+// ---------------------------------------------------------------------------
+
+/**
+ * The capsule's label and the key hint printed beside it.
+ *
+ * The hint repeats what the editor's tooltip and the header button already say.
+ * Cursor looks the chord up through the keybinding service; there is no such
+ * service on this side, and the chord is registered by this file two screens
+ * further down.
+ */
+const PILL_LABEL = '加到对话'
+const PILL_KEY_LABEL = 'Ctrl+L'
+
+/**
+ * Room the capsule keeps free at the right of the longest line it may hang on.
+ * Cursor's own constant is 80px, for a two-button capsule; this one is a single
+ * button, and `workbench.css` holds it to at most this width, so the reserve and
+ * the thing being reserved for cannot drift apart.
+ */
+const PILL_RESERVE_PX = 128
+
+type PillSide = Monaco.editor.ContentWidgetPositionPreference
+
+/**
+ * Monaco's content-widget preferences, by value: `EXACT = 0`, `ABOVE = 1`,
+ * `BELOW = 2` — the numbers the public API fixes in `editor.api.d.ts`.
+ *
+ * They are spelled out rather than read off `monaco.editor` for one reason: the
+ * declaration is a `const enum`, so the value only exists at run time through the
+ * mirror monaco happens to publish on its namespace object, while the placement
+ * search below has to be usable with no monaco instance at all (the smoke suite
+ * drives it through a stub). The cast is what makes the three numbers a type.
+ */
+const PILL_EXACT = 0 as PillSide
+const PILL_ABOVE = 1 as PillSide
+const PILL_BELOW = 2 as PillSide
+
+/** Where the capsule hangs: a line, a column just past that line's text, a side. */
+interface PillPlacement {
+  lineNumber: number
+  column: number
+  side: PillSide
+}
+
+/** Everything the placement search reads, so that it needs no editor. */
+interface PillGeometry {
+  /** The caret's line. */
+  caretLine: number
+  /** The caret's column, which only survives as the fallback anchor. */
+  caretColumn: number
+  selectionStartLine: number
+  selectionEndLine: number
+  lineCount: number
+  /** The model's line length, 1-based. */
+  lineLength: (lineNumber: number) => number
+  /** Characters that fit on a line before the capsule would leave the panel. */
+  charBudget: number
+  /** Whether the editor wraps, which widens the search band. */
+  isWordWrap: boolean
+}
+
+/**
+ * Pick where the capsule hangs — Cursor's search, ported.
+ *
+ * Anchoring on the caret does not work. The caret usually sits in the middle of
+ * a line, so a capsule hung there covers code; and the end of *that* line can be
+ * a long way to the right, far enough to leave the panel. Cursor's answer is to
+ * look for a nearby line worth hanging a box *from*: short enough that the space
+ * to the right of it is empty, close enough that the capsule still reads as
+ * attached to the selection.
+ *
+ *  - **The band** is the caret's line ±2 — ±3 while the editor wraps, where one
+ *    logical line is several visual rows.
+ *  - **The line it hangs on** must be the longest of a three-line window around
+ *    itself, so both its neighbours are no longer than it is and the column past
+ *    its end is empty on all three rows.
+ *  - **The side** is which window matched: one reaching up (`[n-2, n]`) hangs the
+ *    capsule above the line, one reaching down (`[n, n+2]`) hangs it below, the
+ *    centred one (`[n-1, n+1]`) leaves it on the line. All three positions are
+ *    free for the same reason, which is what makes "any of them" safe. The window
+ *    reaching up cannot match at the very top of a file, and that is deliberate
+ *    and load-bearing — see the loop below.
+ *  - **The cost** is `|length - 5| + 25 × lines from the band's centre`, so a
+ *    nearly empty line wins outright and distance is the tie-break. The centre is
+ *    the middle of the selection, and never above the caret's line minus two.
+ *  - **The floor**: a line at or past `charBudget - 10` characters is dropped
+ *    before its cost is looked at. That is not a style filter — it is the edge of
+ *    the panel. `charBudget` is how many characters fit between the text's own
+ *    origin and the content area's right edge, less the room the capsule needs,
+ *    so a line that passes leaves the capsule somewhere to be.
+ *
+ * Ties between windows go to the earlier window (the cost comparison is strict),
+ * and ties inside a window go to the earlier line. Both are Cursor's, and both
+ * are what keep the answer still while the caret moves by one.
+ *
+ * @param geometry - everything the search reads.
+ * @returns the anchor, and the side of it to hang on.
+ */
+function selectionPillPlacement(geometry: PillGeometry): PillPlacement {
+  const { lineCount } = geometry
+  const lineLength = (lineNumber: number): number =>
+    geometry.lineLength(Math.max(1, Math.min(lineCount, lineNumber)))
+  // Cursor's starting point, which survives only if nothing in the band costs less.
+  let line = Math.max(1, Math.min(lineCount, geometry.caretLine < 4 ? geometry.selectionEndLine + 3 : geometry.caretLine - 2))
+  let column = geometry.caretColumn
+  let side = PILL_ABOVE
+  let best = Number.MAX_VALUE
+  const radius = geometry.isWordWrap ? 3 : 2
+  const first = Math.max(1, geometry.caretLine - radius)
+  const last = Math.min(lineCount - 1, geometry.caretLine + radius)
+  const centre = Math.max(geometry.caretLine - 2, Math.floor((geometry.selectionEndLine + geometry.selectionStartLine) / 2) - 1)
+  const limit = geometry.charBudget - 10
+  const consider = (scanLine: number, from: number, to: number, windowSide: PillSide): void => {
+    let longest = 0
+    let longestLine = 0
+    // The window index is kept exactly as Cursor keeps it: `from` and `to` are
+    // used as given, even where they run past the ends of the model, and only the
+    // *length* read above is clamped. The two are then compared unnormalised, so
+    // a window that had to reach past the top of the file cannot match its own
+    // middle line: for a candidate on line 1 the window index ends up on line 0
+    // or -1, and for line 2 it does so unless line 2 is strictly longer than
+    // line 1.
+    //
+    // That is load-bearing rather than incidental, so it is reproduced instead of
+    // repaired. The window reaching up is the one that hangs the capsule *above*
+    // the line, and a capsule hung above the editor's first row is outside the
+    // editor's own clipped box — it would be positioned, reported as visible, and
+    // seen by nobody. Losing that window near the top of a file is what keeps the
+    // capsule below the line there, where it can be seen.
+    for (let n = from; n <= to; n++) {
+      const length = lineLength(n)
+      if (length > longest) {
+        longest = length
+        longestLine = n
+      }
+    }
+    // Not the longest in this window: the column past its end is not empty on
+    // every row of the window, so this window cannot promise a free hang.
+    if (longestLine !== scanLine) return
+    if (longest >= limit) return
+    const cost = Math.abs(longest - PILL_EMPTY_LINE) + Math.abs(scanLine - centre) * PILL_LINE_PENALTY
+    if (cost < best) {
+      best = cost
+      line = scanLine
+      column = longest
+      side = windowSide
+    }
+  }
+  for (let scanLine = first; scanLine <= last; scanLine++) {
+    consider(scanLine, scanLine - 2, scanLine, PILL_ABOVE)
+    consider(scanLine, scanLine, scanLine + 2, PILL_BELOW)
+    consider(scanLine, scanLine - 1, scanLine + 1, PILL_EXACT)
+  }
+  // Two columns past the text: Cursor's own gap, wide enough that the capsule
+  // does not read as part of the line it hangs from.
+  return { lineNumber: line, column: column + 2, side }
+}
+
+/** The line length a window's cost treats as free. Cursor's constant. */
+const PILL_EMPTY_LINE = 5
+
+/** The cost of hanging one line away from the band's centre. Cursor's constant. */
+const PILL_LINE_PENALTY = 25
+
+/** What the capsule needs from the editor's layout, in pixels. */
+interface PillMetrics {
+  /** Characters that fit on a line before the capsule would leave the panel. */
+  charBudget: number
+  lineHeight: number
+  spaceWidth: number
+  /** Room between the text's own origin and the panel's right edge. */
+  contentWidth: number
+}
+
+/**
+ * Read the layout numbers the capsule needs, or report that they are not usable.
+ *
+ * `spaceWidth` is what turns "how many characters fit" into the only unit the
+ * model speaks, and `lineHeight` is what the vertical offset is measured in. Both
+ * come from the resolved font info, so a user's font size and family are already
+ * accounted for; a build that reports no width at all gets no capsule rather than
+ * a capsule placed by guesswork.
+ *
+ * Cursor derives the same budget from the editor's *full* width minus a handful of
+ * constants (50, the decoration lane, the scrollbar, 80 for the capsule). The
+ * text area's own width is measured here instead — the capsule is clamped against
+ * the text area, and this panel is narrow enough that the difference shows. The
+ * origin is the same one Monaco measures the anchor from: the content widget
+ * layer is laid out at `contentLeft`, and `visibleRangeForPosition` already
+ * excludes the gutter. The vertical scrollbar is the one thing taken back out,
+ * because `contentWidth` runs to the editor's right edge and includes it.
+ *
+ * A panel with no room left over at all reports "not usable", which is the same
+ * answer as a font with no measurable width — there is nowhere to put a capsule,
+ * so one is not shown, rather than one placed off the edge and clipped.
+ */
+function pillMetrics(editor: Editor, monaco: MonacoApi): PillMetrics | undefined {
+  const fontInfo = editor.getOption(monaco.editor.EditorOption.fontInfo)
+  const spaceWidth = fontInfo?.spaceWidth ?? 0
+  const lineHeight = fontInfo?.lineHeight ?? 0
+  if (!(spaceWidth > 0) || !(lineHeight > 0)) return undefined
+  const layout = editor.getLayoutInfo()
+  const usable = layout.contentWidth - layout.verticalScrollbarWidth
+  if (!(usable > PILL_RESERVE_PX)) return undefined
+  return {
+    spaceWidth,
+    lineHeight,
+    contentWidth: usable,
+    charBudget: Math.floor((usable - PILL_RESERVE_PX) / spaceWidth),
+  }
+}
+
+/** What the capsule needs to run; everything else it reads from the editor. */
+interface SelectionPillOptions {
+  editor: Editor
+  monaco: MonacoApi
+  /** The same action Ctrl+L and the context-menu entry run. */
+  onPick: () => void
+}
+
+/**
+ * The capsule itself: one content widget, added once, shown and hidden by
+ * `getPosition()`.
+ *
+ * Adding and removing the widget on every selection change would be work done
+ * for nothing — Monaco reads `getPosition()` on each `layoutContentWidget`, and a
+ * null answer is its own "put it away". So the widget is registered when the
+ * editor is created and torn down with it.
+ *
+ * Hiding has four causes, all of them Cursor's: nothing selected (or the
+ * selection is in a buffer that is not on screen), the editor has neither text
+ * nor widget focus, a Tab suggestion is on screen and owns the caret, or the
+ * numbers are unusable. A drag passing over the capsule hides it too — the
+ * pointer is selecting, and a box under it would swallow the rest of the gesture.
+ */
+class SelectionPill implements Monaco.editor.IContentWidget {
+  /**
+   * Monaco's own guard, and the reason the capsule can be clicked at all.
+   *
+   * A mousedown on a content widget never starts a selection drag — Monaco only
+   * begins one when the target is inside the text itself — but without this flag
+   * it is also not intercepted at all: nothing calls `preventDefault()`, nothing
+   * puts the focus back where the click is about to be read from, and the
+   * browser's default then hands focus to the button. The editor blurs, its
+   * selection repaints in the inactive colour, and the capsule reads as a control
+   * sitting on top of a selection that was just thrown away.
+   */
+  readonly suppressMouseDown = true
+  private readonly editor: Editor
+  private readonly monaco: MonacoApi
+  private readonly onPick: () => void
+  private readonly domNode: HTMLElement
+  /** The visible capsule, which carries the offset. */
+  private readonly body: HTMLElement
+  /** What is on screen now: an anchor and the transform for it, or nothing. */
+  private state: { placement: PillPlacement; transform: string } | null = null
+  /** Set while a Tab suggestion is on screen for the open file. */
+  private suppressed = false
+
+  constructor(options: SelectionPillOptions) {
+    this.editor = options.editor
+    this.monaco = options.monaco
+    this.onPick = options.onPick
+    this.domNode = document.createElement('div')
+    this.domNode.className = 'code-workbench-pill'
+    const body = document.createElement('div')
+    body.className = 'code-workbench-pill-body'
+    const button = document.createElement('button')
+    button.type = 'button'
+    // Out of the tab order: keyboard users already have Ctrl+L, and a focusable
+    // capsule would take focus away from the editor on the way past.
+    button.tabIndex = -1
+    button.className = 'code-workbench-pill-button'
+    button.title = `${PILL_LABEL}（${PILL_KEY_LABEL}）`
+    const text = document.createElement('span')
+    text.className = 'code-workbench-pill-text'
+    text.textContent = PILL_LABEL
+    const key = document.createElement('span')
+    key.className = 'code-workbench-pill-key'
+    key.textContent = PILL_KEY_LABEL
+    button.appendChild(text)
+    button.appendChild(key)
+    body.appendChild(button)
+    this.domNode.appendChild(body)
+    this.body = body
+    // The mousedown is swallowed so that focus never leaves the editor: the
+    // selection keeps its caret and does not fade to its inactive colour, and the
+    // click still arrives. With `suppressMouseDown` above this is belt and braces,
+    // but the two cover different halves — Monaco's flag protects the selection,
+    // this protects the focus.
+    this.domNode.addEventListener('mousedown', (event: MouseEvent) => {
+      event.preventDefault()
+      event.stopPropagation()
+    })
+    button.addEventListener('click', (event: MouseEvent) => {
+      event.preventDefault()
+      event.stopPropagation()
+      this.editor.focus()
+      this.onPick()
+    })
+  }
+
+  getId(): string {
+    return 'SelectionPill'
+  }
+
+  getDomNode(): HTMLElement {
+    return this.domNode
+  }
+
+  /**
+   * Monaco reads this on every layout: the anchor, or null to put the capsule
+   * away. The preference is always EXACT — see the note at the head of this
+   * section for why the side is carried by the transform instead.
+   */
+  getPosition(): Monaco.editor.IContentWidgetPosition | null {
+    const state = this.state
+    if (state === null) return null
+    return {
+      position: { lineNumber: state.placement.lineNumber, column: state.placement.column },
+      preference: [PILL_EXACT],
+    }
+  }
+
+  /**
+   * Tell the capsule whether a Tab suggestion is on screen.
+   *
+   * Cursor hides the capsule's button row for as long as one is; hiding the whole
+   * widget comes to the same thing through the one hide path, and a suggestion
+   * owns the caret line the capsule would otherwise hang from.
+   */
+  setSuggestionVisible(visible: boolean): void {
+    if (this.suppressed === visible) return
+    this.suppressed = visible
+    this.update()
+  }
+
+  hide(): void {
+    if (this.state === null) return
+    this.state = null
+    this.editor.layoutContentWidget(this)
+  }
+
+  /**
+   * Recompute the anchor. Five lines, three sliding windows and no allocation
+   * worth counting, so it runs on every selection change, on every edit and
+   * whenever a Tab suggestion comes and goes.
+   */
+  update(): void {
+    const next = this.place()
+    const current = this.state
+    if (current !== null && next !== null
+      && current.transform === next.transform
+      && current.placement.lineNumber === next.placement.lineNumber
+      && current.placement.column === next.placement.column) return
+    if (current === null && next === null) return
+    this.state = next
+    if (next !== null) this.body.style.transform = next.transform
+    this.editor.layoutContentWidget(this)
+  }
+
+  /** The anchor to hang on, or null when the capsule should not be up at all. */
+  private place(): { placement: PillPlacement; transform: string } | null {
+    if (this.suppressed) return null
+    const model = this.editor.getModel()
+    if (model === null) return null
+    const selection = this.editor.getSelection()
+    if (selection === null || selection.isEmpty()) return null
+    // Cursor accepts widget focus as well as text focus, which is what keeps the
+    // capsule up while the user is inside one of the editor's own inputs.
+    if (!this.editor.hasTextFocus() && !this.editor.hasWidgetFocus()) return null
+    const caret = this.editor.getPosition()
+    if (caret === null) return null
+    const metrics = pillMetrics(this.editor, this.monaco)
+    if (metrics === undefined) return null
+    const placement = selectionPillPlacement({
+      caretLine: caret.lineNumber,
+      caretColumn: caret.column,
+      selectionStartLine: selection.startLineNumber,
+      selectionEndLine: selection.endLineNumber,
+      lineCount: model.getLineCount(),
+      lineLength: (lineNumber) => model.getLineLength(lineNumber),
+      charBudget: metrics.charBudget,
+      isWordWrap: this.isWordWrap(),
+    })
+    return { placement, transform: this.offset(placement, metrics) }
+  }
+
+  /**
+   * The capsule's own placement: the vertical side, and the horizontal clamp.
+   *
+   * The vertical half is Cursor's preference, moved to CSS: above means the
+   * capsule's underside sits just over the line, below means its top sits just
+   * under it, and "on the line" centres it on the line's row. A percentage moves
+   * the box by its own height, which is what lets the two outer cases be written
+   * without measuring anything.
+   *
+   * The horizontal half is the same clamp Monaco would have applied for ABOVE and
+   * BELOW, done here against the content area: the anchor is one column past the
+   * longest line, so the capsule only needs sliding when that line is long enough
+   * to have been dropped by the search's own floor and the fallback anchor landed
+   * far to the right. The clamp is exact for a monospace font, which is what a
+   * code editor is set in.
+   */
+  private offset(placement: PillPlacement, metrics: PillMetrics): string {
+    const anchor = (placement.column - 1) * metrics.spaceWidth
+    const dx = Math.min(0, metrics.contentWidth - PILL_RESERVE_PX - anchor)
+    const dy = placement.side === PILL_ABOVE
+      ? 'calc(-100% - 4px)'
+      : placement.side === PILL_BELOW
+        ? `${Math.round(metrics.lineHeight + 4)}px`
+        : `calc(-50% + ${Math.round(metrics.lineHeight / 2)}px)`
+    return `translate(${Math.round(dx)}px, ${dy})`
+  }
+
+  /**
+   * Whether the editor wraps, which the search reads as "one logical line may be
+   * several visual rows" and answers with a wider band.
+   *
+   * The override chain is the one Cursor walks — the second override wins, then
+   * the first, then the plain setting — spelled with option ids rather than the
+   * numbers Cursor's build had frozen into it.
+   */
+  private isWordWrap(): boolean {
+    const options = this.editor.getOptions()
+    const second = options.get(this.monaco.editor.EditorOption.wordWrapOverride2)
+    const first = second === 'inherit' ? options.get(this.monaco.editor.EditorOption.wordWrapOverride1) : second
+    const wrap = first === 'inherit' ? options.get(this.monaco.editor.EditorOption.wordWrap) : first
+    return wrap !== 'off'
+  }
 }
 
 /**
@@ -1916,8 +2456,7 @@ function CodePanel(props: DSH.CodePanelProps): React.ReactNode {
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyL, () => { addToChatRef.current?.() })
     // The same action, in the editor's own context menu. Ctrl+L was the only way
     // to reach Add to Chat, and a right-click on a selection is where people look
-    // for it first — the floating pill that would have answered this was dropped,
-    // so the menu entry is the affordance instead.
+    // for it first. The selection capsule below is the third way in.
     //
     // Two omissions are deliberate. No `keybinding`: Ctrl+L is registered once
     // above, and a second registration of the same chord is a silent duplicate
@@ -1934,8 +2473,25 @@ function CodePanel(props: DSH.CodePanelProps): React.ReactNode {
       contextMenuOrder: 100,
       run: () => addToChatRef.current?.(),
     })
+    // The capsule. One widget for the life of the editor: showing and hiding is
+    // `getPosition()` answering null, so nothing is added to or removed from the
+    // editor's content-widget list while the user types.
+    const pill = new SelectionPill({ editor, monaco, onPick: () => { addToChatRef.current?.() } })
+    editor.addContentWidget(pill)
     const selectionListener = editor.onDidChangeCursorSelection(() => {
       setHasSelection(!editor.getSelection()?.isEmpty())
+      // A selection the user drew by hand supersedes whatever suggestion was on
+      // screen when it started, and the capsule reads the same event to move.
+      pill.setSuggestionVisible(false)
+      pill.update()
+    })
+    const blurListener = editor.onDidBlurEditorText(() => { pill.hide() })
+    // Cursor hides the capsule when the line it hangs from has been deleted.
+    // Re-running the search is that, plus the case an edit above the capsule
+    // moved its line — and the search is cheap enough to just redo.
+    const contentListener = editor.onDidChangeModelContent(() => {
+      pill.setSuggestionVisible(false)
+      pill.update()
     })
     // Tab-completion ghost text: Monaco renders the preview and accepts on Tab;
     // this provider only answers "what should be inserted at the caret".
@@ -1966,12 +2522,24 @@ function CodePanel(props: DSH.CodePanelProps): React.ReactNode {
         if (prefix.trim() === '') return { items: [] }
         const cacheKey = `${sessionId}\u0000${st.path}\u0000${settings.completionBaseUrl}\u0000${settings.completionApiModel}\u0000${model.getLanguageId()}\u0000${prefix}\u0000${suffix}`
         // Monaco only needs the text at the caret; the range is a caret insert.
-        const ghostText = (text: string): Monaco.languages.InlineCompletions => ({
-          items: [{
-            insertText: text,
-            range: new monaco.Range(position.lineNumber, position.column, position.lineNumber, position.column),
-          }],
-        })
+        //
+        // Handing back a suggestion is also the only moment this side knows one
+        // is on screen, and a suggestion occupies the very strip the capsule
+        // hangs in — Cursor reads the same fact off its suggestion service and
+        // hides the capsule's button row for it. Suppressing here rather than at
+        // each `return` means every path that produces ghost text, present and
+        // future, carries the rule. `disposeInlineCompletions` below is the
+        // other half, and Monaco calls it on a caret move, on Esc, on Tab, and
+        // when a new request replaces the items this one returned.
+        const ghostText = (text: string): Monaco.languages.InlineCompletions => {
+          pill.setSuggestionVisible(true)
+          return {
+            items: [{
+              insertText: text,
+              range: new monaco.Range(position.lineNumber, position.column, position.lineNumber, position.column),
+            }],
+          }
+        }
         const known = completionCache.get(cacheKey)
         if (known !== undefined) {
           setCompletionStatus('Tab 接受 AI 建议')
@@ -2046,7 +2614,10 @@ function CodePanel(props: DSH.CodePanelProps): React.ReactNode {
           onCancel?.dispose?.()
         }
       },
-      disposeInlineCompletions: () => {},
+      // The ghost text has gone, so the caret is the capsule's again. Monaco
+      // calls this even for an empty item list, so the flag cannot survive a
+      // suggestion that was disposed without ever being shown.
+      disposeInlineCompletions: () => { pill.setSuggestionVisible(false) },
     })
     // Announcing a change is how this plugin asks for a suggestion at a moment
     // Monaco would not ask at all. Monaco asks on a typed character, on paste,
@@ -2069,6 +2640,14 @@ function CodePanel(props: DSH.CodePanelProps): React.ReactNode {
       // later instance a promise from the previous one.
       inFlightRef.current.clear()
       selectionListener.dispose()
+      blurListener.dispose()
+      contentListener.dispose()
+      // The capsule's node needs no unwinding of its own, and that is the second
+      // reason it is registered once rather than on every selection change: it is
+      // a child of the editor's own DOM, and `editor.dispose()` detaches that
+      // whole subtree from the host. (`removeContentWidget` on its own is only
+      // `domNode.remove()`; Monaco clears its content-widget map without touching
+      // the DOM.) The listeners go first so nothing can fire mid-teardown.
       observer.disconnect()
       editor.dispose()
       editorRef.current = null

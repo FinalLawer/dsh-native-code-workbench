@@ -67,16 +67,86 @@ function dispatchDocument(type, event) {
   return ran
 }
 
+/**
+ * A DOM element stand-in, only as much as the selection capsule builds with.
+ *
+ * The capsule is the one place in this plugin that writes DOM by hand — a
+ * content widget's node belongs to Monaco, so it cannot be a React element — and
+ * what is worth asserting about it is its class names, the transform the
+ * placement search settles on, and which listener a click runs. `style` is a
+ * plain object here, so a `style.transform` write reads back, and `dispatch`
+ * fires the listener the way a browser would.
+ */
+function createElementStub(tagName) {
+  const node = {
+    tagName: String(tagName).toUpperCase(),
+    dataset: {}, style: {}, children: [], listeners: [],
+    className: '', title: '', textContent: '', placeholder: '', value: '', type: '', tabIndex: 0,
+    appendChild(child) { node.children.push(child); return child },
+    append(child) { node.appendChild(child) },
+    addEventListener(type, handler) { node.listeners.push({ type, handler }) },
+    removeEventListener(type, handler) {
+      node.listeners = node.listeners.filter((row) => row.type !== type || row.handler !== handler)
+    },
+    dispatch(type) {
+      const row = node.listeners.find((entry) => entry.type === type)
+      row?.handler({ preventDefault() {}, stopPropagation() {} })
+      return row !== undefined
+    },
+    remove() {},
+  }
+  return node
+}
 globalThis.document = {
   head: { appendChild() {} },
-  createElement: () => ({
-    dataset: {}, style: {}, placeholder: '', textContent: '', value: '',
-    append() {}, appendChild() {}, addEventListener() {}, remove() {},
-  }),
+  createElement: (tagName) => createElementStub(tagName),
   getElementById: () => null,
-  body: { hasAttribute: () => false },
+  // `appendChild` is for the theme probe: `monacoColor` has to hand a token to a
+  // real `color` property for the browser to compute it, which it does on a span
+  // it adds to the body and takes straight back out.
+  body: { hasAttribute: () => false, appendChild() {} },
   addEventListener: addDocumentListener,
   removeEventListener: removeDocumentListener,
+}
+/**
+ * The palette the theme build reads out of the cascade, and the colours a browser
+ * would compute for the tokens that are not literals.
+ *
+ * `--dsw-alias-bg-document-selection` is the one under test: DSH spells it
+ * `color-mix(...)`, and a custom property hands a colour function back
+ * unevaluated. It is also the only token here whose value Monaco's hex-only
+ * parser cannot read, which is why passing it through painted a solid red
+ * selection instead of being ignored.
+ */
+const themeTokens = {
+  '--dsw-alias-markdown-code-block': '#f9fafb',
+  '--dsw-alias-label-primary': '#0f1115',
+  '--dsw-alias-bg-document-selection': 'color-mix(in srgb, #3b82f6 40%, transparent)',
+  // Read through another alias rather than a literal, so the answer comes back
+  // in the other spelling Chrome uses: the channels scaled into 0..1, which
+  // happens whenever a component falls outside sRGB.
+  '--dsw-alias-brand-primary': 'var(--dsw-alias-label-primary)',
+  // A colour the reader refuses on purpose: `channelHex` understands `rgb()`,
+  // `rgba()` and `color(srgb …)` only, so this key has to be dropped rather than
+  // handed over as something Monaco would paint red.
+  '--dsw-alias-border-l2': 'color(display-p3 0.1 0.2 0.3)',
+  // Declared as a name but never given a value — DSH does exactly this with
+  // `fill-l1`, which only ever appears inside a `var()` reference.
+  '--dsw-alias-fill-l1': '',
+}
+const computedColors = {
+  'color-mix(in srgb, #3b82f6 40%, transparent)': 'rgba(59, 130, 246, 0.4)',
+  'var(--dsw-alias-label-primary)': 'color(srgb 0.0588 0.0667 0.0824)',
+  'color(display-p3 0.1 0.2 0.3)': 'color(display-p3 0.1 0.2 0.3)',
+}
+/**
+ * The two call shapes the plugin makes: a custom property read on `body`, and the
+ * computed `color` of the probe span. The second one is the whole point — it is
+ * where a `color-mix()` stops being a token stream and becomes a colour.
+ */
+globalThis.getComputedStyle = (node) => {
+  if (node.tagName === 'SPAN') return { color: computedColors[node.style.color] ?? '' }
+  return { getPropertyValue: (name) => themeTokens[name] ?? '' }
 }
 /**
  * Tree row nodes, so the keyboard-navigation path can be observed.
@@ -151,6 +221,10 @@ const calls = {
   previewOpens: [],
   terminalOpens: [],
   editorActions: [],
+  contentWidgets: [],
+  layouts: [],
+  focuses: 0,
+  themes: [],
 }
 const fakeActx = {
   bail(self, event, payload) {
@@ -195,9 +269,38 @@ let modelText = 'const needle = 1\nconst b = 2\n'
 // The caret offset, movable so the completion window can be driven to its caps.
 let fakeOffset = 16
 
+// --- The editor state the selection capsule reads, all of it movable so the
+// placement search can be driven down each of its branches. A caret, resolved
+// font and layout numbers, and the two focus flags are the capsule's whole input
+// from the editor.
+let caretPosition = { lineNumber: 1, column: 17 }
+// The capsule refuses to appear unless the editor has text or widget focus. The
+// stub says it has, because a panel nobody has clicked into would otherwise
+// never show anything to assert on; the focus case below flips it.
+let editorTextFocus = true
+// Per-line lengths, which is what the search ranks candidate lines by.
+let modelLineLengths = [8, 3]
+// The model's line count, which is what bounds the search band. Two is the
+// default the rest of the suite assumes; the capsule section opens it up so a
+// candidate deep enough in a file can be reached at all.
+let modelLineCount = 2
+// Keyed by `EditorOption` id, the way `editor.getOption` is called. The ids are
+// monaco's own, taken from its public enum: fontInfo 59, wordWrap 149,
+// wordWrapOverride1 153, wordWrapOverride2 154, layoutInfo 166.
+const editorOptionValues = {
+  59: { spaceWidth: 8, lineHeight: 19 },
+  149: 'off',
+  153: 'inherit',
+  154: 'inherit',
+}
+// `contentWidth` runs to the editor's right edge and includes the vertical
+// scrollbar; the capsule takes the scrollbar back out before clamping.
+const editorLayout = { contentLeft: 60, contentWidth: 800, verticalScrollbarWidth: 14 }
+
 const fakeModel = {
   getOffsetAt: () => fakeOffset,
-  getLineCount: () => 2,
+  getLineCount: () => modelLineCount,
+  getLineLength: (lineNumber) => modelLineLengths[lineNumber - 1] ?? 0,
   getLineMaxColumn: () => 20,
   getLanguageId: () => 'javascript',
   getValue: () => modelText,
@@ -232,16 +335,37 @@ const fakeEditor = {
     startLineNumber: 3,
     endLineNumber: 5,
   }),
-  getPosition: () => ({ lineNumber: 1, column: 17 }),
+  getPosition: () => caretPosition,
   onDidChangeCursorSelection(cb) {
     calls.selectionListener = cb
     return { dispose() {} }
   },
+  // `editor.onDidChangeModelContent`, distinct from the model's own content
+  // event: the capsule follows the former, and the buffer's dirty flag the
+  // latter.
+  onDidChangeModelContent(cb) {
+    calls.editorContentListener = cb
+    return { dispose() {} }
+  },
+  onDidBlurEditorText(cb) {
+    calls.blurListener = cb
+    return { dispose() {} }
+  },
   executeEdits() {},
   pushUndoStop() {},
-  addContentWidget() {},
+  // The content-widget door. Registered once per editor and hidden through
+  // `getPosition()` returning null, so the suite keeps the widget object and
+  // drives the capsule through the same API Monaco does.
+  addContentWidget(widget) { calls.contentWidgets.push(widget) },
   updateContentWidget() {},
   removeContentWidget() {},
+  layoutContentWidget(widget) { calls.layouts.push(widget.getId()) },
+  focus() { calls.focuses++; editorTextFocus = true },
+  hasTextFocus: () => editorTextFocus,
+  hasWidgetFocus: () => false,
+  getOption: (id) => editorOptionValues[id],
+  getOptions: () => ({ get: (id) => editorOptionValues[id] }),
+  getLayoutInfo: () => editorLayout,
   deltaDecorations: () => [],
   setSelection() {
     calls.selections++
@@ -268,7 +392,20 @@ const fakeMonaco = {
       }
     },
     setTheme() {},
-    ContentWidgetPositionPreference: { BELOW: 1 },
+    // Recorded rather than swallowed: this is the only place a DSH palette token
+    // becomes a Monaco colour, and the loss is silent when it goes wrong.
+    defineTheme(name, theme) {
+      calls.themes.push({ name, theme })
+    },
+    // The real values, which the stub used to get wrong: `EXACT` is 0, `ABOVE` is
+    // 1 and `BELOW` is 2, and only spelling all three lets a capsule assert which
+    // one it asked for.
+    ContentWidgetPositionPreference: { EXACT: 0, ABOVE: 1, BELOW: 2 },
+    // The option ids the capsule resolves through. `fontInfo` and the three
+    // `wordWrap*` entries are the ones it reads; the rest of the enum is absent
+    // on purpose, so a new read shows up as `undefined` rather than silently
+    // working against a stub that guessed.
+    EditorOption: { fontInfo: 59, wordWrap: 149, wordWrapOverride1: 153, wordWrapOverride2: 154, layoutInfo: 166 },
   },
   languages: {
     getLanguages: () => [
@@ -469,6 +606,31 @@ check('the panel shell renders', allText().includes('保存 (Ctrl+S)') && allTex
 check('the tree lists the workspace root', allText().includes('a.js') && allText().includes('sub'), calls.list)
 check('the root listing used the session cwd', calls.list[0] === 'C:\\repo', calls.list)
 check('the editor mounted', calls.editorCreate === 1, calls.editorCreate)
+// The palette path, which had no coverage at all until a selection came out
+// solid red. Monaco runs every theme colour through `Color.fromHex`, which reads
+// hex and only hex and answers `Color.red` for anything else — so a token that
+// arrives as a colour function is not rejected, it is painted. The assertions
+// below pin both halves: what a readable token becomes, and that an unreadable
+// one is left out of the map instead of being handed over.
+check('the editor theme is built once, from the host palette',
+  calls.themes.length === 1
+  && calls.themes[0].name === 'dsh-code-workbench-light'
+  && calls.themes[0].theme.base === 'vs'
+  && calls.themes[0].theme.inherit === true,
+  calls.themes.map((row) => row.name))
+const themeColors = calls.themes[0]?.theme.colors ?? {}
+check('a token that is already a literal passes through unchanged',
+  themeColors['editor.background'] === '#f9fafb', themeColors['editor.background'])
+check('a color-mix() token is probed into a hex, never handed over as written',
+  themeColors['editor.selectionBackground'] === '#3b82f666', themeColors['editor.selectionBackground'])
+check('the 0..1 spelling of a computed colour is read too',
+  themeColors['editorCursor.foreground'] === '#0f1115', themeColors['editorCursor.foreground'])
+check('a computed colour the reader refuses is dropped rather than painted',
+  themeColors['editorIndentGuide.activeBackground1'] === undefined,
+  themeColors['editorIndentGuide.activeBackground1'])
+check('a token the host never gave a value is dropped',
+  themeColors['editor.lineHighlightBackground'] === undefined,
+  themeColors['editor.lineHighlightBackground'])
 check('editor commands retain save and Add to Chat without inline editing',
   JSON.stringify(calls.commands?.map((row) => row.keybinding)) === JSON.stringify([
     fakeMonaco.KeyMod.CtrlCmd | fakeMonaco.KeyCode.KeyS,
@@ -637,6 +799,174 @@ check('a second ask for the same caret joins the round trip instead of starting 
 check('the joined ask receives the answer instead of "no suggestion"',
   joined?.[1]?.items?.[0]?.insertText === ' + 1', joined?.[1])
 globalThis.fetch = originalFetch
+
+// ---------------------------------------------------------------------------
+// The selection capsule: Cursor's "Add to Chat" pill, and the third door onto
+// the action Ctrl+L and the editor context menu already open.
+//
+// The placement search is the part worth pinning, because where it *does not*
+// hang the capsule from is the design: hanging from the caret covers code, and
+// hanging from the end of the caret's own line can push the capsule out of the
+// panel entirely, since a long line's end may be far to the right and past the
+// clamp. Cursor's answer is to look for a nearby line short enough that the
+// space past its end is empty on every row of a three-line window, and hang
+// there — and which of the three windows matched is what says which side of the
+// line the capsule goes.
+// ---------------------------------------------------------------------------
+console.log('\nselection capsule')
+const capsule = calls.contentWidgets.at(-1)
+check('the capsule is one content widget, registered for the editor’s life',
+  calls.contentWidgets.length === 1 && capsule?.getId() === 'SelectionPill',
+  calls.contentWidgets.map((widget) => widget.getId()))
+check('it swallows mousedown, so clicking it cannot clear the selection it offers',
+  capsule?.suppressMouseDown === true, capsule?.suppressMouseDown)
+const capsuleNode = capsule.getDomNode()
+const capsuleBody = capsuleNode.children[0]
+const capsuleButton = capsuleBody.children[0]
+check('the capsule is a label, a key hint and nothing else',
+  capsuleNode.className === 'code-workbench-pill'
+  && capsuleBody.className === 'code-workbench-pill-body'
+  && capsuleButton.className === 'code-workbench-pill-button'
+  && capsuleButton.tagName === 'BUTTON' && capsuleButton.type === 'button'
+  // Out of the tab order on purpose: Ctrl+L is the keyboard door, and a
+  // focusable capsule would take focus off the editor on the way past it.
+  && capsuleButton.tabIndex === -1
+  && capsuleButton.title === '加到对话（Ctrl+L）'
+  && capsuleButton.children.map((child) => `${child.className}=${child.textContent}`).join('|')
+    === 'code-workbench-pill-text=加到对话|code-workbench-pill-key=Ctrl+L',
+  { node: capsuleNode.className, button: capsuleButton.className, hover: capsuleButton.title })
+
+// Nothing selected, nothing to offer.
+selectionEmpty = true
+await act(async () => { calls.selectionListener() })
+await act(async () => {})
+check('no selection means no capsule', capsule.getPosition() === null, capsule.getPosition())
+
+// The caret is on line 1 and the selection spans lines 3-5, so the search band
+// is line 1 alone: the band is the caret's line ±2, capped at `lineCount - 1`.
+// Line 1 is ten characters against line 2's three, which is long enough to leave
+// the space past its end empty, and every window that can win costs |10 - 5| for
+// standing away from a near-empty line plus 25 for the one line between line 1
+// and the band's centre at line 3.
+//
+// The capsule still ends up *below* line 1, and this is the one part of the
+// search that has to be reproduced rather than tidied up. The window reaching up
+// is the one that hangs the capsule above a line, and Cursor's own loop keeps
+// that window's index unclamped while clamping the length it reads — so for a
+// candidate on line 1 the index lands on line 0 or -1 and the window can never
+// match itself. Losing it there is what keeps the capsule inside the editor: the
+// first row of a file is the top of the editor's clipped box, and a capsule hung
+// above it would be positioned, reported as visible, and seen by nobody.
+selectionEmpty = false
+modelLineLengths = [10, 3]
+caretPosition = { lineNumber: 1, column: 17 }
+editorTextFocus = true
+await act(async () => { calls.selectionListener() })
+await act(async () => {})
+check('the capsule hangs two columns past the end of a line short enough to clear it',
+  JSON.stringify(capsule.getPosition()) === JSON.stringify({ position: { lineNumber: 1, column: 12 }, preference: [0] }),
+  capsule.getPosition())
+check('at the top of a file it can only go below that line, and the side is its own transform',
+  capsuleBody.style.transform === 'translate(0px, 23px)', capsuleBody.style.transform)
+// Monaco recomputes a content widget's anchor on `layoutContentWidget` and on
+// nothing else; `getPosition()` is read there. An invented `updateContentWidget`
+// would be a no-op against the real editor.
+check('moves go through the one layout call Monaco has for a content widget',
+  calls.layouts.at(-1) === 'SelectionPill', calls.layouts.slice(-3))
+
+// Deeper in a file the window reaching up can match, and there it wins: line 3 is
+// twelve characters against its neighbours' ten, three and two, so it is the
+// longest of all three windows around it and costs only |12 - 5| with no distance
+// penalty at all. Every other candidate in the band costs more. Without this case
+// a capsule hard-wired to sit below a line would pass the rest of the section.
+modelLineCount = 6
+modelLineLengths = [10, 3, 12, 2, 2, 2]
+caretPosition = { lineNumber: 3, column: 3 }
+await act(async () => { calls.selectionListener() })
+await act(async () => {})
+check('a long line with room around it takes the capsule above it instead',
+  JSON.stringify(capsule.getPosition()) === JSON.stringify({ position: { lineNumber: 3, column: 14 }, preference: [0] })
+  && capsuleBody.style.transform === 'translate(0px, calc(-100% - 4px))',
+  { position: capsule.getPosition(), transform: capsuleBody.style.transform })
+modelLineCount = 2
+
+// Cursor accepts widget focus as well as text focus. With neither, the capsule
+// is a click target floating over an editor that is not listening.
+editorTextFocus = false
+await act(async () => { calls.selectionListener() })
+await act(async () => {})
+check('an editor that does not have focus shows no capsule', capsule.getPosition() === null, capsule.getPosition())
+editorTextFocus = true
+await act(async () => { calls.selectionListener() })
+await act(async () => {})
+check('and the capsule comes back with the focus', capsule.getPosition() !== null)
+calls.blurListener()
+check('losing text focus is its own way out', capsule.getPosition() === null, capsule.getPosition())
+
+// A line with no room left to its right is dropped before its cost is even
+// looked at, because that is the edge of the panel rather than a matter of
+// taste. With nothing in the band left to hang from, the caret's own column
+// becomes the anchor — two columns past it, the same gap as everywhere else —
+// and far enough right, that anchor is outside the panel. The clamp is what
+// pulls the capsule back, and it is exactly why the preference handed to Monaco
+// is EXACT with the offset kept here: Monaco's own ABOVE/BELOW clamp is measured
+// against the *window*, which stands in well for Cursor where the editor is the
+// window, and is wrong here where the editor is a panel in a sidebar.
+modelLineLengths = [400, 3]
+caretPosition = { lineNumber: 1, column: 120 }
+await act(async () => { calls.selectionListener() })
+await act(async () => {})
+check('a fallback anchor far to the right is clamped back inside the panel',
+  capsuleBody.style.transform === 'translate(-310px, calc(-100% - 4px))', capsuleBody.style.transform)
+
+// A Tab suggestion occupies the very strip the capsule hangs in and owns the
+// caret line, so the capsule stands down for as long as one is on screen. The
+// completion provider is the only thing on this side that knows either fact:
+// reporting a suggestion suppresses the capsule, and Monaco's disposal of it
+// brings the capsule back.
+modelLineLengths = [10, 3]
+caretPosition = { lineNumber: 1, column: 17 }
+await act(async () => { calls.selectionListener() })
+await act(async () => {})
+check('the capsule is up before the suggestion arrives', capsule.getPosition() !== null, capsule.getPosition())
+globalThis.fetch = async () => new Response(JSON.stringify({ ok: true, text: ' + 1' }), { headers: { 'content-type': 'application/json' } })
+await act(async () => {
+  await calls.inlineCompletionProvider.provideInlineCompletions(currentModel, { lineNumber: 1, column: 17 }, {}, completionToken)
+})
+check('a Tab suggestion puts the capsule away', capsule.getPosition() === null, capsule.getPosition())
+await act(async () => { calls.inlineCompletionProvider.disposeInlineCompletions([], { reason: 0 }) })
+check('and disposing the suggestion brings it back, in the same place',
+  JSON.stringify(capsule.getPosition()) === JSON.stringify({ position: { lineNumber: 1, column: 12 }, preference: [0] })
+  && capsuleBody.style.transform === 'translate(0px, 23px)',
+  { position: capsule.getPosition(), transform: capsuleBody.style.transform })
+globalThis.fetch = originalFetch
+
+// The capsule is a door onto `addToChat`, not a second implementation of it, so
+// the click has to land on the same reference-insert channel the chord and the
+// context menu use — and hand the editor back its focus on the way, which is
+// what keeps the selection from fading to its inactive colour.
+const chipsBeforeClick = calls.bailed.length
+editorTextFocus = false
+await act(async () => { capsuleButton.dispatch('click') })
+await act(async () => {})
+check('clicking the capsule runs Add to Chat',
+  calls.bailed.length === chipsBeforeClick + 1
+  && calls.bailed.at(-1).event === 'slash/input-insert-reference'
+  && calls.bailed.at(-1).payload.reference.label.includes('a.js:3-5'),
+  calls.bailed.at(-1))
+check('and gives the editor its focus back first',
+  calls.focuses > 0 && editorTextFocus === true, { focuses: calls.focuses, editorTextFocus })
+
+// Put the editor back the way this section found it: no selection, the header
+// button disabled again, and the default line lengths. The later Add to Chat
+// section drives the selection from scratch and asserts the transition.
+selectionEmpty = true
+modelLineLengths = [8, 3]
+caretPosition = { lineNumber: 1, column: 17 }
+await act(async () => { calls.selectionListener() })
+await act(async () => {})
+check('and going back to no selection takes the capsule away again',
+  capsule.getPosition() === null, capsule.getPosition())
 
 console.log('\nedit + save with the version guard')
 await act(async () => {
