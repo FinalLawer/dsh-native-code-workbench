@@ -1,10 +1,10 @@
-# dsh-code-workbench — TypeScript
+# dsh-code-workbench
 
-DSH Web GUI 右栏的代码工作台插件，**TypeScript 重写版**。
+DSH Web GUI 右栏的代码工作台插件：Monaco（VS Code 编辑器内核）浏览和编辑工作区文件，
+外加代码库检索、Tab 补全（FIM）、保存检查点与回滚、把代码加进对话。**TypeScript 源码**。
 
-本目录是 `dsh-code-workbench` 的一次完整 TypeScript 重构：行为与 0.5.5 版逐字等价，
-源码全部改为带类型的 `.ts` / `.mts`，并新增了一套手写的 DSH SDK 类型声明。
-原 JS 版项目未被改动，两者可以并存对照。
+产品向的说明（安装、能力、已知限制）在仓库根目录的 `README.md`（另有英/繁译本）；
+本文件记的是这个包自身的构建与验证方式。
 
 ---
 
@@ -14,7 +14,7 @@ DSH Web GUI 右栏的代码工作台插件，**TypeScript 重写版**。
 npm install          # 依赖（含 typescript 与 @types/react）
 npm run typecheck    # 类型门禁：tsc --noEmit，strict 全开
 npm run build        # 转译 Host 半边 + 打包 client 半边
-npm test             # 11 个测试套件
+npm test             # 12 个测试套件
 npm run manifest     # 重新生成 update.json
 ```
 

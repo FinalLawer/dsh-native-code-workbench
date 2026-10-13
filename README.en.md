@@ -19,7 +19,7 @@ dsh-code-workbench
 Pin a version by naming it:
 
 ```
-dsh-code-workbench@0.6.1
+dsh-code-workbench@0.6.2
 ```
 
 ### From GitHub
@@ -31,7 +31,7 @@ https://github.com/FinalLawer/dsh-native-code-workbench#path:/dsh-code-workbench
 To pin, carry the tag with it:
 
 ```
-https://github.com/FinalLawer/dsh-native-code-workbench#v0.6.1&path:/dsh-code-workbench
+https://github.com/FinalLawer/dsh-native-code-workbench#v0.6.2&path:/dsh-code-workbench
 ```
 
 ⚠️ **The `#path:/dsh-code-workbench` fragment is not optional.** This repository's root is not a package — the plugin lives in the `dsh-code-workbench/` subdirectory, and the root has no `package.json`. Omit it and pnpm still reports a successful install, but what lands is a placeholder package named `dsh-native-code-workbench.git` at version `0.0.0` (its manifest is pnpm's generated `{"_pnpmPlaceholder": …}`), with neither a package manifest nor a `dsh.bundle` declaration — DSH cannot read a bundle out of it and the plugin never appears. That failure happens *after* the install, so nothing about the install process shows it. npm and the tarball do not have this problem.
@@ -83,9 +83,11 @@ POST {baseUrl}/completions        # used as-is if baseUrl already ends in /compl
 
 Responses are read from `choices[0]` across `text`, `message.content` and `delta.content` in that order, so a compatible service other than DeepSeek works unchanged. Requests carry a hard 10-second timeout; typing interrupts and aborts the one in flight immediately.
 
-Triggering is left entirely to Monaco: it issues its own request on every typed character (space included), on backspace/delete, on Tab, on paste and on explicit caret movement, and the plugin no longer adds a shot of its own. It used to fire `editor.action.inlineSuggest.trigger` 400 ms after a content change, and that is an **Explicit** trigger, which does not satisfy an in-flight Automatic request — Monaco discards the one in flight and starts another, so every completion cost an extra round trip and a fixed extra 400 ms; worse, every further keystroke pushed the finish line another 400 ms out, which reads as "it only shows up if I type a space or delete something".
+Triggering is mostly left to Monaco: it issues its own request on every typed character (space included), on backspace/delete, on Tab, and on paste. The plugin adds exactly the one case Monaco never asks about: the **caret arriving** (a mouse click into a line, the arrow keys walking there) — after it settles for 250 ms, one ask goes out through the `onDidChangeInlineCompletions` channel. A caret move an edit dragged along, a landing inside a selection being drawn, and a move the program made on its own are not arrivals. It used to fire `editor.action.inlineSuggest.trigger` 400 ms after a content change, and that is an **Explicit** trigger, which does not satisfy an in-flight Automatic request — Monaco discards the one in flight and starts another, so every completion cost an extra round trip and a fixed extra 400 ms; worse, every further keystroke pushed the finish line another 400 ms out, which reads as "it only shows up if I type a space or delete something".
 
 Concurrent requests for the same caret now share one round trip: the second ask awaits the first answer and prefers the cache, rather than replying `{items: []}` — an empty array is not "I don't know" to Monaco but a verdict that *this version has no suggestions*, and once recorded in state it short-circuits later asks on that version, so the user has to move the keyboard again to unlock it.
+
+**On a blank line**: with the caret sitting on an empty (or indent-only) line, the model often answers with its end-of-line habit — a line break first, then indented code. But the line is already new, so the extra break leaves the ghost's first line as nothing but spaces or an indent, and Tab inserts a break plus indent. The plugin folds that redundant leading break onto the blank line so the code lands where the caret is (the same treatment Cursor gives a suggestion landing at a line boundary); an answer that is still whitespace after the fold remains "no suggestion". At the end of a real line the very same break-and-indent is the right answer and is kept verbatim.
 
 ### Settings
 

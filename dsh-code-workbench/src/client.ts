@@ -777,6 +777,44 @@ const DRAG_HOVER_EXPAND_MS = 700
  */
 const SEARCH_DEBOUNCE_MS = 300
 
+/**
+ * How long the caret must rest before its arrival is announced as a question.
+ *
+ * Monaco asks for a suggestion when text changes and when its own trigger
+ * commands run — but a caret that merely *arrives* (a mouse click, the arrow
+ * keys) asks nothing at all, and the caret move even drops the ghost that was
+ * showing. Clicking into a line and then doing nothing therefore produced no
+ * suggestion, which is what this timer closes. It is a settle, not a throttle:
+ * walking the caret down a file with the arrow keys resets it every move and
+ * pays for one request where the walk stops. Cursor answers the same case from
+ * its own `onDidChangeCursorPosition` listener (`fireCppSuggestionDebounced`
+ * with the `Qk.LineChange` source, 25/60ms there); the longer settle here is
+ * because every request is a network round trip rather than a local model.
+ */
+const CARET_SETTLE_MS = 250
+
+/**
+ * How close to an edit a caret move must land to count as that edit's own
+ * movement rather than a deliberate arrival.
+ *
+ * Typing drags the caret along and Monaco already asks for that move; asking
+ * again would be a second round trip for the same caret — and worse, the two
+ * asks would race. The content listener stamps the edit and cancels any
+ * pending settle, and the caret listener additionally ignores moves landing
+ * inside this window (Cursor filters the same case by the pair
+ * `reason===2&&source==="modelChange"`).
+ */
+const CARET_EDIT_ECHO_MS = 100
+
+/**
+ * `monaco.editor.CursorChangeReason` values for the moves that are not
+ * arrivals. Spelled as numbers rather than reached through the enum because
+ * the slim entry exports the `editor` namespace but the reason lives on the
+ * event, and the test double speaks the same numbers.
+ */
+const CURSOR_REASON_CONTENT_FLUSH = 1
+const CURSOR_REASON_RECOVER_FROM_MARKERS = 2
+
 /** The completion-status payload the settings page renders. */
 interface CompletionStatus {
   mode?: string
@@ -851,6 +889,44 @@ function stripFences(text: string, preserveWhitespace = false): string {
  */
 function isBlankAnswer(text: string): boolean {
   return text.trim() === ''
+}
+
+/**
+ * Fold the model's "break the line and indent" reflex onto a blank caret line.
+ *
+ * The FIM model sees an empty line between two real ones and answers the way
+ * it would at the *end* of a line: a line break first, then the indented code
+ * (`"\n    foo()"`), or even an indent, a break, and then the code
+ * (`"    \n    foo()"`). Monaco paints that first line as the ghost on the
+ * empty caret line — so what the user sees is spaces or an indent, with the
+ * actual code one line below, and accepting leaves the empty line holding
+ * whitespace. Cursor strips the same reflex in its own pipeline
+ * (`shouldRemoveLeadingEol`, a leading EOL sliced off the suggestion when the
+ * edit lands at a line boundary).
+ *
+ * The strip is only for a caret whose own line is blank. At the end of a
+ * non-empty line the very same leading break is the right answer — "break the
+ * line and indent" — and stays untouched. What remains after the strip may
+ * still be whitespace only; that is left to {@link isBlankAnswer}, which reads
+ * it the same way an empty answer is read.
+ * @param text - the completion as it came back, fences already stripped.
+ * @param lineBefore - the caret's line up to the caret; whitespace-only means
+ *   the caret sits on a blank line (possibly after auto-indent).
+ * @param lineAfter - the caret's line from the caret onward; together with
+ *   `lineBefore` it decides whether the line is really blank.
+ * @returns the completion with one leading line break folded away when the
+ *   caret line was blank, and the text unchanged otherwise.
+ */
+function foldOntoBlankLine(text: string, lineBefore: string, lineAfter: string): string {
+  if ((lineBefore + lineAfter).trim() !== '') return text
+  const reflex = /^(?:[ \t]*\r?\n)+/.exec(text)
+  if (reflex === null) return text
+  const folded = text.slice(reflex[0].length)
+  // The remainder is authored as whole-line text — the model just wrote the
+  // indent it would put at the line start — so the indent the caret already
+  // carries would be applied twice. Take it back off the front.
+  const indent = /^[ \t]*/.exec(lineBefore)?.[0] ?? ''
+  return indent !== '' && folded.startsWith(indent) ? folded.slice(indent.length) : folded
 }
 
 // ---------------------------------------------------------------------------
@@ -2485,13 +2561,72 @@ function CodePanel(props: DSH.CodePanelProps): React.ReactNode {
       pill.setSuggestionVisible(false)
       pill.update()
     })
-    const blurListener = editor.onDidBlurEditorText(() => { pill.hide() })
+    // The caret-arrival settle below and the edit stamp that disqualifies it.
+    let caretSettleTimer: ReturnType<typeof setTimeout> | undefined
+    let lastEditAtMs = 0
+    const blurListener = editor.onDidBlurEditorText(() => {
+      // A settle in flight is for a caret that was being aimed at; leaving the
+      // editor is the user aiming somewhere else entirely.
+      if (caretSettleTimer !== undefined) {
+        clearTimeout(caretSettleTimer)
+        caretSettleTimer = undefined
+      }
+      pill.hide()
+    })
     // Cursor hides the capsule when the line it hangs from has been deleted.
     // Re-running the search is that, plus the case an edit above the capsule
     // moved its line — and the search is cheap enough to just redo.
     const contentListener = editor.onDidChangeModelContent(() => {
+      // Stamp the edit so the caret movement it drags along is not mistaken for
+      // an arrival (see the caret listener below), and drop any settle the edit
+      // just invalidated: Monaco asks for the typed caret itself.
+      lastEditAtMs = Date.now()
+      if (caretSettleTimer !== undefined) {
+        clearTimeout(caretSettleTimer)
+        caretSettleTimer = undefined
+      }
       pill.setSuggestionVisible(false)
       pill.update()
+    })
+    // A caret that merely *arrives* — a mouse click into a line, the arrow
+    // keys — is a question Monaco never asks: it asks on typed characters, on
+    // paste, and on its trigger-command list, and a caret move drops the ghost
+    // that was showing. Clicking into a line and then doing nothing therefore
+    // left the caret bare. Cursor answers exactly this case from its own
+    // `onDidChangeCursorPosition` listener (`fireCppSuggestionDebounced` with
+    // source `Qk.LineChange`, gated on the line having changed); this is that
+    // arrival, settled before it fires and announced through the provider's
+    // `onDidChangeInlineCompletions` channel — the one door that asks to be
+    // asked again without cancelling what is already on the wire.
+    //
+    // Three kinds of caret move are *not* arrivals and are skipped. A move the
+    // model caused (reason `RecoverFromMarkers`/`ContentFlush`, or source
+    // `modelChange`) is the caret keeping up with an edit — Monaco asks for
+    // those itself, and asking again is the double round trip the removed 400ms
+    // nudge lost to; Cursor filters the same case by `reason===2&&source==="modelChange"`.
+    // A move the program caused (`api`, `restoreState` — restoring a view state
+    // on open, the search jump's `setSelection`) announces itself where it
+    // happens. And any move landing within `CARET_EDIT_ECHO_MS` of a content
+    // change is that edit's own movement, caught regardless of what the event
+    // claims about its reason.
+    const caretListener = editor.onDidChangeCursorPosition((event) => {
+      const reason = event.reason as number
+      const source = event.source
+      if (reason === CURSOR_REASON_CONTENT_FLUSH || reason === CURSOR_REASON_RECOVER_FROM_MARKERS) return
+      if (source === 'api' || source === 'restoreState' || source === 'modelChange') return
+      if (Date.now() - lastEditAtMs < CARET_EDIT_ECHO_MS) return
+      if (caretSettleTimer !== undefined) clearTimeout(caretSettleTimer)
+      caretSettleTimer = setTimeout(() => {
+        caretSettleTimer = undefined
+        // A drawn selection is not somewhere code is about to be inserted —
+        // Cursor refuses to fire for one either — and a caret move while the
+        // editor is unfocused is program furniture, not a question.
+        const selection = editor.getSelection()
+        if (selection !== null && !selection.isEmpty()) return
+        if (!editor.hasTextFocus()) return
+        if (stateRef.current.path === null || settingsRef.current.completionEnabled === false) return
+        refreshCompletionsRef.current?.()
+      }, CARET_SETTLE_MS)
     })
     // Tab-completion ghost text: Monaco renders the preview and accepts on Tab;
     // this provider only answers "what should be inserted at the caret".
@@ -2520,6 +2655,12 @@ function CodePanel(props: DSH.CodePanelProps): React.ReactNode {
         const prefix = value.slice(Math.max(0, offset - COMPLETION_PREFIX_CHARS), offset)
         const suffix = value.slice(offset, offset + COMPLETION_SUFFIX_CHARS)
         if (prefix.trim() === '') return { items: [] }
+        // The caret's own line, split at the caret: this is what tells the
+        // answer-apart rules below whether the caret sits on a blank line.
+        const lineStart = offset === 0 ? 0 : value.lastIndexOf('\n', offset - 1) + 1
+        const lineBreak = value.indexOf('\n', offset)
+        const lineBefore = value.slice(lineStart, offset)
+        const lineAfter = value.slice(offset, lineBreak === -1 ? value.length : lineBreak)
         const cacheKey = `${sessionId}\u0000${st.path}\u0000${settings.completionBaseUrl}\u0000${settings.completionApiModel}\u0000${model.getLanguageId()}\u0000${prefix}\u0000${suffix}`
         // Monaco only needs the text at the caret; the range is a caret insert.
         //
@@ -2579,7 +2720,7 @@ function CodePanel(props: DSH.CodePanelProps): React.ReactNode {
               prefix,
               suffix,
             }, controller.signal)
-            const insertText = stripFences(text, true).slice(0, 2000)
+            const insertText = foldOntoBlankLine(stripFences(text, true), lineBefore, lineAfter).slice(0, 2000)
             // Only an answer with something to insert is remembered. The cache
             // means "this caret has already been answered", and a remembered
             // blank would hand those spaces back to every later ask for it.
@@ -2642,6 +2783,8 @@ function CodePanel(props: DSH.CodePanelProps): React.ReactNode {
       selectionListener.dispose()
       blurListener.dispose()
       contentListener.dispose()
+      caretListener.dispose()
+      if (caretSettleTimer !== undefined) clearTimeout(caretSettleTimer)
       // The capsule's node needs no unwinding of its own, and that is the second
       // reason it is registered once rather than on every selection change: it is
       // a child of the editor's own DOM, and `editor.dispose()` detaches that

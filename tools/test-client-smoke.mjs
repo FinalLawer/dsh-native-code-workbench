@@ -340,6 +340,13 @@ const fakeEditor = {
     calls.selectionListener = cb
     return { dispose() {} }
   },
+  // The caret-arrival trigger: a caret that merely arrives (a mouse click, the
+  // arrow keys) must ask for a suggestion, which is what the fake records here
+  // so a test can fire exactly the moves Monaco would report.
+  onDidChangeCursorPosition(cb) {
+    calls.caretListener = cb
+    return { dispose() {} }
+  },
   // `editor.onDidChangeModelContent`, distinct from the model's own content
   // event: the capsule follows the former, and the buffer's dirty flag the
   // latter.
@@ -762,6 +769,51 @@ await act(async () => {
 check('a whitespace-only completion is not remembered as an answer',
   suggestions?.items?.length === 0 && blankFetches === blankFetchesAfterFirstAsk + 1,
   { blankFetchesAfterFirstAsk, blankFetches })
+// On a blank caret line the model keeps its "break the line and indent" reflex
+// — the answer opens with a line break (sometimes behind an indent) before any
+// code. Monaco would paint that first line as the ghost on the empty line, so
+// what the user sees is spaces or an indent with the code one line below. The
+// fold removes the reflex; a caret on a real line keeps it, because there
+// "break the line and indent" is the right answer.
+globalThis.fetch = async (url, options) => {
+  calls.fetch.push({ url, body: JSON.parse(options.body) })
+  return new Response(JSON.stringify({ ok: true, text: '\n    foldedOntoLine()' }), { headers: { 'content-type': 'application/json' } })
+}
+await act(async () => { currentModel.setValue('const needle = 1\n\n// blank-line fold\n') })
+fakeOffset = 17 // caret at (2,1): an empty line between two real ones
+await act(async () => {
+  suggestions = await calls.inlineCompletionProvider.provideInlineCompletions(currentModel, { lineNumber: 2, column: 1 }, {}, completionToken)
+})
+check('a leading line break folds onto the blank caret line',
+  suggestions?.items?.[0]?.insertText === '    foldedOntoLine()', suggestions)
+await act(async () => { currentModel.setValue('const needle = 1\n    \n// after indent\n') })
+fakeOffset = 21 // caret at (2,5): a blank line indented four deep
+await act(async () => {
+  suggestions = await calls.inlineCompletionProvider.provideInlineCompletions(currentModel, { lineNumber: 2, column: 5 }, {}, completionToken)
+})
+check('the fold also takes back the indent the caret already carries',
+  suggestions?.items?.[0]?.insertText === 'foldedOntoLine()', suggestions)
+await act(async () => { currentModel.setValue('const needle = 1\nconst real = 2\n') })
+fakeOffset = 31 // caret at the end of a real line
+await act(async () => {
+  suggestions = await calls.inlineCompletionProvider.provideInlineCompletions(currentModel, { lineNumber: 2, column: 15 }, {}, completionToken)
+})
+check('a caret on a real line keeps the break-the-line answer',
+  suggestions?.items?.[0]?.insertText === '\n    foldedOntoLine()', suggestions)
+// And what remains after the fold is still read as blank: a reflex with no code
+// behind it is not a suggestion on a blank line either.
+globalThis.fetch = async (url, options) => {
+  calls.fetch.push({ url, body: JSON.parse(options.body) })
+  return new Response(JSON.stringify({ ok: true, text: '    \n      ' }), { headers: { 'content-type': 'application/json' } })
+}
+await act(async () => { currentModel.setValue('const needle = 1\n\n// blank-line reflex only\n') })
+fakeOffset = 17 // caret at (2,1): the blank line again
+await act(async () => {
+  suggestions = await calls.inlineCompletionProvider.provideInlineCompletions(currentModel, { lineNumber: 2, column: 1 }, {}, completionToken)
+})
+check('a whitespace-only reflex on a blank line yields no suggestion',
+  suggestions?.items?.length === 0 && allText().includes('AI 未返回补全'), suggestions)
+fakeOffset = 16
 // A transport failure is the one path that still surfaces in the editor.
 globalThis.fetch = async () => new Response(JSON.stringify({ error: { message: 'model unavailable' } }), { status: 409 })
 await act(async () => { currentModel.setValue(currentModel.getValue() + '\n// force another distinct completion context\n') })
@@ -799,6 +851,53 @@ check('a second ask for the same caret joins the round trip instead of starting 
 check('the joined ask receives the answer instead of "no suggestion"',
   joined?.[1]?.items?.[0]?.insertText === ' + 1', joined?.[1])
 globalThis.fetch = originalFetch
+
+// A caret that merely arrives — the bug report's "click into a line and do
+// nothing" — must ask for a suggestion where Monaco itself never would. The
+// settle is what turns the arrival into one announcement; the three moves
+// below are the ones that must NOT become one: the caret keeping up with an
+// edit (Monaco asks for that already), the caret arriving inside a drawn
+// selection, and a caret move the program made on its own.
+console.log('\ncaret arrival')
+const refreshesBeforeArrival = completionRefreshes
+await act(async () => {
+  calls.caretListener({ lineNumber: 2, column: 1, reason: 3, source: 'mouse' })
+})
+await act(async () => { await new Promise((resolve) => setTimeout(resolve, 320)) })
+check('a caret that arrives by mouse asks for a suggestion without a keystroke',
+  completionRefreshes === refreshesBeforeArrival + 1,
+  { refreshesBeforeArrival, completionRefreshes })
+const refreshesBeforeEditEcho = completionRefreshes
+await act(async () => {
+  // The edit stamps, then its own caret move lands inside the stamp window —
+  // same mouse source as an arrival, so only the stamp can disqualify it.
+  calls.editorContentListener()
+  calls.caretListener({ lineNumber: 2, column: 2, reason: 3, source: 'mouse' })
+})
+await act(async () => { await new Promise((resolve) => setTimeout(resolve, 320)) })
+check('a caret move an edit dragged along is left to Monaco',
+  completionRefreshes === refreshesBeforeEditEcho,
+  { refreshesBeforeEditEcho, completionRefreshes })
+const refreshesBeforeSelection = completionRefreshes
+await act(async () => {
+  selectionEmpty = false
+  calls.caretListener({ lineNumber: 3, column: 1, reason: 3, source: 'mouse' })
+})
+await act(async () => { await new Promise((resolve) => setTimeout(resolve, 320)) })
+selectionEmpty = true
+check('a caret arriving inside a drawn selection asks nothing',
+  completionRefreshes === refreshesBeforeSelection,
+  { refreshesBeforeSelection, completionRefreshes })
+const refreshesBeforeApiMove = completionRefreshes
+await act(async () => {
+  calls.caretListener({ lineNumber: 4, column: 1, reason: 3, source: 'api' })
+})
+await act(async () => { await new Promise((resolve) => setTimeout(resolve, 320)) })
+check('a caret move the program made announces itself instead',
+  completionRefreshes === refreshesBeforeApiMove,
+  { refreshesBeforeApiMove, completionRefreshes })
+check('asking on arrival never drives the editor itself',
+  (calls.inlineTriggers ?? 0) === 0, calls.inlineTriggers ?? 0)
 
 // ---------------------------------------------------------------------------
 // The selection capsule: Cursor's "Add to Chat" pill, and the third door onto

@@ -19,7 +19,7 @@ dsh-code-workbench
 需要固定版本时带上版本号：
 
 ```
-dsh-code-workbench@0.6.1
+dsh-code-workbench@0.6.2
 ```
 
 ### 从 GitHub 安装
@@ -31,7 +31,7 @@ https://github.com/FinalLawer/dsh-native-code-workbench#path:/dsh-code-workbench
 固定版本请把 tag 一起带上：
 
 ```
-https://github.com/FinalLawer/dsh-native-code-workbench#v0.6.1&path:/dsh-code-workbench
+https://github.com/FinalLawer/dsh-native-code-workbench#v0.6.2&path:/dsh-code-workbench
 ```
 
 ⚠️ **`#path:/dsh-code-workbench` 这一段不能省。** 这个仓库的根目录不是包——插件在 `dsh-code-workbench/` 子目录里，根目录没有 `package.json`。省略它时 pnpm 仍会报告安装成功，但装出来的是一个名为 `dsh-native-code-workbench.git`、版本 `0.0.0` 的占位包（清单是 pnpm 生成的 `{"_pnpmPlaceholder": …}`），既没有包清单也没有 `dsh.bundle` 声明，DSH 读不到组合包，插件不会出现。这个失败发生在安装**之后**，光看安装过程看不出来。走 npm 或压缩包则没有这个问题。
@@ -83,9 +83,11 @@ POST {baseUrl}/completions        # baseUrl 已以 /completions 结尾则原样�
 
 响应对 `choices[0]` 依次识别 `text`、`message.content`、`delta.content` 三种字段，因此 DeepSeek 之外的兼容服务也能直接用。请求带 10 秒硬超时；打字打断会立即中止在途请求。
 
-触发完全交给 Monaco：它在每个输入字符（含空格）、退格/删除、Tab、粘贴和显式光标移动上都会自己发请求，插件不再额外补一枪。此前插件在内容变更后 400ms 会自己发一次 `editor.action.inlineSuggest.trigger`，而那是 **Explicit** 触发，不满足已在途的 Automatic 请求——Monaco 会丢掉在途那次并重开一次，于是每次补全都多一个往返、固定多等 400ms；更糟的是每多敲一个字终点就再后退 400ms，表现就是「要打个空格或删一下才会出来」。
+触发的主体是 Monaco：它在每个输入字符（含空格）、退格/删除、Tab、粘贴上都会自己发请求。插件自己只补一种 Monaco 不问的情形：**光标落点**（鼠标点进某行、方向键挪过去）——停稳 250ms 后经 `onDidChangeInlineCompletions` 频道问一次，打字拖过去的光标移动、绘制选区中的落点、程序自己挪的光标都不算。此前插件在内容变更后 400ms 会自己发一次 `editor.action.inlineSuggest.trigger`，而那是 **Explicit** 触发，不满足已在途的 Automatic 请求——Monaco 会丢掉在途那次并重开一次，于是每次补全都多一个往返、固定多等 400ms；更糟的是每多敲一个字终点就再后退 400ms，表现就是「要打个空格或删一下才会出来」。
 
 同一光标的并发请求现在共享一次往返：第二次询问 await 第一次的答案并优先读缓存，而不是回 `{items: []}`——空数组对 Monaco 不是「我不知道」而是「这一版没有建议」的判决，被记进 state 后后续询问会被短路，于是必须再动一次键盘才解锁。
+
+**空行上的补全**：光标停在空行（或只含缩进的行）上时，模型经常回「先换行再缩进再写代码」——那是它在行尾的惯用续写，可空行本来就已经是新行，多出来的那一次换行会让 ghost 的第一行只剩下空格或缩进、按 Tab 也只插入一个换行加缩进。插件在空行上把这段冗余的前导空行折掉，让代码落回本行（与 Cursor 在编辑落在行边界时剥掉前导 EOL 同一处理）；折完仍然只剩空白的答案照旧当作「没有建议」。行尾光标上的「换行 + 缩进」是正确答案，原样保留。
 
 ### 设置项
 
