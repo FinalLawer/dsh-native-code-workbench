@@ -2,24 +2,24 @@
   "files": {
     "LICENSE": "1d19a36206ef5ea6136f713dc5ea7200a4432290e369a24e43e91fc9b49257d5",
     "README.md": "edb2f0454d51ed1d8313f26d3d98214f58baf344b82b94826b19e8c0ce4d57c9",
-    "build.mjs": "f2138344459573e36246f507063080e8b40bdf340b00a3cf9cc1c2d8b186d270",
-    "client.js": "7bcf33605ad4e1d4e6d0e40a341ef8566c3ee151168550fffbdd1814c808cf8f",
+    "build.mjs": "c1a25dbd367cc5e85c8d8642ed92b61fc2867c17ed5155608dc9923d99845f54",
+    "client.js": "e8c0bc65e7e665040ac5064c9df743b51c533d0d7f294af566f415958c018381",
     "completion-api.mjs": "85cd1d328d4fd520689356822a827fb3f883355c5ca1311268ac85b21d1ac25e",
     "completion-api.mts": "37a8f5fadf1f995ef925ccc248e0b876141b25c5a08d262559c24b6fe8a77349",
     "cordis.patch.yml": "4ba0c560522cb7a2e49621db347e2224b422a5725c89d446f27310fe78d194c8",
     "index.js": "7e91d0eb546f87d0413eee69acbe545f8e834a555ae9ca94a0bdddb0bcd4d4f8",
     "index.ts": "404dc96aa2167a5e8433025068926b8651a7d45e94e0d5d1354969a094e113d1",
-    "package.json": "12bb89e6413bcacf44aa76933e1353be3ad752c17c2ae0e0a6e2f8a8c09278e9",
-    "src/client.ts": "1b4629d96f52387db8d0dcf058d1ea46f8c93463e33de9efd2e1882c2ef1457d",
+    "package.json": "7fe0def0fbbaa36f6b6140de142949f5238b55f03c170159ea700087a9fff369",
+    "src/client.ts": "5427471d9374b0e8ba94d46e129b1d96d504174a24863ce71506078d3706911c",
     "src/completion-window.mjs": "0ff0e80ebf4f4c7ce431064a5d10f48cde24f63744e1f71b4ef6d40c91e84b3f",
     "src/completion-window.mts": "a9ee42a9ce38a11ee047ab2e8f7612a5c72d386b0b312947db9f917f3a844a53",
     "src/monaco-entry.mjs": "ea56780651850d39e669078f72a0605b8361dec1bc9cecc75bc301aa81f4dabd",
     "src/monaco-entry.mts": "52336351d75809127c8250ac32aed48a874e010192cc63f18239ab80219e8822",
     "src/snippets.mjs": "3781905f0e4b1272cd8b56c120723a0e1c2c2e1a11590dac1f0b0718b3d86f4b",
     "src/snippets.mts": "666fce4d54f8a230e49faa37743f274da287d20d75a930c0ba74c2327bf55736",
-    "src/workbench.css": "9d39f427d76206affe5878f881e548bdd76bf7040feafb94f73e2bb3b62d21b6",
+    "src/workbench.css": "a48a9e3892978392e7b591cdf383e877ecc95cee220b385ca8536a2888bd3702",
     "vendor/schemastery.d.mts": "fca846c1420a192b7ae749da96afa0c9b5c57b2e7dff418153674f90200f4e27",
     "vendor/schemastery.mjs": "2d7a054603361bd89569101afcf997ad00bd62cf8fa6aec43d49083ce0f5dac7"
   },
-  "version": "0.6.2"
+  "version": "0.6.3"
 }

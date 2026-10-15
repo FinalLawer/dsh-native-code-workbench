@@ -66,7 +66,17 @@
 .code-workbench-tree-body { outline: none; min-height: 0; }
 /* The in-tree name field that stands in for a row while creating or renaming.
    It reads as part of the tree — one line at the row's depth — rather than as a
-   floating panel, which is the whole point of editing in place. */
+   floating panel, which is the whole point of editing in place.
+
+   It draws its own focus affordance and takes no outline, and the generic ring
+   below has to skip it for a reason worth writing down: the row clips
+   (`overflow: hidden`, so a long name ellipsises) and the field is 20px tall in
+   a 24px row, so a 2px ring at a 2px offset has nowhere to go. It is not
+   dropped, it is *cut* — the top and bottom are clipped away and what is left
+   is two thick vertical bars hugging the field, in `--dsw-alias-brand-primary`,
+   which in the light theme is `#0f1115`. The 1px brand border below is the
+   indicator instead: it is on screen for exactly as long as the field is, and
+   the field exists only while it is being edited. */
 .code-workbench-tree-editor { cursor: default; }
 .code-workbench-tree-editor-input {
   flex: 1 1 auto;
@@ -137,8 +147,11 @@
 .code-workbench button:not(:disabled):hover {
   background: var(--dsw-alias-interactive-bg-hover) !important;
 }
+/* The brand ring, on everything that can take it. The in-tree name field is the
+   one exclusion, and it is excluded because the ring cannot be drawn there at
+   all — see its own rule above. */
 .code-workbench button:focus-visible,
-.code-workbench input:focus-visible {
+.code-workbench input:not(.code-workbench-tree-editor-input):focus-visible {
   outline: 2px solid var(--dsw-alias-brand-primary) !important;
   outline-offset: 2px;
 }
@@ -183,15 +196,15 @@
    be animated between — two glyphs, no shared shape — so the same triangle
    turns 90° instead, which is also what makes an expand read as one gesture
    rather than two pictures. */
-.code-workbench-tree-twisty { flex: 0 0 auto; display: inline-flex; transition: transform .15s ease; transform: rotate(0deg); }
+.code-workbench-tree-twisty { display: inline-flex; transition: transform .15s ease; transform: rotate(0deg); }
 .code-workbench-tree-twisty[data-open="true"] { transform: rotate(90deg); }
 
-/* The type marker that stands where a folder's twisty would be. It occupies the
-   same 12px box so file and folder names stay on one column; the dot itself is
-   drawn by the pseudo-element, which lets the caller set a single `color`
-   rather than a background. */
-.code-workbench-tree-kind { flex: 0 0 auto; width: 12px; height: 12px; display: flex; align-items: center; justify-content: center; }
-.code-workbench-tree-kind::before { content: ''; width: 7px; height: 7px; border-radius: 2px; background: currentColor; }
+/* The 16px marker column: a folder's twisty and a file's type glyph both sit
+   here, centred, so file and folder names stay on one column. It is wider than
+   the 12px indent step on purpose — the glyph carries a type mark inside it and
+   needs the room — and because the indent rails are positioned off the step,
+   not off this box, they do not move when the marker grows. */
+.code-workbench-tree-marker { flex: 0 0 auto; width: 16px; height: 16px; display: flex; align-items: center; justify-content: center; }
 
 /* A row that has just appeared fades rather than popping in. It rides on the
    row itself, not on a listing container: React reuses a row's DOM node for as
@@ -220,9 +233,9 @@
 }
 @keyframes code-workbench-spin { to { transform: rotate(360deg); } }
 
-/* The Add to Chat capsule. Geometry is Cursor's own — an 8px shell holding a
-   24px button at 12px with the same lift — and only the colours are ours, so
-   the capsule follows the light and dark themes the panel already tracks.
+/* The Add to Chat capsule: an 8px shell holding a 24px button at 12px, with a
+   lift under the pointer. Only the colours come from the panel's tokens, so the
+   capsule follows the light and dark themes the panel already tracks.
    Monaco owns this node: it sets `position: absolute`, the top/left, the
    `widgetId` the hit test reads, and the `display`/`visibility` that hide the
    capsule when its line scrolls away. The `transform` that picks which side of
@@ -264,8 +277,8 @@
   cursor: pointer;
 }
 /* The key hint is a reminder, not a label, so it sits a step back from the words
-   it follows. Cursor looks the chord up through its keybinding service; this one
-   is the chord this file registers. */
+   it follows. The chord is a literal here because it is the one this file's
+   client half registers. */
 .code-workbench-pill-key { color: var(--dsw-alias-label-secondary); font-size: 11px; }
 
 /* The status line. The dot is the whole point: the same 11px sentence used to

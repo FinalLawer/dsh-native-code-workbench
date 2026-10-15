@@ -19,7 +19,7 @@ dsh-code-workbench
 需要固定版本時帶上版本號：
 
 ```
-dsh-code-workbench@0.6.2
+dsh-code-workbench@0.6.3
 ```
 
 ### 從 GitHub 安裝
@@ -31,7 +31,7 @@ https://github.com/FinalLawer/dsh-native-code-workbench#path:/dsh-code-workbench
 固定版本請把 tag 一起帶上：
 
 ```
-https://github.com/FinalLawer/dsh-native-code-workbench#v0.6.2&path:/dsh-code-workbench
+https://github.com/FinalLawer/dsh-native-code-workbench#v0.6.3&path:/dsh-code-workbench
 ```
 
 ⚠️ **`#path:/dsh-code-workbench` 這一段不能省。** 這個儲存庫的根目錄不是套件——外掛在 `dsh-code-workbench/` 子目錄裡，根目錄沒有 `package.json`。省略它時 pnpm 仍會回報安裝成功，但裝出來的是一個名為 `dsh-native-code-workbench.git`、版本 `0.0.0` 的佔位套件（清單是 pnpm 產生的 `{"_pnpmPlaceholder": …}`），既沒有套件清單也沒有 `dsh.bundle` 宣告，DSH 讀不到組合包，外掛不會出現。這個失敗發生在安裝**之後**，光看安裝過程看不出來。走 npm 或壓縮包則沒有這個問題。
@@ -87,7 +87,7 @@ POST {baseUrl}/completions        # baseUrl 已以 /completions 結尾則原樣�
 
 同一游標的並行請求現在共用一次來回：第二次詢問 await 第一次的答案並優先讀快取，而不是回 `{items: []}`——空陣列對 Monaco 不是「我不知道」而是「這一版沒有建議」的判決，被記進 state 後後續詢問會被短路，於是必須再動一次鍵盤才解鎖。
 
-**空行上的補全**：游標停在空行（或只含縮排的行）上時，模型經常回「先換行再縮排再寫程式碼」——那是它在行尾的慣用續寫，可空行本來就已經是新行，多出來的那一次換行會讓 ghost 的第一行只剩下空白或縮排、按 Tab 也只插入一個換行加縮排。外掛在空行上把這段冗餘的前導空行折掉，讓程式碼落回本行（與 Cursor 在編輯落在行邊界時剝掉前導 EOL 同一處理）；折完仍然只剩空白的答案照舊當作「沒有建議」。行尾游標上的「換行 + 縮排」是正確答案，原樣保留。
+**空行上的補全**：游標停在空行（或只含縮排的行）上時，模型經常回「先換行再縮排再寫程式碼」——那是它在行尾的慣用續寫，可空行本來就已經是新行，多出來的那一次換行會讓 ghost 的第一行只剩下空白或縮排、按 Tab 也只插入一個換行加縮排。外掛在空行上把這段冗餘的前導空行折掉，讓程式碼落回本行（落在行邊界的建議本來就該先剝掉這個前導換行）；折完仍然只剩空白的答案照舊當作「沒有建議」。行尾游標上的「換行 + 縮排」是正確答案，原樣保留。
 
 ### 設定項
 
@@ -127,7 +127,7 @@ API Key 透過 Host 設定服務儲存，標記為秘密欄位，設定頁不會
 |---|---|---|
 | 編輯器 | **Monaco 內嵌**（約 5.13 MiB bundle，延遲載入） | `monaco-editor` 打進 bundle（瀏覽器模組表凍結，沒有 Monaco，必須內嵌） |
 | Worker | Blob URL 內嵌 `editor.worker` | `self.MonacoEnvironment.getWorker`，無 CSP 攔截 |
-| 檔案樹 | 遞迴、延遲展開 | `ctx.remote.workspaceFiles.list`（官方唯讀 Remote） |
+| 檔案樹 | 遞迴、延遲展開；列的型別字形取自 **DSH 官方 UI 函式庫**（與官方工作區檔案樹同一個元件） | `ctx.remote.workspaceFiles.list`（官方唯讀 Remote）；字形 = `@deepseek-ai/dsh-client-ui-primitives` 的 `FileTypeIcon` + `classifyFileType`——**隱式 baseline 模組**，只走 loader 的 `require`，不列相依、也不進 `dsh.client.external` |
 | 讀取檔案 | 分頁讀全量、依副檔名選語言 | `ctx.remote.workspaceFiles.read`（依行分頁，`eof` 收尾） |
 | **非文字檔案轉交** | 點擊 PDF / Excel / Word / PPT / 圖片等非文字檔案 → 不建模型、不開自家分頁，改在右側欄「文件預覽」中開啟 | 官方 `fileAddressFor`（`@deepseek-ai/dsh-util-workspace-path`）+ `ctx.sidebarRight.openResource`，落到官方 `dsh-resource://file/**` 預覽檔位；本外掛分頁類型不註冊 pattern，因此不搶官方 fallback |
 | **寫入檔案** | `POST /api/code-workbench/write`，**版本守衛**（`FS_STALE_VERSION` 拒絕覆寫並行修改），沙箱策略 = 工作階段標準策略 | host 半邊 `ctx.connection.fetch.register`（與官方 `/api/file` 同一通道）→ `ctx.fs.writeText(target, text, intent, signal, sandboxPolicy)` |
@@ -138,7 +138,7 @@ API Key 透過 Host 設定服務儲存，標記為秘密欄位，設定頁不會
 | **檢查更新／一鍵升級** | 有新版本發佈時面板頂端出現提示列，點「升級」原地取代安裝目錄裡的檔案；只動了**執行期不參與啟動載入**的檔案（`client.js`，以及 `src/*` 建置輸入、`build.mjs`、README 等）就**免重啟**——`client.js` 由 HMR 自己重載面板；改了 Host 半邊啟動時載入過的檔案（`index.js` 及其 import）才提示「重啟 DSH 後生效」 | `POST /api/code-workbench/update-check`（`api.github.com` REST：`/tags` → 該 tag 的 `update.json` → 與本機逐檔摘要比對）與 `POST /api/code-workbench/update-apply`（每個檔案先依清單摘要驗證、再 `rename` 原子取代） |
 | **外部變更自動重載** | Agent／外部改了磁碟上的檔案 → 乾淨緩衝區**自動重新整理**；有未儲存修改時警告不覆寫 | 官方 `workspaceFiles.changes` 串流（`ctx.remote.$stream`），依開啟檔案訂閱 |
 | **加入對話（Add to Chat）** | 右側欄**選取多行程式碼** → `Ctrl+L`、右側欄按鈕、或**編輯器右鍵選單「加入至對話」** → 主對話輸入框裡出現**引用膠囊**（只顯示 `檔案:行號 · N 行`），**傳送時才展開**成完整程式碼區塊給 Agent | 官方 chip 機制：`slash/input-insert-reference` 事件插 `ReferenceChipNode` + 自註冊 reference codec（`inputTriggers.registerSource` 的 `codec.serialize` 做提交展開）。三個入口進的是**同一個** `addToChat`，所以產出同一枚膠囊；右鍵選單項由 `editor.addAction` 註冊在 cut/copy/paste 群組之後，**不帶** `keybinding`（`Ctrl+L` 已由 `addCommand` 註冊，重複註冊同一個組合鍵是靜默的）也**不帶** `precondition`（本 build 未定義的 context key 恆為 false，會把選單項永久變灰，看起來像壞了） |
-| **選取懸浮膠囊** | 在編輯器裡選取程式碼，選取範圍附近浮出「**加入至對話、Ctrl+L**」膠囊，點一下即加入對話；選取消失即收起，正在顯示 ghost 建議時讓位 | Monaco **內容部件**（`editor.addContentWidget`）—— 膠囊只給出行列錨點，像素位置由 Monaco 自己算。落點搜尋照 Cursor 的演算法複刻（在 ±2 行視窗裡挑最長的一行作錨，代價 = 行長與 5 行之差 + 25 × 行偏移），但**偏好恆為 `EXACT`**、上下偏移由外掛自算 `transform`：Monaco 的 `ABOVE`/`BELOW` 以**整個視窗**為鉗制基準，而編輯器只占右欄一條 |
+| **選取懸浮膠囊** | 在編輯器裡選取程式碼，選取範圍附近浮出「**加入至對話、Ctrl+L**」膠囊，點一下即加入對話；選取消失即收起，正在顯示 ghost 建議時讓位 | Monaco **內容部件**（`editor.addContentWidget`）—— 膠囊只給出行列錨點，像素位置由 Monaco 自己算。落點搜尋（在 ±2 行視窗裡挑最長的一行作錨，代價 = 行長與 5 行之差 + 25 × 行偏移），但**偏好恆為 `EXACT`**、上下偏移由外掛自算 `transform`：Monaco 的 `ABOVE`/`BELOW` 以**整個視窗**為鉗制基準，而編輯器只占右欄一條 |
 | **拖曳列到輸入框** | 檔案樹列（檔案或目錄）拖進主對話輸入框 → 落成引用膠囊；**傳送時展開為共用 `@路徑` mention**（目錄帶尾斜線、含空格走 `@"…"`），對話記錄裡渲染回同一個膠囊 | 私有 MIME「三重收窄」在 document 捕獲階段接管拖放 → 同一個官方 `slash/input-insert-reference` 通道；提交展開走同一個 reference codec（`clipboardText` 與展開文案逐字一致） |
 | **拖曳分頁** | 分頁列上的分頁同樣可拖：拖進主對話輸入框 → 與拖檔案樹列**完全相同的引用膠囊**；在分頁列內左右拖 → **換位**，落點那一側的邊緣出現插入標記 | 重用同一個私有 MIME 和同一個官方通道，因此膠囊只有一個出處；列內換位由各自的 drag ref 分流——**兩個手勢互不認領**（樹列拖過分頁列不換位，分頁拖到資料夾列也不移動檔案） |
 | **點空白處取消選取** | 點擊檔案樹空白處 → 清空選取；頂端新增按鈕隨之回到在工作區根目錄建立 | 樹的容器 `onClick`，用 `closest('.code-workbench-tree-row, button, input, .code-workbench-tree-toolbar')` 排除落在列、列內控件和工具列上的點擊：列點擊本來就會冒泡到容器，而工具列是右對齊的，**選取目錄後的下一個動作就是往右上走點「新增檔案」，擦邊落在它的空白處**——沒有這道守衛時，兩個手勢會重合成一個，近失手又會把目標悄悄打回根目錄。清空 `selected` 的同時一併清掉 Shift 多選集合與錨點 |

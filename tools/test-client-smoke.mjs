@@ -444,8 +444,48 @@ globalThis.__CODE_WORKBENCH_TEST_MONACO__ = fakeMonaco
 const source = fs.readFileSync(new URL('../dsh-code-workbench/client.js', import.meta.url), 'utf8')
 // eslint-disable-next-line no-new-func
 new Function(source)()
+
+/**
+ * The tree's file markers come from the platform, and the platform is not here.
+ *
+ * `@deepseek-ai/dsh-client-ui-primitives` is a *baseline* module the web shell
+ * seeds into its frozen module table; the bundle reaches it through the
+ * factory's `require`. Node has no such table, so this stands in — and it is a
+ * stand-in for the *wiring*, not for the artwork. The real `FileTypeIcon`
+ * carries a full-colour brand glyph per code type and a category tint for
+ * everything else; re-drawing any of that here would be a second copy of the
+ * product's icons, and the copy would be the thing the test passed against.
+ *
+ * What is worth pinning is what this plugin is responsible for: that the row
+ * hands `classifyFileType` the entry *name*, that the answer goes straight back
+ * in as `kind`, and that the glyph is asked for at the size the marker column
+ * was built for. The stub therefore echoes its arguments back.
+ */
+const fileTypeIconCalls = []
+const classifyFileTypeCalls = []
+const primitives = {
+  FileTypeIcon: (props) => {
+    fileTypeIconCalls.push({ kind: props.kind, size: props.size, className: props.className })
+    return React.createElement('svg', {
+      'data-file-type': props.kind,
+      width: props.size,
+      height: props.size,
+      className: props.className,
+    })
+  },
+  // Faithful only in shape: the real classifier maps a name to a closed set of
+  // kinds (and, for code files, to a language). The extension is enough to
+  // prove the argument that arrived was a name and not a path.
+  classifyFileType: (path) => {
+    classifyFileTypeCalls.push(path)
+    const dot = String(path).lastIndexOf('.')
+    return dot < 0 ? 'other' : String(path).slice(dot + 1)
+  },
+}
+
 const bundle = globalThis.__factory((specifier) => {
   if (specifier === 'react') return React
+  if (specifier === '@deepseek-ai/dsh-client-ui-primitives') return primitives
   throw new Error(`unexpected external require("${specifier}")`)
 })
 
@@ -612,6 +652,29 @@ const allText = () => textOf(tree())
 check('the panel shell renders', allText().includes('保存 (Ctrl+S)') && allText().includes('就绪'), allText().slice(0, 80))
 check('the tree lists the workspace root', allText().includes('a.js') && allText().includes('sub'), calls.list)
 check('the root listing used the session cwd', calls.list[0] === 'C:\\repo', calls.list)
+// The file markers are the platform's, and the row's whole job is to hand the
+// platform the right thing. Three separate mistakes are possible and each one
+// renders fine: classifying the *path* instead of the name (which still returns
+// a kind), asking for a glyph at a size the 16px marker column cannot hold, and
+// forgetting the class that centres it. All three are pinned below.
+check('a file row classifies the entry name, not the path',
+  classifyFileTypeCalls.includes('a.js') && !classifyFileTypeCalls.some((name) => name.includes('\\') || name.includes('/')),
+  classifyFileTypeCalls.slice(0, 6))
+check('the classified kind is what the glyph is asked for',
+  fileTypeIconCalls.some((call) => call.kind === 'js'), fileTypeIconCalls.slice(0, 6))
+check('every file glyph is asked for at the marker column size',
+  fileTypeIconCalls.length > 0 && fileTypeIconCalls.every((call) => call.size === 16),
+  fileTypeIconCalls.map((call) => call.size))
+check('every file glyph carries the marker box class',
+  fileTypeIconCalls.length > 0
+  && fileTypeIconCalls.every((call) => call.className === 'code-workbench-tree-marker'),
+  fileTypeIconCalls.map((call) => call.className))
+// A folder is still a twisty: the marker column is shared, but only files
+// changed. `sub` is a directory in the fixture, so a glyph for it would mean the
+// row stopped telling the two apart.
+check('a directory row is not given a file glyph',
+  !fileTypeIconCalls.some((call) => call.kind === 'sub' || call.kind === 'directory'),
+  fileTypeIconCalls.map((call) => call.kind))
 check('the editor mounted', calls.editorCreate === 1, calls.editorCreate)
 // The palette path, which had no coverage at all until a selection came out
 // solid red. Monaco runs every theme colour through `Color.fromHex`, which reads
@@ -669,6 +732,24 @@ const folderRow = findAll(tree(), (n) => n.type === 'div' && n.props.title === '
 check('folders share the hover frame and keyboard focus styling',
   folderRow?.props.className === 'code-workbench-tree-row' && folderRow.props.tabIndex === 0)
 const css = fs.readFileSync(new URL('../dsh-code-workbench/src/workbench.css', import.meta.url), 'utf8')
+// One marker column, 16px, shared by a folder's twisty and a file's glyph — so
+// file and folder names land on the same x. It is wider than the 12px indent
+// step because the glyph carries a type mark inside it; the rails are
+// positioned off the step, not off this box, so they do not move.
+check('the marker column is one 16px box, shared by files and folders',
+  /\.code-workbench-tree-marker\s*\{[^}]*width:\s*16px;[^}]*height:\s*16px;/s.test(css))
+// The seven-pixel language dot is gone, not merely unused: a rule left behind
+// would paint under the glyph's transparent corners.
+check('the old language dot rule is gone',
+  !css.includes('code-workbench-tree-kind'), css.match(/code-workbench-tree-kind[^;]*/)?.[0])
+// The in-tree name field opts out of the brand ring, and the reason is
+// geometric rather than aesthetic: the row clips, the field nearly fills it, and
+// a 2px ring at a 2px offset has nowhere to go — the browser cuts the top and
+// bottom away and leaves two vertical bars. Both halves are pinned: the field
+// keeps its own border indicator, and the generic rule skips it.
+check('the in-tree name field is excluded from the brand focus ring',
+  /\.code-workbench input:not\(\.code-workbench-tree-editor-input\):focus-visible/.test(css)
+  && /\.code-workbench-tree-editor-input\s*\{[^}]*outline:\s*none;/s.test(css))
 check('hover uses theme background and an inset frame without layout shifts',
   /\.code-workbench-tree-row:hover\s*\{[^}]*background:\s*var\(--dsw-alias-interactive-bg-hover\);[^}]*box-shadow:\s*inset 0 0 0 1px var\(--dsw-alias-border-l2\);/s.test(css))
 // The tree marks exactly one thing: the selection — the row the toolbar, the
@@ -900,17 +981,17 @@ check('asking on arrival never drives the editor itself',
   (calls.inlineTriggers ?? 0) === 0, calls.inlineTriggers ?? 0)
 
 // ---------------------------------------------------------------------------
-// The selection capsule: Cursor's "Add to Chat" pill, and the third door onto
-// the action Ctrl+L and the editor context menu already open.
+// The selection capsule: the third door onto the action Ctrl+L and the editor
+// context menu already open.
 //
 // The placement search is the part worth pinning, because where it *does not*
 // hang the capsule from is the design: hanging from the caret covers code, and
 // hanging from the end of the caret's own line can push the capsule out of the
 // panel entirely, since a long line's end may be far to the right and past the
-// clamp. Cursor's answer is to look for a nearby line short enough that the
-// space past its end is empty on every row of a three-line window, and hang
-// there — and which of the three windows matched is what says which side of the
-// line the capsule goes.
+// clamp. The answer is to look for a nearby line short enough that the space
+// past its end is empty on every row of a three-line window, and hang there —
+// and which of the three windows matched is what says which side of the line
+// the capsule goes.
 // ---------------------------------------------------------------------------
 console.log('\nselection capsule')
 const capsule = calls.contentWidgets.at(-1)
@@ -949,8 +1030,8 @@ check('no selection means no capsule', capsule.getPosition() === null, capsule.g
 // and the band's centre at line 3.
 //
 // The capsule still ends up *below* line 1, and this is the one part of the
-// search that has to be reproduced rather than tidied up. The window reaching up
-// is the one that hangs the capsule above a line, and Cursor's own loop keeps
+// search that has to be kept as written rather than tidied up. The window
+// reaching up is the one that hangs the capsule above a line, and the loop keeps
 // that window's index unclamped while clamping the length it reads — so for a
 // candidate on line 1 the index lands on line 0 or -1 and the window can never
 // match itself. Losing it there is what keeps the capsule inside the editor: the
@@ -989,8 +1070,8 @@ check('a long line with room around it takes the capsule above it instead',
   { position: capsule.getPosition(), transform: capsuleBody.style.transform })
 modelLineCount = 2
 
-// Cursor accepts widget focus as well as text focus. With neither, the capsule
-// is a click target floating over an editor that is not listening.
+// Widget focus counts as focus too. With neither, the capsule is a click target
+// floating over an editor that is not listening.
 editorTextFocus = false
 await act(async () => { calls.selectionListener() })
 await act(async () => {})
@@ -1009,8 +1090,8 @@ check('losing text focus is its own way out', capsule.getPosition() === null, ca
 // and far enough right, that anchor is outside the panel. The clamp is what
 // pulls the capsule back, and it is exactly why the preference handed to Monaco
 // is EXACT with the offset kept here: Monaco's own ABOVE/BELOW clamp is measured
-// against the *window*, which stands in well for Cursor where the editor is the
-// window, and is wrong here where the editor is a panel in a sidebar.
+// against the *window*, which is the wrong frame of reference for an editor that
+// is one panel in a sidebar.
 modelLineLengths = [400, 3]
 caretPosition = { lineNumber: 1, column: 120 }
 await act(async () => { calls.selectionListener() })

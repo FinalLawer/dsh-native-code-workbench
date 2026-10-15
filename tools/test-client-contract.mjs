@@ -58,8 +58,23 @@ const reactStub = {
   useState: (initial) => [initial, () => {}],
 }
 
+/**
+ * The baseline UI library the tree's file markers come from.
+ *
+ * `require`ing it must run nothing of ours: this suite evaluates the bundle with
+ * no DOM and no renderer, and both symbols are used inside the tree's render.
+ * They throw if touched, which pins that as a fact rather than an assumption —
+ * a classifier called at factory time would otherwise be invisible here and cost
+ * every page load.
+ */
+const primitivesStub = {
+  FileTypeIcon: () => { throw new Error('FileTypeIcon was called at factory time') },
+  classifyFileType: () => { throw new Error('classifyFileType was called at factory time') },
+}
+
 const module = factory((specifier) => {
   if (specifier === 'react') return reactStub
+  if (specifier === '@deepseek-ai/dsh-client-ui-primitives') return primitivesStub
   throw new Error(`unexpected external require("${specifier}")`)
 })
 
@@ -86,6 +101,7 @@ const existingStyle = { textContent: 'previous revision' }
 globalThis.document.getElementById = () => existingStyle
 factory((specifier) => {
   if (specifier === 'react') return reactStub
+  if (specifier === '@deepseek-ai/dsh-client-ui-primitives') return primitivesStub
   throw new Error(`unexpected external require("${specifier}")`)
 })
 check('hot reload updates the existing stylesheet including tree hover rules',

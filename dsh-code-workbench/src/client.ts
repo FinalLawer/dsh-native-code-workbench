@@ -26,6 +26,7 @@
 import React from 'react'
 import type * as Monaco from 'monaco-editor/editor/editor.api.js'
 import { fileAddressFor } from '@deepseek-ai/dsh-util-workspace-path'
+import { FileTypeIcon, classifyFileType } from '@deepseek-ai/dsh-client-ui-primitives'
 import './workbench.css'
 import { serializeSnippet, splitSnippets } from './snippets.mjs'
 import { COMPLETION_PREFIX_CHARS, COMPLETION_SUFFIX_CHARS } from './completion-window.mjs'
@@ -786,10 +787,9 @@ const SEARCH_DEBOUNCE_MS = 300
  * showing. Clicking into a line and then doing nothing therefore produced no
  * suggestion, which is what this timer closes. It is a settle, not a throttle:
  * walking the caret down a file with the arrow keys resets it every move and
- * pays for one request where the walk stops. Cursor answers the same case from
- * its own `onDidChangeCursorPosition` listener (`fireCppSuggestionDebounced`
- * with the `Qk.LineChange` source, 25/60ms there); the longer settle here is
- * because every request is a network round trip rather than a local model.
+ * pays for one request where the walk stops. The settle is deliberately long:
+ * every request here is a network round trip, so a shorter one would buy
+ * nothing but extra traffic.
  */
 const CARET_SETTLE_MS = 250
 
@@ -801,8 +801,8 @@ const CARET_SETTLE_MS = 250
  * again would be a second round trip for the same caret — and worse, the two
  * asks would race. The content listener stamps the edit and cancels any
  * pending settle, and the caret listener additionally ignores moves landing
- * inside this window (Cursor filters the same case by the pair
- * `reason===2&&source==="modelChange"`).
+ * inside this window, which covers the case whichever way the event reports
+ * its reason.
  */
 const CARET_EDIT_ECHO_MS = 100
 
@@ -900,9 +900,8 @@ function isBlankAnswer(text: string): boolean {
  * (`"    \n    foo()"`). Monaco paints that first line as the ghost on the
  * empty caret line — so what the user sees is spaces or an indent, with the
  * actual code one line below, and accepting leaves the empty line holding
- * whitespace. Cursor strips the same reflex in its own pipeline
- * (`shouldRemoveLeadingEol`, a leading EOL sliced off the suggestion when the
- * edit lands at a line boundary).
+ * whitespace. A suggestion that lands at a line boundary has to have that
+ * leading end-of-line sliced off before it means anything at the caret.
  *
  * The strip is only for a caret whose own line is blank. At the end of a
  * non-empty line the very same leading break is the right answer — "break the
@@ -930,27 +929,28 @@ function foldOntoBlankLine(text: string, lineBefore: string, lineAfter: string):
 }
 
 // ---------------------------------------------------------------------------
-// The selection capsule — Cursor's "Add to Chat" pill, on this side's editor.
+// The selection capsule — "加到对话", floating beside the selected lines.
 //
 // A small capsule that appears beside the selected lines and adds them to the
-// main chat draft. The shape of it is Cursor's, read out of its shipped
-// workbench bundle; the parts worth porting are the placement search, the
-// mounting, and the rules for getting out of the way.
+// main chat draft. Three things have to be right for it to feel like part of
+// the editor rather than a panel bolted on: where it hangs, how it is mounted,
+// and when it gets out of the way.
 //
-// **It is a Monaco content widget, not an overlay.** Cursor hands Monaco a line,
-// a column and a side, and Monaco works out the pixels — so the capsule rides
-// scrolling, wrapping and zoom without any bookkeeping of its own, and its own
-// code never asks where anything is on screen. Cursor's `hoverWidget.js` does
-// exactly this, and `IContentWidget` is public API.
+// **It is a Monaco content widget, not an overlay.** The capsule hands Monaco a
+// line, a column and a side, and Monaco works out the pixels — so it rides
+// scrolling, wrapping and zoom without any bookkeeping of its own, and this
+// code never asks where anything is on screen. `IContentWidget` is public API
+// and is exactly the mechanism for this.
 //
 // **The offset is ours, not the preference's.** Monaco lays ABOVE and BELOW out
 // by clamping the box inside `getClientArea(body)` — the *window* — and lets it
-// hang up to a box width outside the editor. In Cursor the editor is the window,
-// so that is a good approximation; here the editor is a panel in the right
-// sidebar, and the same clamp would carry the capsule over the panel's edge. The
+// hang up to a box width outside the editor. That is a reasonable fit when the
+// editor owns the window; here the editor is one column of the right sidebar,
+// and the same clamp would carry the capsule over the panel's edge. The
 // preference handed to Monaco is therefore always EXACT, which does no clamping
 // and no offset at all, and the above/below/on-the-line choice is applied as a
-// `transform` on the capsule itself — measured against a width this panel knows.
+// `transform` on the capsule itself — measured against a width this panel
+// actually knows.
 //
 // The DOM is built by hand rather than through React. A content widget's node is
 // owned by Monaco (added once, moved by Monaco, disposed by Monaco), the capsule
@@ -961,19 +961,20 @@ function foldOntoBlankLine(text: string, lineBefore: string, lineAfter: string):
 /**
  * The capsule's label and the key hint printed beside it.
  *
- * The hint repeats what the editor's tooltip and the header button already say.
- * Cursor looks the chord up through the keybinding service; there is no such
- * service on this side, and the chord is registered by this file two screens
- * further down.
+ * The hint repeats what the editor's tooltip and the header button already say,
+ * and it is written as a literal rather than read back from the keybinding
+ * service: there is no such service on this side of the plugin, and the chord
+ * is registered by this file two screens further down.
  */
 const PILL_LABEL = '加到对话'
 const PILL_KEY_LABEL = 'Ctrl+L'
 
 /**
  * Room the capsule keeps free at the right of the longest line it may hang on.
- * Cursor's own constant is 80px, for a two-button capsule; this one is a single
- * button, and `workbench.css` holds it to at most this width, so the reserve and
- * the thing being reserved for cannot drift apart.
+ *
+ * The reserve and the capsule's own maximum width are the same number on
+ * purpose: `workbench.css` holds the button to at most this width, so the space
+ * being reserved for and the thing being reserved cannot drift apart.
  */
 const PILL_RESERVE_PX = 128
 
@@ -1018,13 +1019,13 @@ interface PillGeometry {
 }
 
 /**
- * Pick where the capsule hangs — Cursor's search, ported.
+ * Pick where the capsule hangs.
  *
  * Anchoring on the caret does not work. The caret usually sits in the middle of
  * a line, so a capsule hung there covers code; and the end of *that* line can be
- * a long way to the right, far enough to leave the panel. Cursor's answer is to
- * look for a nearby line worth hanging a box *from*: short enough that the space
- * to the right of it is empty, close enough that the capsule still reads as
+ * a long way to the right, far enough to leave the panel. The answer is to look
+ * for a nearby line worth hanging a box *from*: short enough that the space to
+ * the right of it is empty, close enough that the capsule still reads as
  * attached to the selection.
  *
  *  - **The band** is the caret's line ±2 — ±3 while the editor wraps, where one
@@ -1048,8 +1049,9 @@ interface PillGeometry {
  *    so a line that passes leaves the capsule somewhere to be.
  *
  * Ties between windows go to the earlier window (the cost comparison is strict),
- * and ties inside a window go to the earlier line. Both are Cursor's, and both
- * are what keep the answer still while the caret moves by one.
+ * and ties inside a window go to the earlier line. Both rules exist to keep the
+ * answer still while the caret moves by one: without them the capsule would
+ * jump between two equally good lines on consecutive keystrokes.
  *
  * @param geometry - everything the search reads.
  * @returns the anchor, and the side of it to hang on.
@@ -1058,7 +1060,7 @@ function selectionPillPlacement(geometry: PillGeometry): PillPlacement {
   const { lineCount } = geometry
   const lineLength = (lineNumber: number): number =>
     geometry.lineLength(Math.max(1, Math.min(lineCount, lineNumber)))
-  // Cursor's starting point, which survives only if nothing in the band costs less.
+  // The starting point, which survives only if nothing in the band costs less.
   let line = Math.max(1, Math.min(lineCount, geometry.caretLine < 4 ? geometry.selectionEndLine + 3 : geometry.caretLine - 2))
   let column = geometry.caretColumn
   let side = PILL_ABOVE
@@ -1071,15 +1073,14 @@ function selectionPillPlacement(geometry: PillGeometry): PillPlacement {
   const consider = (scanLine: number, from: number, to: number, windowSide: PillSide): void => {
     let longest = 0
     let longestLine = 0
-    // The window index is kept exactly as Cursor keeps it: `from` and `to` are
-    // used as given, even where they run past the ends of the model, and only the
-    // *length* read above is clamped. The two are then compared unnormalised, so
-    // a window that had to reach past the top of the file cannot match its own
-    // middle line: for a candidate on line 1 the window index ends up on line 0
-    // or -1, and for line 2 it does so unless line 2 is strictly longer than
-    // line 1.
+    // The window index is used exactly as given: `from` and `to` run past the
+    // ends of the model without being clamped, and only the *length* read above
+    // is clamped. The two are then compared unnormalised, so a window that had
+    // to reach past the top of the file cannot match its own middle line: for a
+    // candidate on line 1 the window index ends up on line 0 or -1, and for
+    // line 2 it does so unless line 2 is strictly longer than line 1.
     //
-    // That is load-bearing rather than incidental, so it is reproduced instead of
+    // That is load-bearing rather than incidental, so it is kept instead of
     // repaired. The window reaching up is the one that hangs the capsule *above*
     // the line, and a capsule hung above the editor's first row is outside the
     // editor's own clipped box — it would be positioned, reported as visible, and
@@ -1109,15 +1110,15 @@ function selectionPillPlacement(geometry: PillGeometry): PillPlacement {
     consider(scanLine, scanLine, scanLine + 2, PILL_BELOW)
     consider(scanLine, scanLine - 1, scanLine + 1, PILL_EXACT)
   }
-  // Two columns past the text: Cursor's own gap, wide enough that the capsule
-  // does not read as part of the line it hangs from.
+  // Two columns past the text: wide enough that the capsule does not read as
+  // part of the line it hangs from.
   return { lineNumber: line, column: column + 2, side }
 }
 
-/** The line length a window's cost treats as free. Cursor's constant. */
+/** The line length a window's cost treats as free. */
 const PILL_EMPTY_LINE = 5
 
-/** The cost of hanging one line away from the band's centre. Cursor's constant. */
+/** The cost of hanging one line away from the band's centre. */
 const PILL_LINE_PENALTY = 25
 
 /** What the capsule needs from the editor's layout, in pixels. */
@@ -1139,14 +1140,13 @@ interface PillMetrics {
  * accounted for; a build that reports no width at all gets no capsule rather than
  * a capsule placed by guesswork.
  *
- * Cursor derives the same budget from the editor's *full* width minus a handful of
- * constants (50, the decoration lane, the scrollbar, 80 for the capsule). The
- * text area's own width is measured here instead — the capsule is clamped against
- * the text area, and this panel is narrow enough that the difference shows. The
- * origin is the same one Monaco measures the anchor from: the content widget
- * layer is laid out at `contentLeft`, and `visibleRangeForPosition` already
- * excludes the gutter. The vertical scrollbar is the one thing taken back out,
- * because `contentWidth` runs to the editor's right edge and includes it.
+ * The budget is derived from the text area's own width rather than the editor's
+ * full width: the capsule is clamped against the text area, and this panel is
+ * narrow enough that the difference shows. The origin is the same one Monaco
+ * measures the anchor from — the content widget layer is laid out at
+ * `contentLeft`, and `visibleRangeForPosition` already excludes the gutter. The
+ * vertical scrollbar is the one thing taken back out, because `contentWidth`
+ * runs to the editor's right edge and includes it.
  *
  * A panel with no room left over at all reports "not usable", which is the same
  * answer as a font with no measurable width — there is nowhere to put a capsule,
@@ -1185,11 +1185,11 @@ interface SelectionPillOptions {
  * null answer is its own "put it away". So the widget is registered when the
  * editor is created and torn down with it.
  *
- * Hiding has four causes, all of them Cursor's: nothing selected (or the
- * selection is in a buffer that is not on screen), the editor has neither text
- * nor widget focus, a Tab suggestion is on screen and owns the caret, or the
- * numbers are unusable. A drag passing over the capsule hides it too — the
- * pointer is selecting, and a box under it would swallow the rest of the gesture.
+ * Hiding has four causes: nothing selected (or the selection is in a buffer that
+ * is not on screen), the editor has neither text nor widget focus, a Tab
+ * suggestion is on screen and owns the caret, or the numbers are unusable. A
+ * drag passing over the capsule hides it too — the pointer is selecting, and a
+ * box under it would swallow the rest of the gesture.
  */
 class SelectionPill implements Monaco.editor.IContentWidget {
   /**
@@ -1283,9 +1283,9 @@ class SelectionPill implements Monaco.editor.IContentWidget {
   /**
    * Tell the capsule whether a Tab suggestion is on screen.
    *
-   * Cursor hides the capsule's button row for as long as one is; hiding the whole
-   * widget comes to the same thing through the one hide path, and a suggestion
-   * owns the caret line the capsule would otherwise hang from.
+   * Hiding the whole widget rather than just its button row comes to the same
+   * thing through the one hide path, and a suggestion owns the caret line the
+   * capsule would otherwise hang from.
    */
   setSuggestionVisible(visible: boolean): void {
     if (this.suppressed === visible) return
@@ -1324,8 +1324,8 @@ class SelectionPill implements Monaco.editor.IContentWidget {
     if (model === null) return null
     const selection = this.editor.getSelection()
     if (selection === null || selection.isEmpty()) return null
-    // Cursor accepts widget focus as well as text focus, which is what keeps the
-    // capsule up while the user is inside one of the editor's own inputs.
+    // Widget focus counts as focus too, which is what keeps the capsule up while
+    // the user is inside one of the editor's own inputs.
     if (!this.editor.hasTextFocus() && !this.editor.hasWidgetFocus()) return null
     const caret = this.editor.getPosition()
     if (caret === null) return null
@@ -1347,11 +1347,11 @@ class SelectionPill implements Monaco.editor.IContentWidget {
   /**
    * The capsule's own placement: the vertical side, and the horizontal clamp.
    *
-   * The vertical half is Cursor's preference, moved to CSS: above means the
-   * capsule's underside sits just over the line, below means its top sits just
-   * under it, and "on the line" centres it on the line's row. A percentage moves
-   * the box by its own height, which is what lets the two outer cases be written
-   * without measuring anything.
+   * The vertical half is applied in CSS rather than through Monaco's own
+   * preference: above means the capsule's underside sits just over the line,
+   * below means its top sits just under it, and "on the line" centres it on the
+   * line's row. A percentage moves the box by its own height, which is what lets
+   * the two outer cases be written without measuring anything.
    *
    * The horizontal half is the same clamp Monaco would have applied for ABOVE and
    * BELOW, done here against the content area: the anchor is one column past the
@@ -1375,9 +1375,11 @@ class SelectionPill implements Monaco.editor.IContentWidget {
    * Whether the editor wraps, which the search reads as "one logical line may be
    * several visual rows" and answers with a wider band.
    *
-   * The override chain is the one Cursor walks — the second override wins, then
-   * the first, then the plain setting — spelled with option ids rather than the
-   * numbers Cursor's build had frozen into it.
+   * Monaco resolves word wrap through a chain: two overrides sit above the plain
+   * setting, the second winning over the first, and either may be `inherit`,
+   * which passes the question down. They are read here by option id rather than
+   * by the numeric index the option table happens to give them, because the
+   * index is an implementation detail of the build.
    */
   private isWordWrap(): boolean {
     const options = this.editor.getOptions()
@@ -1471,33 +1473,24 @@ function workbenchIcon(name: keyof typeof ICON_PATHS): React.ReactElement {
 /**
  * The marker a file row shows where a folder shows its twisty.
  *
- * Coloured by language family rather than drawn as an icon set: the point is
- * that the *shape* of a tree — how much of it is code, config, markup, assets —
- * reads at a glance, and seven pixels of colour does that without shipping a
- * sprite sheet or a font. The hues are the languages' own, which is what makes
- * them recognisable, so they are literal values rather than DSH tokens.
+ * It used to be a seven-pixel square tinted by language family — a hand-kept
+ * extension table, coloured with literal hues, on the argument that the *shape*
+ * of a tree (how much of it is code, config, markup, assets) reads at a glance
+ * without shipping a sprite sheet. What that bought was a column of identical
+ * squares, and a square says "there is a file here", which the row's own name
+ * already says. It said nothing about *which* file.
+ *
+ * So the marker is now DSH's own: `FileTypeIcon` from
+ * `@deepseek-ai/dsh-client-ui-primitives`, the same component the workspace
+ * files tab renders in its tree, fed the same way — `classifyFileType(name)`
+ * with one argument. Code files get their brand artwork from the package's
+ * embedded set, everything else a category tint, and both stay in step with the
+ * rest of the product for free. Nothing here re-derives what a `.ts` is.
+ *
+ * One consequence worth knowing: the icon carries its own colour, so a row can
+ * no longer be recoloured by the tree. `--dsh-file-type-icon-color` is the
+ * package's own override hook if that is ever wanted.
  */
-const FILE_KIND_COLOR: Record<string, string> = {
-  js: '#d4a017', mjs: '#d4a017', cjs: '#d4a017', jsx: '#d4a017',
-  ts: '#3178c6', mts: '#3178c6', cts: '#3178c6', tsx: '#3178c6',
-  css: '#a45bd6', scss: '#a45bd6', less: '#a45bd6',
-  html: '#e34c26', htm: '#e34c26', xml: '#e34c26', svg: '#e34c26',
-  json: '#cbcb41', jsonc: '#cbcb41', yaml: '#cbcb41', yml: '#cbcb41', toml: '#cbcb41',
-  md: '#7d8590', mdx: '#7d8590', txt: '#7d8590', rst: '#7d8590',
-  py: '#3572a5', rb: '#701516', go: '#00add8', rs: '#dea584',
-  java: '#b07219', kt: '#a97bff', swift: '#f05138', php: '#4f5d95',
-  c: '#8a8a8a', h: '#8a8a8a', cpp: '#f34b7d', cs: '#178600',
-  sh: '#89e051', bash: '#89e051', zsh: '#89e051', ps1: '#4a7fbd', lua: '#5b6fbd', dart: '#00b4ab',
-  sql: '#e38c00', graphql: '#e10098', vue: '#41b883', svelte: '#ff3e00',
-}
-
-/** A file's language colour, or the muted token when the extension says nothing. */
-function fileKindColor(name: string): string {
-  const base = name.toLowerCase()
-  const dot = base.lastIndexOf('.')
-  if (dot < 0) return 'var(--dsw-alias-label-quaternary, #8b949e)'
-  return FILE_KIND_COLOR[base.slice(dot + 1)] ?? 'var(--dsw-alias-label-quaternary, #8b949e)'
-}
 
 // ---------------------------------------------------------------------------
 // File tree (lazy, recursive)
@@ -2056,16 +2049,26 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
           title: full,
         }, guideRails(depth, railCountFor(depth, carriesChain)),
           // A folder turns its twisty; a file shows what kind of file it is.
-          // Both sit in the same 12px box so names stay on one column.
+          // Both sit in the same 16px box so names stay on one column — and the
+          // box is 16 rather than the old 12 because the file glyph carries a
+          // type mark inside it, which needs the room. `INDENT` is deliberately
+          // *not* widened to match: the rails are positioned off `INDENT` and
+          // sit to the left of this box, so leaving the step at 12 keeps every
+          // guide exactly where it was while the marker simply grows into the
+          // gap on its right.
           isDir
             ? h('svg', {
-              className: 'code-workbench-tree-twisty',
+              className: 'code-workbench-tree-twisty code-workbench-tree-marker',
               'data-open': isOpen ? 'true' : 'false',
               width: 12, height: 12, viewBox: '0 0 12 12',
               'aria-hidden': true,
               style: { color: T.fgMuted },
             }, h('path', { d: 'M4 2.5 L8 6 L4 9.5', fill: 'none', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round' }))
-            : h('span', { className: 'code-workbench-tree-kind', 'aria-hidden': true, style: { color: fileKindColor(entry.name) } }),
+            : h(FileTypeIcon, {
+              kind: classifyFileType(entry.name),
+              size: 16,
+              className: 'code-workbench-tree-marker',
+            }),
           h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis' } }, entry.name)))
       }
       if (isOpen) walk(full, depth + 1, full)
@@ -2573,9 +2576,9 @@ function CodePanel(props: DSH.CodePanelProps): React.ReactNode {
       }
       pill.hide()
     })
-    // Cursor hides the capsule when the line it hangs from has been deleted.
-    // Re-running the search is that, plus the case an edit above the capsule
-    // moved its line — and the search is cheap enough to just redo.
+    // An edit can delete the line the capsule hangs from. Re-running the search
+    // is that, plus the case an edit above the capsule moved its line — and the
+    // search is cheap enough to just redo.
     const contentListener = editor.onDidChangeModelContent(() => {
       // Stamp the edit so the caret movement it drags along is not mistaken for
       // an arrival (see the caret listener below), and drop any settle the edit
@@ -2592,23 +2595,20 @@ function CodePanel(props: DSH.CodePanelProps): React.ReactNode {
     // keys — is a question Monaco never asks: it asks on typed characters, on
     // paste, and on its trigger-command list, and a caret move drops the ghost
     // that was showing. Clicking into a line and then doing nothing therefore
-    // left the caret bare. Cursor answers exactly this case from its own
-    // `onDidChangeCursorPosition` listener (`fireCppSuggestionDebounced` with
-    // source `Qk.LineChange`, gated on the line having changed); this is that
-    // arrival, settled before it fires and announced through the provider's
+    // left the caret bare. This is that arrival, gated on the line having
+    // changed, settled before it fires and announced through the provider's
     // `onDidChangeInlineCompletions` channel — the one door that asks to be
     // asked again without cancelling what is already on the wire.
     //
     // Three kinds of caret move are *not* arrivals and are skipped. A move the
     // model caused (reason `RecoverFromMarkers`/`ContentFlush`, or source
     // `modelChange`) is the caret keeping up with an edit — Monaco asks for
-    // those itself, and asking again is the double round trip the removed 400ms
-    // nudge lost to; Cursor filters the same case by `reason===2&&source==="modelChange"`.
-    // A move the program caused (`api`, `restoreState` — restoring a view state
-    // on open, the search jump's `setSelection`) announces itself where it
-    // happens. And any move landing within `CARET_EDIT_ECHO_MS` of a content
-    // change is that edit's own movement, caught regardless of what the event
-    // claims about its reason.
+    // those itself, and asking again is the double round trip a separate nudge
+    // would pay for. A move the program caused (`api`, `restoreState` —
+    // restoring a view state on open, the search jump's `setSelection`)
+    // announces itself where it happens. And any move landing within
+    // `CARET_EDIT_ECHO_MS` of a content change is that edit's own movement,
+    // caught regardless of what the event claims about its reason.
     const caretListener = editor.onDidChangeCursorPosition((event) => {
       const reason = event.reason as number
       const source = event.source
@@ -2618,9 +2618,9 @@ function CodePanel(props: DSH.CodePanelProps): React.ReactNode {
       if (caretSettleTimer !== undefined) clearTimeout(caretSettleTimer)
       caretSettleTimer = setTimeout(() => {
         caretSettleTimer = undefined
-        // A drawn selection is not somewhere code is about to be inserted —
-        // Cursor refuses to fire for one either — and a caret move while the
-        // editor is unfocused is program furniture, not a question.
+        // A drawn selection is not somewhere code is about to be inserted, and a
+        // caret move while the editor is unfocused is program furniture, not a
+        // question.
         const selection = editor.getSelection()
         if (selection !== null && !selection.isEmpty()) return
         if (!editor.hasTextFocus()) return
@@ -2666,12 +2666,11 @@ function CodePanel(props: DSH.CodePanelProps): React.ReactNode {
         //
         // Handing back a suggestion is also the only moment this side knows one
         // is on screen, and a suggestion occupies the very strip the capsule
-        // hangs in — Cursor reads the same fact off its suggestion service and
-        // hides the capsule's button row for it. Suppressing here rather than at
-        // each `return` means every path that produces ghost text, present and
-        // future, carries the rule. `disposeInlineCompletions` below is the
-        // other half, and Monaco calls it on a caret move, on Esc, on Tab, and
-        // when a new request replaces the items this one returned.
+        // hangs in. Suppressing here rather than at each `return` means every
+        // path that produces ghost text, present and future, carries the rule.
+        // `disposeInlineCompletions` below is the other half, and Monaco calls it
+        // on a caret move, on Esc, on Tab, and when a new request replaces the
+        // items this one returned.
         const ghostText = (text: string): Monaco.languages.InlineCompletions => {
           pill.setSuggestionVisible(true)
           return {

@@ -19,7 +19,7 @@ dsh-code-workbench
 需要固定版本时带上版本号：
 
 ```
-dsh-code-workbench@0.6.2
+dsh-code-workbench@0.6.3
 ```
 
 ### 从 GitHub 安装
@@ -31,7 +31,7 @@ https://github.com/FinalLawer/dsh-native-code-workbench#path:/dsh-code-workbench
 固定版本请把 tag 一起带上：
 
 ```
-https://github.com/FinalLawer/dsh-native-code-workbench#v0.6.2&path:/dsh-code-workbench
+https://github.com/FinalLawer/dsh-native-code-workbench#v0.6.3&path:/dsh-code-workbench
 ```
 
 ⚠️ **`#path:/dsh-code-workbench` 这一段不能省。** 这个仓库的根目录不是包——插件在 `dsh-code-workbench/` 子目录里，根目录没有 `package.json`。省略它时 pnpm 仍会报告安装成功，但装出来的是一个名为 `dsh-native-code-workbench.git`、版本 `0.0.0` 的占位包（清单是 pnpm 生成的 `{"_pnpmPlaceholder": …}`），既没有包清单也没有 `dsh.bundle` 声明，DSH 读不到组合包，插件不会出现。这个失败发生在安装**之后**，光看安装过程看不出来。走 npm 或压缩包则没有这个问题。
@@ -87,7 +87,7 @@ POST {baseUrl}/completions        # baseUrl 已以 /completions 结尾则原样�
 
 同一光标的并发请求现在共享一次往返：第二次询问 await 第一次的答案并优先读缓存，而不是回 `{items: []}`——空数组对 Monaco 不是「我不知道」而是「这一版没有建议」的判决，被记进 state 后后续询问会被短路，于是必须再动一次键盘才解锁。
 
-**空行上的补全**：光标停在空行（或只含缩进的行）上时，模型经常回「先换行再缩进再写代码」——那是它在行尾的惯用续写，可空行本来就已经是新行，多出来的那一次换行会让 ghost 的第一行只剩下空格或缩进、按 Tab 也只插入一个换行加缩进。插件在空行上把这段冗余的前导空行折掉，让代码落回本行（与 Cursor 在编辑落在行边界时剥掉前导 EOL 同一处理）；折完仍然只剩空白的答案照旧当作「没有建议」。行尾光标上的「换行 + 缩进」是正确答案，原样保留。
+**空行上的补全**：光标停在空行（或只含缩进的行）上时，模型经常回「先换行再缩进再写代码」——那是它在行尾的惯用续写，可空行本来就已经是新行，多出来的那一次换行会让 ghost 的第一行只剩下空格或缩进、按 Tab 也只插入一个换行加缩进。插件在空行上把这段冗余的前导空行折掉，让代码落回本行（落在行边界的建议本来就该先剥掉这个前导换行）；折完仍然只剩空白的答案照旧当作「没有建议」。行尾光标上的「换行 + 缩进」是正确答案，原样保留。
 
 ### 设置项
 
@@ -127,7 +127,7 @@ API Key 通过 Host 设置服务保存，标记为秘密字段，设置页不会
 |---|---|---|
 | 编辑器 | **Monaco 内联**（约 5.13 MiB bundle，懒加载） | `monaco-editor` 打进 bundle（浏览器模块表冻结，无 Monaco，必须内联） |
 | Worker | Blob URL 内嵌 `editor.worker` | `self.MonacoEnvironment.getWorker`，无 CSP 拦截 |
-| 文件树 | 递归、懒展开 | `ctx.remote.workspaceFiles.list`（官方只读 Remote） |
+| 文件树 | 递归、懒展开；行的类型字形取自 **DSH 官方 UI 库**（与官方工作区文件树同一个组件） | `ctx.remote.workspaceFiles.list`（官方只读 Remote）；字形 = `@deepseek-ai/dsh-client-ui-primitives` 的 `FileTypeIcon` + `classifyFileType`——**隐式 baseline 模块**，只走 loader 的 `require`，不列依赖、也不进 `dsh.client.external` |
 | 读文件 | 分页读全量、按扩展名选语言 | `ctx.remote.workspaceFiles.read`（按行分页，`eof` 收尾） |
 | **非文本文件转交** | 点击 PDF / Excel / Word / PPT / 图片等非文本文件 → 不建模型、不开自家标签，改在右栏「文档预览」中打开 | 官方 `fileAddressFor`（`@deepseek-ai/dsh-util-workspace-path`）+ `ctx.sidebarRight.openResource`，落到官方 `dsh-resource://file/**` 预览档位；本插件 tab 类型不注册 pattern，因此不抢官方 fallback |
 | **写文件** | `POST /api/code-workbench/write`，**版本守卫**（`FS_STALE_VERSION` 拒绝覆盖并发修改），沙箱策略 = 会话标准策略 | host 半体 `ctx.connection.fetch.register`（与官方 `/api/file` 同一通道）→ `ctx.fs.writeText(target, text, intent, signal, sandboxPolicy)` |
@@ -138,7 +138,7 @@ API Key 通过 Host 设置服务保存，标记为秘密字段，设置页不会
 | **检查更新 / 一键升级** | 有新版发布时面板顶部出现提示条，点「升级」原地替换安装目录里的文件；只动了**运行期不参与启动加载**的文件（`client.js`，以及 `src/*` 构建输入、`build.mjs`、README 等）就**免重启**——`client.js` 由 HMR 自己重载面板；改了 Host 半边启动时加载过的文件（`index.js` 及其 import）才提示「重启 DSH 后生效」 | `POST /api/code-workbench/update-check`（`api.github.com` REST：`/tags` → 该 tag 的 `update.json` → 与本机逐文件摘要比对）与 `POST /api/code-workbench/update-apply`（每个文件先按清单摘要校验、再 `rename` 原子替换） |
 | **外部改动自动重载** | Agent/外部改了盘上文件 → 干净缓冲区**自动刷新**；有未保存修改时警告不覆盖 | 官方 `workspaceFiles.changes` 流（`ctx.remote.$stream`），按打开文件订阅 |
 | **加到对话（Add to Chat）** | 右栏**选中多行代码** → `Ctrl+L`、右栏按钮、或**编辑器右键菜单「添加到对话」** → 主对话输入框里出现**引用胶囊**（只显示 `文件:行号 · N 行`），**发送时才展开**成完整代码块给 Agent | 官方 chip 机制：`slash/input-insert-reference` 事件插 `ReferenceChipNode` + 自注册 reference codec（`inputTriggers.registerSource` 的 `codec.serialize` 做提交展开）。三个入口进的是**同一个** `addToChat`，所以产出同一枚胶囊；右键菜单项由 `editor.addAction` 注册在 cut/copy/paste 组之后，**不带** `keybinding`（`Ctrl+L` 已由 `addCommand` 注册，重复注册同一个和弦是静默的）也**不带** `precondition`（本 build 未定义的 context key 恒为 false，会把菜单项永久灰掉，看起来像坏了） |
-| **选中悬浮胶囊** | 在编辑器里选中代码，选区附近浮出「**加到对话　Ctrl+L**」胶囊，点一下即加入对话；选区消失即收起，正在显示 ghost 建议时让位 | Monaco **内容部件**（`editor.addContentWidget`）—— 胶囊只给出行列锚点，像素位置由 Monaco 自己算。落点搜索照 Cursor 的算法复刻（在 ±2 行窗口里挑最长的一行作锚，代价 = 行长与 5 行之差 + 25 × 行偏移），但**偏好恒为 `EXACT`**、上下偏移由插件自算 `transform`：Monaco 的 `ABOVE`/`BELOW` 以**整个窗口**为钳制基准，而编辑器只占右栏一条 |
+| **选中悬浮胶囊** | 在编辑器里选中代码，选区附近浮出「**加到对话　Ctrl+L**」胶囊，点一下即加入对话；选区消失即收起，正在显示 ghost 建议时让位 | Monaco **内容部件**（`editor.addContentWidget`）—— 胶囊只给出行列锚点，像素位置由 Monaco 自己算。落点搜索（在 ±2 行窗口里挑最长的一行作锚，代价 = 行长与 5 行之差 + 25 × 行偏移），但**偏好恒为 `EXACT`**、上下偏移由插件自算 `transform`：Monaco 的 `ABOVE`/`BELOW` 以**整个窗口**为钳制基准，而编辑器只占右栏一条 |
 | **拖拽行到输入框** | 文件树行（文件或目录）拖进主对话输入框 → 落成引用胶囊；**发送时展开为共享 `@路径` mention**（目录带尾斜杠、含空格走 `@"…"`），聊天记录里渲染回同一个胶囊 | 私有 MIME「三重收窄」在 document 捕获阶段接管拖放 → 同一个官方 `slash/input-insert-reference` 通道；提交展开走同一个 reference codec（`clipboardText` 与展开文案逐字一致） |
 | **拖拽标签页** | 标签条上的标签同样可拖：拖进主对话输入框 → 与拖文件树行**完全相同的引用胶囊**；在标签条内左右拖 → **换位**，落点那一侧的边缘出现插入标记 | 复用同一个私有 MIME 和同一个官方通道，因此胶囊只有一个出处；条内换位由各自的 drag ref 分流——**两个手势互不认领**（树行拖过标签条不换位，标签拖到文件夹行也不移动文件） |
 | **点空白处取消选中** | 单击文件树空白处 → 清空选中；顶部新建按钮随之回到在工作区根目录创建 | 树的容器 `onClick`，用 `closest('.code-workbench-tree-row, button, input, .code-workbench-tree-toolbar')` 排除落在行、行内控件和工具栏上的点击：行点击本来就会冒泡到容器，而工具栏是右对齐的，**选中目录后的下一个动作就是往右上走点「新建文件」，擦边落在它的空白处**——没有这道守卫时，两个手势会重合成一个，近失手又会把目标悄悄打回根目录。清空 `selected` 的同时一并清掉 Shift 多选集合与锚点 |

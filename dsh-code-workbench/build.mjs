@@ -15,8 +15,9 @@
  *     plugin as one self-contained classic script:
  *     `window.__ModuleLoader__.load({ id, factory(require) { … } })`. The
  *     factory may `require` only baseline table modules (`react`, `react-dom`,
- *     `@deepseek-ai/cordis`, …); everything else must be inlined. Monaco is not
- *     in that table, so this script bundles it in:
+ *     `@deepseek-ai/cordis`, `@deepseek-ai/dsh-client-ui-primitives`, …);
+ *     everything else must be inlined. Monaco is not in that table, so this
+ *     script bundles it in:
  *
  *       src/client.ts ──esbuild(cjs, external react)──► factory body
  *       monaco editor.worker ──esbuild(iife, minified)──► embedded Blob worker
@@ -111,9 +112,20 @@ if (!jsonWorkerJs) throw new Error('build: json worker bundle produced no js out
 const jsonWorkerCode = jsonWorkerJs.text
 
 // ---------------------------------------------------------------------------
-// 2. Main bundle: the client half, CJS body for the factory. `react` stays a
-//    factory `require`; monaco and everything else is inlined.
+// 2. Main bundle: the client half, CJS body for the factory. The baseline
+//    modules stay factory `require`s; monaco and everything else is inlined.
+//
+//    The externals below are esbuild's — "do not bundle, emit `require(id)`" —
+//    and are a different list from the package's `dsh.client.external`, which
+//    declares *non*-baseline shared requests. `ui-primitives` is baseline (the
+//    shell's frozen `PLATFORM_MODULES` table), so it belongs here and nowhere
+//    else: naming it in `dsh.client.external` would ask the loader to fetch a
+//    dynamic row that does not exist.
 // ---------------------------------------------------------------------------
+const BASELINE_MODULES = [
+  'react',
+  '@deepseek-ai/dsh-client-ui-primitives',
+]
 const mainBuild = await build({
   entryPoints: [path.join(root, 'src', 'client.ts')],
   outfile: path.join(root, '.build', 'client.js'),
@@ -121,7 +133,7 @@ const mainBuild = await build({
   format: 'cjs',
   platform: 'browser',
   target: 'es2020',
-  external: ['react'],
+  external: BASELINE_MODULES,
   write: false,
   sourcemap: false,
   minify: !dev,
