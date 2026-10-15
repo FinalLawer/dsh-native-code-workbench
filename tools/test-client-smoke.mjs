@@ -463,6 +463,9 @@ new Function(source)()
  */
 const fileTypeIconCalls = []
 const classifyFileTypeCalls = []
+// The folder pair the platform's own tree renders for a directory. Same stand-in
+// rule as above: the artwork stays out of here, the wiring does not.
+const folderIconCalls = []
 const primitives = {
   FileTypeIcon: (props) => {
     fileTypeIconCalls.push({ kind: props.kind, size: props.size, className: props.className })
@@ -472,6 +475,14 @@ const primitives = {
       height: props.size,
       className: props.className,
     })
+  },
+  IconFolderOpenRegular: (props) => {
+    folderIconCalls.push({ icon: 'open', size: props.size, className: props.className })
+    return React.createElement('svg', { 'data-folder-icon': 'open', className: props.className })
+  },
+  IconFolderCloseRegular: (props) => {
+    folderIconCalls.push({ icon: 'close', size: props.size, className: props.className })
+    return React.createElement('svg', { 'data-folder-icon': 'close', className: props.className })
   },
   // Faithful only in shape: the real classifier maps a name to a closed set of
   // kinds (and, for code files, to a language). The extension is enough to
@@ -649,7 +660,26 @@ await act(async () => {
 await act(async () => {})
 const tree = () => renderer.toJSON()
 const allText = () => textOf(tree())
-check('the panel shell renders', allText().includes('保存 (Ctrl+S)') && allText().includes('就绪'), allText().slice(0, 80))
+check('the panel shell renders', allText().includes('开始编辑代码') && allText().includes('就绪'), allText().slice(0, 80))
+// Nothing is open, so the tab strip says nothing. It keeps the band's height — the
+// left pane's first row is level with it, and the editor must not jump when the
+// first tab arrives — but prints no hint and draws no divider, because with no tabs
+// there is nothing to list and nothing for a divider to separate.
+const emptyStrip = findAll(tree(), (n) => typeof n.props?.className === 'string' && n.props.className.includes('code-workbench-tabs'))[0]
+check('an empty tab strip is quiet: no hint',
+  emptyStrip !== undefined
+  && emptyStrip.props.className.includes('code-workbench-tabs-quiet')
+  && !allText().includes('未打开文件'),
+  emptyStrip?.props?.className)
+// The action row that used to sit directly under the header is gone. It held
+// 「加到对话」 and 「保存 (Ctrl+S)」 — both second doors onto actions that already
+// have a primary one (the selection capsule, Ctrl+L and the editor context menu;
+// Ctrl+S and the optional auto-save) — and it bought a permanent band of height
+// for two buttons that were disabled most of the time.
+check('the redundant action row is gone',
+  !allText().includes('保存 (Ctrl+S)')
+  && findAll(tree(), (n) => n.type === 'button' && textOf(n) === '加到对话').length === 0,
+  allText().slice(0, 120))
 check('the tree lists the workspace root', allText().includes('a.js') && allText().includes('sub'), calls.list)
 check('the root listing used the session cwd', calls.list[0] === 'C:\\repo', calls.list)
 // The file markers are the platform's, and the row's whole job is to hand the
@@ -669,12 +699,25 @@ check('every file glyph carries the marker box class',
   fileTypeIconCalls.length > 0
   && fileTypeIconCalls.every((call) => call.className === 'code-workbench-tree-marker'),
   fileTypeIconCalls.map((call) => call.className))
-// A folder is still a twisty: the marker column is shared, but only files
-// changed. `sub` is a directory in the fixture, so a glyph for it would mean the
-// row stopped telling the two apart.
+// A directory row is not given a *file* glyph: `sub` is a directory in the
+// fixture, so a `FileTypeIcon` for it would mean the row stopped telling the two
+// apart. What a directory gets instead is the platform's own open/closed folder
+// pair — the two components `dsh-client-ui-sidebar-files` calls for a directory —
+// so the marker column stops being the one place with no picture for a folder.
 check('a directory row is not given a file glyph',
   !fileTypeIconCalls.some((call) => call.kind === 'sub' || call.kind === 'directory'),
   fileTypeIconCalls.map((call) => call.kind))
+check('a directory row gets the platform folder glyph',
+  folderIconCalls.length > 0
+  && folderIconCalls.some((call) => call.icon === 'close')
+  && folderIconCalls.every((call) => call.className === 'code-workbench-tree-marker code-workbench-tree-folder'),
+  folderIconCalls)
+// At this point every directory in the fixture is collapsed, so only the closed
+// half of the pair can have been asked for. The open half is pinned below, once
+// a folder has actually been expanded.
+check('the folder glyph follows the expansion state',
+  folderIconCalls.length > 0 && folderIconCalls.every((call) => call.icon === 'close'),
+  folderIconCalls.map((call) => call.icon))
 check('the editor mounted', calls.editorCreate === 1, calls.editorCreate)
 // The palette path, which had no coverage at all until a selection came out
 // solid red. Monaco runs every theme colour through `Color.fromHex`, which reads
@@ -738,6 +781,85 @@ const css = fs.readFileSync(new URL('../dsh-code-workbench/src/workbench.css', i
 // positioned off the step, not off this box, so they do not move.
 check('the marker column is one 16px box, shared by files and folders',
   /\.code-workbench-tree-marker\s*\{[^}]*width:\s*16px;[^}]*height:\s*16px;/s.test(css))
+// The empty strip's quiet state keeps the band's height and only drops the divider.
+// The height is what keeps the two panes' first rows level and the editor from
+// jumping when the first tab arrives; the divider is a shadow, so dropping it cannot
+// move anything by a pixel the way removing a border would.
+check('the quiet tab strip keeps its height and only hides the divider',
+  /\.code-workbench-tabs\s*\{[^}]*min-height:\s*var\(--cw-head-row/s.test(css)
+  && /\.code-workbench-tabs-quiet\s*\{[^}]*box-shadow:\s*none;/s.test(css))
+// The open tab is marked by merging into the editor, not by a stripe above it: no
+// top border, the editor's own background instead of the strip's raised one, and the
+// strip's divider drawn as an inset shadow so that this tab's opaque background —
+// and only this one — paints over it. All three parts are pinned, since any one of
+// them alone leaves the tab either striped or cut off from the page below.
+const activeTabCss = css.match(/\.code-workbench-tab\.active\s*\{([^}]*)\}/s)?.[1] ?? ''
+// The token the editor paints itself with, read out of the built theme builder
+// rather than written down a second time here: `take('editor.background', …)` is the
+// one place that decides it, and the stylesheet is an independent mention of it.
+const editorBackgroundToken = source.match(/editor\.background"\s*,\s*"(--[\w-]+)"/)?.[1]
+check('the open tab is painted with the same token as the editor itself',
+  editorBackgroundToken !== undefined
+  && activeTabCss.includes(`background: var(${editorBackgroundToken}`),
+  { editorBackgroundToken, activeTab: activeTabCss.trim() })
+check('the open tab merges into the editor instead of wearing a top stripe',
+  !/border-top/.test(activeTabCss)
+  && /\.code-workbench-tabs\s*\{[^}]*box-shadow:\s*inset 0 -1px 0/s.test(css)
+  && !/\.code-workbench-tab\.active\s*\{[^}]*margin-bottom/s.test(css),
+  activeTabCss.trim())
+// The close button's hover frame has to be the button's own box, centred on the
+// glyph and rounded. A bare `×` is laid out on a text baseline, and its line box is
+// both taller and higher than the glyph — which is what put the frame off-centre and
+// made it read as a rectangle around the line rather than around the cross.
+const closeButtonCss = css.match(/\.code-workbench-tab button\s*\{([^}]*)\}/s)?.[1] ?? ''
+check('the close button is a rounded box with the glyph centred in it',
+  /display:\s*flex/.test(closeButtonCss)
+  && /align-items:\s*center/.test(closeButtonCss)
+  && /justify-content:\s*center/.test(closeButtonCss)
+  && /width:\s*18px/.test(closeButtonCss)
+  && /height:\s*18px/.test(closeButtonCss)
+  && /border-radius:\s*[1-9]/.test(closeButtonCss),
+  closeButtonCss.trim())
+// The view switcher is a row above the tree, not a rail of its own beside the
+// pane, and the tree's tools are not in that row either: they ride the root row,
+// on the line of the thing they act on. Both halves of that are pinned — the
+// absent rail, the switcher's row, and where the tools ended up.
+check('the view switcher is a row above the tree, not a rail beside it',
+  !/\.code-workbench-activity\b/.test(css) && /\.code-workbench-viewbar\s*\{/.test(css))
+const viewBar = findAll(tree(), (n) => n.props?.className === 'code-workbench-viewbar')[0]
+check('the switcher row holds the switcher and nothing else',
+  viewBar !== undefined
+  && findAll(viewBar, (n) => n.type === 'button' && n.props['aria-label'] === '文件').length === 1
+  && findAll(viewBar, (n) => n.type === 'button' && n.props['aria-label'] === '新建文件').length === 0,
+  viewBar === undefined ? 'no view bar' : undefined)
+const viewBarRootRow = findAll(tree(), (n) => n.props?.className === 'code-workbench-tree-row' && n.props.title === 'C:\\repo')[0]
+check('and the tree tools ride the root row',
+  viewBarRootRow !== undefined
+  && findAll(viewBarRootRow, (n) => n.type === 'button' && n.props['aria-label'] === '新建文件').length === 1
+  && findAll(viewBarRootRow, (n) => n.type === 'button' && n.props['aria-label'] === '全部折叠').length === 1,
+  viewBarRootRow?.props?.title)
+// The tools are hidden until the pointer is in the tree. Pinned as CSS because a
+// renderer cannot hover: `opacity` (not `display`) so the row never resizes, and
+// `:focus-within` as well as `:hover` so the keyboard can reach them.
+check('and the tools are revealed by the pointer being in the tree',
+  /\.code-workbench-tree-tools\s*\{[^}]*opacity:\s*0;/s.test(css)
+  && /\.code-workbench-tree:hover\s+\.code-workbench-tree-tools/.test(css)
+  && /\.code-workbench-tree:focus-within\s+\.code-workbench-tree-tools/.test(css))
+// A header row needs `flex-shrink: 0`, not just a height. Each one is a flex item
+// in a column beside a scroller whose flex basis is its own content, so a few
+// hundred rows make the two shrink in proportion and the band loses a few pixels —
+// the header is squashed exactly when the tree gets long. Both first rows are
+// pinned, because they are the pair that has to stay level across the split, and
+// the rule had been on the tab strip alone for as long as the view bar existed.
+check('neither pane\'s first row can be squashed by a long file list',
+  /\.code-workbench-viewbar\s*\{[^}]*flex:\s*0 0 auto;/s.test(css)
+  && /\.code-workbench-tabs\s*\{\s*flex-shrink:\s*0;\s*\}/s.test(css))
+// Every row is sized by the row list's content box, so a classic scrollbar taking
+// its width out of that box slides every row — and the tree's tools, which ride the
+// root row's trailing edge — a dozen pixels left the moment a folder gets tall
+// enough to scroll. Reserving the gutter unconditionally is what stops that.
+check('the row list reserves the scrollbar gutter so nothing slides when it appears',
+  /\.code-workbench-tree-body\s*\{[^}]*scrollbar-gutter:\s*stable;/s.test(css))
 // The seven-pixel language dot is gone, not merely unused: a rule left behind
 // would paint under the glyph's transparent corners.
 check('the old language dot rule is gone',
@@ -1153,7 +1275,36 @@ await act(async () => {
   currentModel.setValue(currentModel.getValue() + '// edited\n')
   await new Promise((resolve) => setTimeout(resolve, 720))
 })
-check('the dirty indicator appears', allText().includes('● 未保存'))
+// The dirty marker used to be a line of text in the panel's header band. That
+// band is gone, so the marker now lives on the file's own tab and the assertions
+// below read it there. (Distinct from the `activeTabText` snapshot further down,
+// which pins the tab strip's own text at that point in the run.)
+const activeTabMarker = () => {
+  const tab = findAll(tree(), (node) => node.props?.className?.includes('code-workbench-tab') && node.props.className.includes('active'))[0]
+  return tab === undefined ? '' : textOf(tab)
+}
+check('the dirty indicator appears', activeTabMarker().includes('●'), activeTabMarker())
+// The tab wears the glyph the tree wears, asked for the same way: the entry *name*
+// (so the classifier sees an extension and not a path) in the same 16px box the
+// tree's marker column established, under a class of the tab's own. Comparing the
+// kind against the open tab's own text is what ties the glyph to this file rather
+// than to any file.
+const tabIconCalls = fileTypeIconCalls.filter((call) => call.className === 'code-workbench-tab-icon')
+check('a tab wears the same file glyph the tree does',
+  tabIconCalls.length > 0
+  && tabIconCalls.every((call) => call.size === 16)
+  && tabIconCalls.some((call) => call.kind === 'js' && activeTabMarker().includes('.js')),
+  { tabIconCalls, activeTab: activeTabMarker() })
+// A tab exists now, so the strip is no longer quiet: it prints the tab and draws
+// the divider that separates it from the editor. The class is the whole switch,
+// which is why this is asserted on the same element as the empty case above.
+check('once a file is open the strip speaks again, divider and all',
+  (() => {
+    const strip = findAll(tree(), (n) => typeof n.props?.className === 'string' && n.props.className.includes('code-workbench-tabs'))[0]
+    return strip !== undefined
+      && !strip.props.className.includes('code-workbench-tabs-quiet')
+      && activeTabMarker().length > 0
+  })())
 // Monaco asks on its own for every typed character, for backspace and delete
 // (they sit in its `triggerCommands` list precisely because they never reach
 // `onDidType`), and for Tab and paste. Nudging it from here arrives as an
@@ -1163,9 +1314,12 @@ check('the dirty indicator appears', allText().includes('● 未保存'))
 // the ghost text another 400ms away. Asserting the count is zero pins that the
 // plugin leaves the driving to Monaco.
 check('editing never makes the plugin drive the editor itself', (calls.inlineTriggers ?? 0) === 0, calls.inlineTriggers ?? 0)
-const saveButton = findAll(tree(), (n) => n.type === 'button' && textOf(n).includes('保存'))[0]
+// Ctrl+S is the primary door onto save — the header button that used to offer it
+// is gone (see the shell check above). It is the same handler the button called:
+// `addCommand` binds `saveRef.current`, and that is `save` itself.
+const saveCommand = calls.commands?.find((row) => row.keybinding === (fakeMonaco.KeyMod.CtrlCmd | fakeMonaco.KeyCode.KeyS))
 await act(async () => {
-  saveButton.props.onClick()
+  saveCommand?.handler()
 })
 await act(async () => {})
 const write = calls.fetch.at(-1)
@@ -1472,10 +1626,13 @@ await act(async () => {
   selectionEmpty = false
   calls.selectionListener()
 })
-const chatButton = findAll(tree(), (n) => n.type === 'button' && textOf(n).includes('加到对话'))[0]
-check('the Add-to-Chat button enables on selection', chatButton !== undefined && chatButton.props.disabled === false)
+// Ctrl+L is the primary door onto this action: the header button that used to
+// offer it is gone, so the chord is what the chip assertions below ride on. The
+// editor context menu is the second door and is exercised further down.
+const addToChatCommand = calls.commands?.find((row) => row.keybinding === (fakeMonaco.KeyMod.CtrlCmd | fakeMonaco.KeyCode.KeyL))
+check('Ctrl+L is bound to Add to Chat', typeof addToChatCommand?.handler === 'function', calls.commands?.map((row) => row.keybinding))
 await act(async () => {
-  chatButton.props.onClick()
+  addToChatCommand?.handler()
 })
 await act(async () => {})
 const insert = calls.bailed.at(-1)
@@ -1583,6 +1740,13 @@ check('the chip carries a path-only reference for the dropped file',
   && dropped.payload.reference.ref.pathOnly === true
   && dropped.payload.reference.ref.directory === false
   && dropped.payload.reference.label === 'a.js', dropped?.payload.reference)
+// The shell draws the chip's glyph from `appearance` alone — `ReferenceIconRegular
+// kind={appearance}`, whose artwork knows `session`, `file` and `folder` and nothing
+// else — and its own file source maps a directory to `folder`. So the domain has to
+// be right or a folder is drawn as a document; there is no file-*type* glyph to ask
+// for, which is why this asserts the domain and not a `.js`/`.py` kind.
+check('a file reference asks for the file glyph',
+  dropped?.payload.reference.appearance === 'file', dropped?.payload.reference.appearance)
 check('the drop reuses the captured draft span', dropped?.payload.span?.draftRev === 1, dropped?.payload.span)
 check('status reports the dropped file', allText().includes('已添加到对话：a.js'), allText().slice(-80))
 
@@ -1593,6 +1757,8 @@ const droppedDir = calls.bailed.at(-1)
 check('a dropped directory lands as a directory reference',
   droppedDir?.payload.reference.ref.directory === true && droppedDir.payload.reference.label === 'sub/',
   droppedDir?.payload.reference)
+check('and asks for the folder glyph, not the document the shell draws for a file',
+  droppedDir?.payload.reference.appearance === 'folder', droppedDir?.payload.reference.appearance)
 
 // What a submission carries decides two things at once: the transcript's
 // projector only decorates a `@token` (start of text or after whitespace) into
@@ -1669,6 +1835,34 @@ console.log('\nfile-tree keyboard navigation')
 const treeBody = () => findAll(tree(), (node) => node.props?.className === 'code-workbench-tree-body')[0]
 const rowNode = (title) => treeRowFor(title)
 const selectedTitle = () => findAll(tree(), (node) => node.props?.['data-selected'] === true).map((node) => node.props.title)
+
+// The workspace root is a row of the tree now rather than a caption above it: it
+// carries the chevron and closes its own subtree. The round trip is collapsed and
+// reopened inside two `act` blocks with nothing asserted in between, so the state
+// every later assertion runs against is the state it ran against before.
+console.log('\nthe workspace root folds like any other folder')
+const rootRow = () => findAll(tree(), (n) => n.props?.className === 'code-workbench-tree-row' && n.props.title === 'C:\\repo')[0]
+check('the root is a row of the tree, expanded',
+  rootRow() !== undefined && rootRow().props.role === 'treeitem' && rootRow().props['aria-expanded'] === true,
+  rootRow()?.props?.['aria-expanded'])
+check('and the subtree under it is on screen', rowNode('C:\\repo\\a.js') !== undefined)
+// The invariant that makes every gap in the tree the same: the root is a row of
+// the same list as its children, not a header sitting above the scroller. Split
+// across two boxes, the root-to-first-child gap is decided by one set of rules on
+// one side of the boundary and another set on the other, and can only ever be made
+// to look equal.
+check('the root row lives inside the row list, not above it',
+  findAll(treeBody(), (n) => n.props?.className === 'code-workbench-tree-row' && n.props.title === 'C:\\repo')[0] !== undefined)
+await act(async () => { rootRow().props.onClick() })
+await act(async () => {})
+check('clicking the root collapses its subtree',
+  rootRow().props['aria-expanded'] === false && rowNode('C:\\repo\\a.js') === undefined,
+  { expanded: rootRow().props['aria-expanded'], child: rowNode('C:\\repo\\a.js')?.props?.title })
+await act(async () => { rootRow().props.onClick() })
+await act(async () => {})
+check('and clicking it again brings the subtree back',
+  rootRow().props['aria-expanded'] === true && rowNode('C:\\repo\\a.js') !== undefined)
+
 /** Deliver a key to the tree container and let React flush. */
 const pressTreeKey = async (key, extra = {}) => {
   let prevented = false
@@ -1683,7 +1877,7 @@ const pressTreeKey = async (key, extra = {}) => {
 // The status bar is deliberately excluded: the drag suite above leaves a
 // message there, and this assertion is about the *document*, not the chrome.
 const editorBeforeKeys = currentModel?.getValue()
-const dirtyBeforeKeys = allText().includes('未保存')
+const dirtyBeforeKeys = activeTabMarker().includes('●')
 check('the tree exposes a single flat tree container', treeBody() !== undefined, Boolean(treeBody()))
 const ajsKeys = rowNode('C:\\repo\\a.js').props.onKeyDown
 let rowPrevented = false
@@ -1704,8 +1898,13 @@ check('a click still selects its row', selectedTitle().includes('C:\\repo\\a.js'
 check('the selected row is announced to assistive tech',
   rowNode('C:\\repo\\a.js').props['aria-selected'] === true
   && rowNode('C:\\repo\\b.js').props['aria-selected'] === false)
+// Level 2, not 1: the root is the tree's first row and everything else hangs one
+// level under it — `aria-level` counts the root as 1, so a child of the workspace
+// root is 2. The depth is announced, not just painted, so this is the number a
+// screen reader reads out.
 check('rows identify themselves as tree items at their depth',
-  rowNode('C:\\repo\\a.js').props.role === 'treeitem' && rowNode('C:\\repo\\a.js').props['aria-level'] === 1)
+  rowNode('C:\\repo\\a.js').props.role === 'treeitem' && rowNode('C:\\repo\\a.js').props['aria-level'] === 2,
+  rowNode('C:\\repo\\a.js').props['aria-level'])
 // The selection effect focuses the selected row, so this is the row that took
 // DOM focus — which is what makes the next keypress reach the tree at all.
 check('the selected row is the one holding focus', lastFocusedTreeRow === 'C:\\repo\\a.js', lastFocusedTreeRow)
@@ -1724,7 +1923,7 @@ check('tree navigation leaves the editor buffer untouched',
   currentModel.getValue() === editorBeforeKeys,
   { before: editorBeforeKeys.slice(0, 60), now: currentModel.getValue().slice(0, 60) })
 check('tree navigation does not mark the open file dirty',
-  allText().includes('未保存') === dirtyBeforeKeys)
+  activeTabMarker().includes('●') === dirtyBeforeKeys)
 
 // --- A collapsed folder is a boundary: its children are simply not in the
 // tree, so ↓ can never skip into them. → is what opens the door.
@@ -1741,6 +1940,11 @@ check('landing on a collapsed folder did not expand it', rowNode('C:\\repo\\sub'
 check('↓ never skipped past the folder into its children', rowNode(subChild) === undefined)
 await pressTreeKey('ArrowRight')
 check('→ expands the folder the selection is on', rowNode('C:\\repo\\sub').props['aria-expanded'] === true)
+// The glyph is asked for by state, not drawn once: the moment the folder opens,
+// the pair's open half is what the row asks the platform for.
+check('→ swaps the folder glyph to the open half',
+  folderIconCalls.some((call) => call.icon === 'open'),
+  folderIconCalls.map((call) => call.icon).slice(-4))
 check('→ reveals the first child', rowNode(subChild) !== undefined, rowNode(subChild)?.props.title)
 await pressTreeKey('ArrowRight')
 check('→ again steps onto the first child', selectedTitle().includes(subChild), selectedTitle())
@@ -1999,9 +2203,12 @@ check('a multi-delete issues nothing before it is confirmed',
 console.log('\nindent guides show the selection ancestry')
 const railsOn = (title) => findAll(rowNodeFor(title), (node) => node.props?.className === 'code-workbench-tree-rail' && node.props['data-on'] === 'true').length
 const railsTotal = (title) => findAll(rowNodeFor(title), (node) => node.props?.className === 'code-workbench-tree-rail').length
-// A root-level row has no rails at all: there is no ancestry to draw.
-check('a root row has no indent rails', railsTotal('C:\\repo\\a.js') === 0, railsTotal('C:\\repo\\a.js'))
-// Open the folder so a depth-1 row exists to inspect.
+// A row with no ancestry draws no rails at all. That row is the workspace root:
+// every other row in the tree now hangs one level under it, so the children carry
+// the root's rail and `a.js` is no longer root-level.
+check('the workspace root row has no indent rails',
+  railsTotal('C:\\repo') === 0, railsTotal('C:\\repo'))
+// Open the folder so a deeper row exists to inspect.
 if (rowNodeFor('C:\\repo\\sub').props['aria-expanded'] !== true) {
   await act(async () => { rowNodeFor('C:\\repo\\sub').props.onClick({}) })
   await act(async () => {})
@@ -2009,8 +2216,9 @@ if (rowNodeFor('C:\\repo\\sub').props['aria-expanded'] !== true) {
 check('the child row exists once its folder is open', rowNodeFor('C:\\repo\\sub\\a.js') !== undefined)
 await act(async () => { treeBodyEl().props.onMouseEnter() })
 await act(async () => {})
+// Two levels of ancestry, so two rails: the workspace root and `sub`.
 check('while the pointer is over the list a child row lights all its rails',
-  railsOn('C:\\repo\\sub\\a.js') === railsTotal('C:\\repo\\sub\\a.js') && railsTotal('C:\\repo\\sub\\a.js') === 1,
+  railsOn('C:\\repo\\sub\\a.js') === railsTotal('C:\\repo\\sub\\a.js') && railsTotal('C:\\repo\\sub\\a.js') === 2,
   { on: railsOn('C:\\repo\\sub\\a.js'), total: railsTotal('C:\\repo\\sub\\a.js') })
 // Leaving the list keeps only the primary selection's ancestry lit.
 // Select the child directly: clicking the folder row would collapse it and take
@@ -2020,8 +2228,9 @@ await act(async () => {})
 check('the child row survives the selection', rowNodeFor('C:\\repo\\sub\\a.js') !== undefined)
 await act(async () => { treeBodyEl().props.onMouseLeave() })
 await act(async () => {})
+// The selection's whole ancestry stays lit: the root's rail and `sub`'s.
 check('a child of the selection keeps its ancestor rail lit after the pointer leaves',
-  railsOn('C:\\repo\\sub\\a.js') === 1, { on: railsOn('C:\\repo\\sub\\a.js'), total: railsTotal('C:\\repo\\sub\\a.js') })
+  railsOn('C:\\repo\\sub\\a.js') === 2, { on: railsOn('C:\\repo\\sub\\a.js'), total: railsTotal('C:\\repo\\sub\\a.js') })
 check('an unrelated sibling loses its rails once the pointer leaves',
   railsOn('C:\\repo\\sub\\b.js') === 0, { on: railsOn('C:\\repo\\sub\\b.js'), total: railsTotal('C:\\repo\\sub\\b.js') })
 // Put the pointer back inside for the drag block, which expects the full tree.
@@ -2288,7 +2497,7 @@ check('a click that landed on a row is not blank space',
 // fact.
 await act(async () => { treeRowIn('C:\\repo\\sub').props.onClick() })
 await act(async () => {})
-const toolbarTarget = { closest: (selector) => (selector.includes('toolbar') ? {} : null) }
+const toolbarTarget = { closest: (selector) => (selector.includes('viewbar') ? {} : null) }
 await act(async () => { treeRoot().props.onClick(makeEvent('click', { target: toolbarTarget })) })
 check('and a click on the toolbar does not count as blank space',
   treeRowIn('C:\\repo\\sub').props['data-selected'] === true
@@ -2316,11 +2525,15 @@ await act(async () => { treeRowIn('C:\\repo\\one.js').props.onClick() })
 await act(async () => { treeRowIn('C:\\repo\\two.js').props.onClick() })
 await act(async () => { treeRowIn('C:\\repo\\three.js').props.onClick() })
 await act(async () => {})
+// Located by the path its name span carries, not by child index: a tab is a glyph,
+// a name and a close button now, and "the first child is the name" was only ever
+// true while the glyph was not there.
+const tabNameTitle = (tab) => findAll(tab, (n) => n.type === 'span' && typeof n.props?.title === 'string')[0]?.props.title
 const tabNodeFor = (path) => findAll(tree(), (n) => typeof n.props?.className === 'string'
   && n.props.className.split(' ')[0] === 'code-workbench-tab'
-  && Array.isArray(n.children) && n.children[0]?.props?.title === path)[0]
+  && Array.isArray(n.children) && tabNameTitle(n) === path)[0]
 const tabOrder = () => findAll(tree(), (n) => typeof n.props?.className === 'string'
-  && n.props.className.split(' ')[0] === 'code-workbench-tab').map((n) => n.children[0].props.title)
+  && n.props.className.split(' ')[0] === 'code-workbench-tab').map(tabNameTitle)
 check('three files are open, in the order they were opened',
   tabOrder().join() === 'C:\\repo\\one.js,C:\\repo\\two.js,C:\\repo\\three.js', tabOrder())
 check('every tab is a drag source', tabNodeFor('C:\\repo\\one.js').props.draggable === true)

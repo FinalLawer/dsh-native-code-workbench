@@ -60,4 +60,29 @@ declare module '@deepseek-ai/dsh-client-ui-primitives' {
    * invented here.
    */
   function classifyFileType(path: string): FileTypeIconKind
+
+  /** Props the folder artwork actually reads; it spreads the rest away. */
+  interface FolderIconProps {
+    /** Rendered width and height in px; the artwork's own default is 16. */
+    size?: number
+    /** Passed through to the `<svg>`; the artwork strokes with `currentColor`. */
+    className?: string
+  }
+
+  /**
+   * The folder glyphs, one per expansion state.
+   *
+   * DSH's own file tree (`dsh-client-ui-sidebar-files/lib/client.js`) calls exactly
+   * these two for a directory:
+   *
+   *     expanded ? IconFolderOpenRegular : IconFolderCloseRegular
+   *
+   * and passes only a `className` — no `size`, because `FolderCloseArtwork` is
+   * declared `({ size = 16, className, strokeWidth })` with a `0 0 16 16` viewBox,
+   * which is already the width of an icon column. Only those three props are read:
+   * the artwork does not spread the rest of its props onto the `<svg>`, so a
+   * `style` handed to it would be dropped silently.
+   */
+  function IconFolderOpenRegular(props: FolderIconProps): import('react').ReactElement
+  function IconFolderCloseRegular(props: FolderIconProps): import('react').ReactElement
 }

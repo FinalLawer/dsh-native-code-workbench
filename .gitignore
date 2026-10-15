@@ -5,7 +5,8 @@ __pycache__/
 tmp-*.txt
 .DS_Store
 
-# Packaged release artifacts (tarball / zip produced by `npm pack`).
+# Packaged release artifacts (tarball / zip produced by `npm pack`), captured
+# run logs, and the local cleanup quarantine under `outputs/_trash-*/`.
 outputs/
 
 # Scratch diagnostics live under a leading underscore: one-off probes and
@@ -13,15 +14,10 @@ outputs/
 # part of the suite and never ship.
 tools/_*
 
-# Local agent working context (session logs, project conventions) — not project artifacts.
-.workbuddy/
-.workbuddy-ai/
-
-# Reference material unpacked from the installed desktop client. Kept locally for
-# API lookups, but it is not ours to redistribute: the Electron shell (main
-# process, preload scripts, and renderer documents) is not part of the
-# MIT-licensed `@deepseek-ai/dsh` package published on npm.
-ref/app-lib/
-ref/app-renderer/
-ref/dsh/desktop-runtime.json
-ref/dsh/package.json
+# Reference material unpacked from the installed desktop client — the whole
+# tree, its node_modules included. Kept locally for API lookups, but it is not
+# ours to redistribute: the Electron shell (main process, preload scripts, and
+# renderer documents) is not part of the MIT-licensed `@deepseek-ai/dsh` package
+# published on npm. Nothing under it is tracked, so the tree is ignored whole
+# rather than file by file — a freshly unpacked copy cannot leak into a commit.
+ref/

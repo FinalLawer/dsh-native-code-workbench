@@ -26,7 +26,7 @@
 import React from 'react'
 import type * as Monaco from 'monaco-editor/editor/editor.api.js'
 import { fileAddressFor } from '@deepseek-ai/dsh-util-workspace-path'
-import { FileTypeIcon, classifyFileType } from '@deepseek-ai/dsh-client-ui-primitives'
+import { FileTypeIcon, IconFolderCloseRegular, IconFolderOpenRegular, classifyFileType } from '@deepseek-ai/dsh-client-ui-primitives'
 import './workbench.css'
 import { serializeSnippet, splitSnippets } from './snippets.mjs'
 import { COMPLETION_PREFIX_CHARS, COMPLETION_SUFFIX_CHARS } from './completion-window.mjs'
@@ -216,7 +216,20 @@ interface ChatReference {
     code?: string
   }
   label: string
-  appearance: 'file'
+  /**
+   * The chip's glyph, and the only lever we have on it.
+   *
+   * The shell renders `ReferenceIconRegular kind={appearance}` (in the conversation
+   * package's `ReferenceChip`), and that artwork knows exactly three kinds:
+   * `session`, `file` — a generic document outline — and `folder`. There is no
+   * file-*type* kind, so a `.js` reference cannot wear the `.js` glyph the tree and
+   * the tabs do; that would need the shell's chip to call `FileTypeIcon` +
+   * `classifyFileType` on the reference's path.
+   *
+   * What is ours is getting the domain right: the shell's own file source maps a
+   * directory to `folder`, so a directory sent as `file` gets a document drawn.
+   */
+  appearance: 'file' | 'folder'
   clipboardText: string
 }
 
@@ -1508,9 +1521,21 @@ interface FileTreeProps {
   clipboard: TreeClipboard | null
   closeMenuSignal: string | null
   onMenuOpen: () => void
+  /**
+   * Rendered at the left end of the tree's header row, ahead of its own tools.
+   *
+   * This is the view switcher — 文件 / 搜索 / 历史 — which used to be a rail beside
+   * the pane and is now the left end of the row above the tree. The tree renders
+   * it, rather than the panel, because this row *is* the tree's header and the
+   * tree is what is on screen in this mode; the panel renders the same node in a
+   * row of its own for the other two modes.
+   */
+  leading?: React.ReactNode
+  /** The pane is folded: its header row stays — that is where the switcher is — and the rows go. */
+  collapsed?: boolean
 }
 
-function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRevision, clipboard, closeMenuSignal, onMenuOpen }: FileTreeProps): React.ReactNode {
+function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRevision, clipboard, closeMenuSignal, onMenuOpen, leading, collapsed = false }: FileTreeProps): React.ReactNode {
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set([cwd]))
   const [children, setChildren] = useState<TreeChildren>({}) // dir path -> entries | 'loading' | error string
   const [menu, setMenu] = useState<TreeMenu | null>(null)
@@ -2048,22 +2073,35 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
           },
           title: full,
         }, guideRails(depth, railCountFor(depth, carriesChain)),
-          // A folder turns its twisty; a file shows what kind of file it is.
+          // Two columns, in this order: the disclosure chevron, then the glyph.
+          //
+          // The chevron lives in its own 12px box because a file has none, and the
+          // glyph column after it has to begin at the same x for both — otherwise
+          // a folder's name would sit 16px right of a file's at the same depth. The
+          // box is always rendered, empty for a file, so the columns cannot drift.
+          h('span', { className: 'code-workbench-tree-chevron', 'aria-hidden': true },
+            isDir
+              ? h('svg', {
+                className: 'code-workbench-tree-twisty',
+                'data-open': isOpen ? 'true' : 'false',
+                width: 12, height: 12, viewBox: '0 0 12 12',
+              }, h('path', { d: 'M4 2.5 L8 6 L4 9.5', fill: 'none', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round' }))
+              : null),
+          // A directory now gets the platform's own folder glyph: the open/closed
+          // pair `dsh-client-ui-sidebar-files` renders for a directory, called the
+          // same way it calls them. A file keeps `FileTypeIcon` fed by
+          // `classifyFileType(name)`.
+          //
           // Both sit in the same 16px box so names stay on one column — and the
           // box is 16 rather than the old 12 because the file glyph carries a
           // type mark inside it, which needs the room. `INDENT` is deliberately
           // *not* widened to match: the rails are positioned off `INDENT` and
-          // sit to the left of this box, so leaving the step at 12 keeps every
-          // guide exactly where it was while the marker simply grows into the
-          // gap on its right.
+          // sit to the left of these boxes, so leaving the step at 12 keeps every
+          // guide exactly where it was.
           isDir
-            ? h('svg', {
-              className: 'code-workbench-tree-twisty code-workbench-tree-marker',
-              'data-open': isOpen ? 'true' : 'false',
-              width: 12, height: 12, viewBox: '0 0 12 12',
-              'aria-hidden': true,
-              style: { color: T.fgMuted },
-            }, h('path', { d: 'M4 2.5 L8 6 L4 9.5', fill: 'none', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round' }))
+            ? h(isOpen ? IconFolderOpenRegular : IconFolderCloseRegular, {
+              className: 'code-workbench-tree-marker code-workbench-tree-folder',
+            })
             : h(FileTypeIcon, {
               kind: classifyFileType(entry.name),
               size: 16,
@@ -2074,7 +2112,74 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
       if (isOpen) walk(full, depth + 1, full)
     }
   }
-  walk(cwd, 0, null)
+  // The workspace root is a row like any other now: it opens and closes its own
+  // subtree. `expanded` already starts with `cwd` in it, so the tree still opens
+  // expanded — the only thing that is new is that it can be closed.
+  //
+  // It is pushed into the row list rather than rendered as a header above it. Both
+  // put it on screen, but only this puts it in the *same box* as the rows below:
+  // as a sibling of the scroller its gap to the first child was decided by the
+  // flex column's rules on one side of the boundary and by a row margin on the
+  // other, which is two rules for a gap that has to match one. Here every gap in
+  // the tree is the same pair of row margins, root included.
+  const rootOpen = expanded.has(cwd)
+  rows.push(h('div', {
+    key: 'code-workbench-tree-root',
+    className: 'code-workbench-tree-row',
+    'data-depth': 0,
+    role: 'treeitem',
+    tabIndex: 0,
+    'aria-level': 1,
+    'aria-expanded': rootOpen,
+    title: cwd,
+    // Half a row's padding would be 4px; this keeps the full 8px a row gets,
+    // because the children are indented instead (see `walk(cwd, 1, …)`). The
+    // nesting is carried by their 12px step, not by pulling the root out of line,
+    // so the root keeps the same breathing room from the pane's edge as any row.
+    style: rowStyle(0),
+    onClick: () => toggle(cwd),
+    onContextMenu: (event: React.MouseEvent) => contextMenu(event, cwd, true),
+  },
+    h('span', { className: 'code-workbench-tree-chevron', 'aria-hidden': true },
+      h('svg', {
+        className: 'code-workbench-tree-twisty',
+        'data-open': rootOpen ? 'true' : 'false',
+        width: 12, height: 12, viewBox: '0 0 12 12',
+      }, h('path', { d: 'M4 2.5 L8 6 L4 9.5', fill: 'none', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round' }))),
+    // `minWidth: 0` because the tools after the name are pushed right by an auto
+    // margin: a flex item's default `min-width: auto` refuses to shrink below its
+    // content, so a long workspace name would push the tools out of the row instead
+    // of ellipsising itself.
+    h('span', { style: { flex: '1 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' } }, cwd.split(/[\\/]/).filter(Boolean).at(-1)),
+    // The tree's tools ride the root row's trailing edge: that row *is* the tree's
+    // header, so the tools sit on the same line as the thing they act on instead of
+    // costing a band of their own. `margin-left: auto` (in the stylesheet) is what
+    // pushes them to the right end, past the name.
+    //
+    // Folded there is no tree to act on, so they are left out entirely. Otherwise
+    // they are shown by the pointer being anywhere in the tree — this row is inside
+    // `.code-workbench-tree`, so hovering it or any row below counts.
+    collapsed ? null : h('div', { className: 'code-workbench-tree-tools' },
+      h('button', {
+        title: selected === null ? '新建文件' : `在 ${relativeToCwd(createTarget.path, cwd) || '工作区'} 中新建文件`,
+        'aria-label': '新建文件',
+        onClick: () => openCreate('createFile', createTarget),
+      }, workbenchIcon('createFile')),
+      h('button', {
+        title: selected === null ? '新建文件夹' : `在 ${relativeToCwd(createTarget.path, cwd) || '工作区'} 中新建文件夹`,
+        'aria-label': '新建文件夹',
+        onClick: () => openCreate('createDirectory', createTarget),
+      }, workbenchIcon('createDirectory')),
+      h('button', { title: '刷新', 'aria-label': '刷新文件树', onClick: () => { for (const dir of expanded) load(dir) } }, workbenchIcon('refresh')),
+      h('button', { title: '全部折叠', 'aria-label': '全部折叠', onClick: () => setExpanded(new Set([cwd])) }, workbenchIcon('collapse')),
+    )))
+  // The root's children start one level in, not at its own level. They used to be
+  // walked at depth 0, i.e. flush with the root, and the only thing saying "these
+  // belong to it" was the root sitting a few pixels to their left — an offset that
+  // had to be tuned by hand and never looked right. A real indent says it by
+  // construction, and it is also what turns on the first indent rail under the
+  // root while the pointer is over the list.
+  if (rootOpen) walk(cwd, 1, null)
   /**
    * Move the selection one row up or down and put focus on it. Crossing a
    * directory boundary is *not* automatic: the child row only exists in `flat`
@@ -2243,7 +2348,7 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
     // next move after selecting a folder, so a near miss has to keep the
     // target rather than silently reset it to the workspace root.
     if (typeof target?.closest === 'function'
-      && target.closest('.code-workbench-tree-row, button, input, .code-workbench-tree-toolbar') !== null) return
+      && target.closest('.code-workbench-tree-row, button, input, .code-workbench-viewbar') !== null) return
     setSelected(null)
     setExtraSelection(new Set())
     selectionAnchorRef.current = null
@@ -2256,25 +2361,17 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
     // element never reaches it — a content-height tree left every click under
     // the last row on the caller's wrapper, which listens to nothing. The
     // scrolling belongs to the row list inside, not to this box: see there.
-    style: { display: 'flex', flexDirection: 'column', flex: '1 1 auto', minHeight: 0, overflow: 'hidden', padding: '4px 0' },
+    style: { display: 'flex', flexDirection: 'column', flex: '1 1 auto', minHeight: 0, overflow: 'hidden' },
     onClick: clearSelection,
     onContextMenu: (event: React.MouseEvent) => contextMenu(event, cwd, true),
   },
-    h('div', { className: 'code-workbench-tree-toolbar' },
-      h('button', {
-        title: selected === null ? '新建文件' : `在 ${relativeToCwd(createTarget.path, cwd) || '工作区'} 中新建文件`,
-        'aria-label': '新建文件',
-        onClick: () => openCreate('createFile', createTarget),
-      }, workbenchIcon('createFile')),
-      h('button', {
-        title: selected === null ? '新建文件夹' : `在 ${relativeToCwd(createTarget.path, cwd) || '工作区'} 中新建文件夹`,
-        'aria-label': '新建文件夹',
-        onClick: () => openCreate('createDirectory', createTarget),
-      }, workbenchIcon('createDirectory')),
-      h('button', { title: '刷新', 'aria-label': '刷新文件树', onClick: () => { for (const dir of expanded) load(dir) } }, workbenchIcon('refresh')),
-      h('button', { title: '全部折叠', 'aria-label': '全部折叠', onClick: () => setExpanded(new Set([cwd])) }, workbenchIcon('collapse')),
-    ),
-    h('div', { style: rowStyle(0), onContextMenu: (event: React.MouseEvent) => contextMenu(event, cwd, true) }, cwd.split(/[\\/]/).filter(Boolean).at(-1)),
+    // The switcher's own row, above the tree. Its tools are not here any more:
+    // they moved onto the root row below, on the line of the thing they act on, so
+    // this band holds nothing but the switcher — and the switcher is centred in it.
+    h('div', { className: 'code-workbench-viewbar' }, leading),
+    // The root row is the first entry of the row list below, not a header here —
+    // see where `rows.push` builds it. Same box as every other row, so one pair of
+    // margins governs every gap in the tree.
     // The keyboard handler sits on the scroller, not on each row: with focus on
     // a row, ↑/↓/←/→/F2/Delete bubble here, so every row shares one
     // implementation and there is no per-row listener to keep in sync.
@@ -2292,7 +2389,9 @@ function FileTree({ list, cwd, activePath, onOpen, joinPath, onAction, refreshRe
       // It is also the box `scrollerRef` measures: a ref on an element that never
       // overflows reads a scroll offset of zero forever, which quietly turned the
       // "a refresh must not jump you to the top" restore into a no-op.
-      style: { flex: '1 1 auto', minHeight: 0, overflow: 'auto' },
+      // Folded, the rows go and the header row above stays — that row is where the
+      // view switcher lives, so hiding the whole pane would hide the only way back.
+      style: { flex: '1 1 auto', minHeight: 0, overflow: 'auto', ...(collapsed ? { display: 'none' } : {}) },
       ref: scrollerRef,
       onKeyDown: handleTreeKeys,
       onMouseEnter: () => setPointerInTree(true),
@@ -2392,7 +2491,6 @@ function CodePanel(props: DSH.CodePanelProps): React.ReactNode {
   const [searching, setSearching] = useState(false)
   const [result, setResult] = useState<SearchReport | { error: string } | null>(null)
   const [history, setHistory] = useState<HistoryReport | { error: string } | null>(null)
-  const [hasSelection, setHasSelection] = useState(false)
   const [navigationOpen, setNavigationOpen] = useState(true)
   const [completionStatus, setCompletionStatus] = useState('AI 补全就绪')
   const [editRevision, setEditRevision] = useState(0)
@@ -2558,7 +2656,6 @@ function CodePanel(props: DSH.CodePanelProps): React.ReactNode {
     const pill = new SelectionPill({ editor, monaco, onPick: () => { addToChatRef.current?.() } })
     editor.addContentWidget(pill)
     const selectionListener = editor.onDidChangeCursorSelection(() => {
-      setHasSelection(!editor.getSelection()?.isEmpty())
       // A selection the user drew by hand supersedes whatever suggestion was on
       // screen when it started, and the capsule reads the same event to move.
       pill.setSuggestionVisible(false)
@@ -3238,7 +3335,10 @@ function CodePanel(props: DSH.CodePanelProps): React.ReactNode {
         source: 'code-workbench',
         ref: { path: parsed.path, directory: parsed.directory, pathOnly: true },
         label,
-        appearance: 'file',
+        // The shell draws the chip's glyph from this, and its own file source maps a
+        // directory to `folder` (`appearance: directory ? "folder" : "file"`). Sending
+        // `file` for a directory had the shell draw a document for a folder.
+        appearance: parsed.directory === true ? 'folder' : 'file',
         clipboardText: referenceMention(parsed.path, parsed.directory === true),
       }
       const span = inputActions.captureInsertion()
@@ -3273,7 +3373,7 @@ function CodePanel(props: DSH.CodePanelProps): React.ReactNode {
         const scope = sessionsScope?.(sessionId)
         if (!scope || !inputActions?.captureInsertion) throw new Error('对话输入框尚未就绪')
         const relative = relativeToCwd(path, cwd) || '.'
-        const reference: ChatReference = { source: 'code-workbench', ref: { path: relative, directory: target.isDir, pathOnly: true }, label: relative, appearance: 'file', clipboardText: referenceMention(relative, target.isDir === true) }
+        const reference: ChatReference = { source: 'code-workbench', ref: { path: relative, directory: target.isDir, pathOnly: true }, label: relative, appearance: target.isDir === true ? 'folder' : 'file', clipboardText: referenceMention(relative, target.isDir === true) }
         if (scope.bail(scope, 'slash/input-insert-reference', { reference, span: inputActions.captureInsertion() }) !== true) throw new Error('对话输入框正忙')
       } else if (action === 'openTerminal') {
         if (!openWorkspaceTerminal(sidebarRight)) throw new Error('无法打开终端：宿主未提供终端面板')
@@ -3606,7 +3706,6 @@ function CodePanel(props: DSH.CodePanelProps): React.ReactNode {
           : h('div', { style: { padding: '8px', color: T.fgMuted, fontSize: '11px' } }, '加载中…')),
   )
 
-  const relativePath = typeof activePath === 'string' ? relativeToCwd(activePath, cwd) : activePath
   const showTabMenu = (event: React.MouseEvent, path: string) => {
     event.preventDefault()
     event.stopPropagation()
@@ -3689,9 +3788,22 @@ function CodePanel(props: DSH.CodePanelProps): React.ReactNode {
         setTabDrop(null)
       },
     },
+      // The same glyph the tree shows for this file, in the same 16px box, asked for
+      // the same way: the entry *name*, so `classifyFileType` reads an extension
+      // rather than a path. One file should look like itself wherever it appears.
+      h(FileTypeIcon, { kind: classifyFileType(name ?? path), size: 16, className: 'code-workbench-tab-icon' }),
       h('span', { title: path }, `${name}${tabDirty ? ' ●' : ''}`),
       h('button', { title: `关闭 ${name}`, onClick: (event: React.MouseEvent) => { event.stopPropagation(); void closeFile(path) } }, '×'))
   })
+  // The view switcher: three buttons, built once and placed either by the tree (as
+  // the left end of its header row, which is the row above the file list) or by the
+  // panel itself (in a row of its own, for the search and history views, which have
+  // no header row to host it).
+  const viewButtons = h('div', { className: 'code-workbench-viewbar-views', role: 'toolbar', 'aria-label': '工作区视图' },
+    ([['tree', '文件', 'files'], ['search', '搜索', 'search'], ['history', '历史', 'history']] as Array<['tree' | 'search' | 'history', string, keyof typeof ICON_PATHS]>).map(([mode, label, icon]) => h('button', {
+      key: mode, title: label, 'aria-label': label, 'aria-pressed': navigationOpen && leftMode === mode,
+      onClick: () => { setNavigationOpen(leftMode === mode ? !navigationOpen : true); setLeftMode(mode); if (mode === 'history') void loadHistory() },
+    }, workbenchIcon(icon))))
   return h('div', { className: 'code-workbench', onContextMenuCapture: () => setTabMenu(null), style: { display: 'flex', flexDirection: 'column', height: '100%', minWidth: 0, background: T.bg, color: T.fg } },
     dialog ? h('div', { className: 'code-workbench-dialog-backdrop', onKeyDown: (event: React.KeyboardEvent) => { if (event.key === 'Escape') finishDialog(false) } },
       h('form', { className: 'code-workbench-dialog', role: 'dialog', 'aria-modal': true, 'aria-label': dialog.title, onSubmit: (event: React.FormEvent) => { event.preventDefault(); finishDialog(true) } },
@@ -3700,25 +3812,24 @@ function CodePanel(props: DSH.CodePanelProps): React.ReactNode {
         h('div', { className: 'code-workbench-dialog-actions' },
           h('button', { type: 'button', style: button, onClick: () => finishDialog(false) }, '取消'),
           h('button', { type: 'submit', autoFocus: !dialog.input, style: button, disabled: dialog.input && !dialogValue.trim() }, '确定')))) : null,
-    h('div', { style: header },
-      h('button', { style: button, onClick: () => setNavigationOpen(!navigationOpen), 'aria-expanded': navigationOpen }, navigationOpen ? '收起导航' : '工作区'),
-      h('span', { title: activePath ?? cwd, style: { flex: '1 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: T.fg } },
-        relativePath ?? '代码工作台'),
-      h('span', { style: { color: dirty ? T.accent : T.fgMuted } }, dirty ? '● 未保存' : ''),
-    ),
-    h('div', { style: { ...header, flexWrap: 'wrap', gap: '6px', padding: '8px 12px' } },
-      h('button', {
-        style: { ...button, opacity: hasSelection ? 1 : 0.5 },
-        onClick: addToChat,
-        disabled: !hasSelection,
-        title: '把选中代码添加到主对话输入框（Ctrl+L）',
-      }, '加到对话'),
-      h('button', { style: button, onClick: () => { void save() }, disabled: !dirty }, '保存 (Ctrl+S)'),
-    ),
+    // No header band, and no action row under it.
+    //
+    // The band held three things and each one has a home: the navigation toggle
+    // is the active icon in the activity rail (clicking the view you are already
+    // on collapses the pane), the dirty marker is the dot on the file's own tab,
+    // and the path is that tab's tooltip, with the file tree showing where it
+    // sits. The row below held 「加到对话」 and 「保存 (Ctrl+S)」, both second doors
+    // onto actions that already have a primary one — the selection capsule, Ctrl+L
+    // and the editor context menu for the first; Ctrl+S and the optional auto-save
+    // for the second. Between them they were two permanent bands of height bought
+    // for controls that were disabled most of the time.
     release === null && updateNote === '' ? null : h('div', {
       className: 'code-workbench-update',
       role: 'status',
-      style: { ...header, borderBottom: `1px solid ${T.border}`, background: T.bgRaised, color: T.fg, padding: '8px 12px' },
+      // `borderBottom: 'none'` because the body underneath now carries the top
+      // divider: the banner's own line would sit flush against it and read as a
+      // 2px rule. The raised background already separates it from the tab bar.
+      style: { ...header, borderBottom: 'none', background: T.bgRaised, color: T.fg, padding: '8px 12px' },
     },
       h('span', { style: { flex: '1 1 auto', minWidth: 0, overflowWrap: 'anywhere' } },
         // The note never replaces the offer: a failure is something to read, not
@@ -3734,18 +3845,30 @@ function CodePanel(props: DSH.CodePanelProps): React.ReactNode {
         onClick: () => { void runUpdate() },
       }, updateBusy ? '更新中…' : '升级'),
     ),
-    h('div', { className: 'code-workbench-body', style: { display: 'flex', flex: '1 1 auto', minHeight: 0 } },
-      h('div', { className: 'code-workbench-activity', role: 'toolbar', 'aria-label': '工作区视图' },
-        ([['tree', '文件', 'files'], ['search', '搜索', 'search'], ['history', '历史', 'history']] as Array<['tree' | 'search' | 'history', string, keyof typeof ICON_PATHS]>).map(([mode, label, icon]) => h('button', {
-          key: mode, title: label, 'aria-label': label, 'aria-pressed': navigationOpen && leftMode === mode,
-          onClick: () => { setNavigationOpen(leftMode === mode ? !navigationOpen : true); setLeftMode(mode); if (mode === 'history') void loadHistory() },
-        }, workbenchIcon(icon)))),
-      h('div', { className: 'code-workbench-navigation', style: { width: 'clamp(150px, 28%, 210px)', flex: '0 0 auto', borderRight: `1px solid ${T.border}`, background: T.bgRaised, display: navigationOpen ? 'flex' : 'none', flexDirection: 'column', minHeight: 0 } },
-        h('div', { className: 'code-workbench-navigation-title' }, leftMode === 'tree' ? '文件' : leftMode === 'search' ? '搜索' : '历史'),
+    // The band is gone but its `border-bottom` was doing a second job: it was the
+    // panel's top divider. That line belongs to the content area, so it is drawn
+    // on the body instead — same token the tab strip and the tree toolbar use for
+    // their own separators, which is what lets the three meet.
+    h('div', { className: 'code-workbench-body', style: { display: 'flex', flex: '1 1 auto', minHeight: 0, borderTop: `1px solid ${T.border}` } },
+      // The pane carries two marker columns now (chevron + glyph), so the same
+      // name needs ~12px more room than it did: the clamp moves out with it rather
+      // than letting every long name truncate a character earlier. Folded, the
+      // width is left to the content so the pane shrinks to the switcher row that
+      // stays behind — the point of folding is the editor's width, and a fixed
+      // column would give none of it back.
+      h('div', { className: 'code-workbench-navigation', style: { width: navigationOpen ? 'clamp(170px, 30%, 240px)' : 'auto', flex: '0 0 auto', borderRight: `1px solid ${T.border}`, background: T.bgRaised, display: 'flex', flexDirection: 'column', minHeight: 0 } },
+        // No mode title above the pane: the switcher's own pressed state and its
+        // tooltip already answer which view is showing, and a title band cost a
+        // whole row that left this pane's first separator below the tab strip's.
+        //
+        // The two views that are not the tree have no header row of their own, so
+        // the switcher's row is rendered here for them. In tree mode the tree
+        // renders that row itself, with its own tools at the right end.
+        leftMode === 'tree' ? null : h('div', { className: 'code-workbench-viewbar' }, viewButtons),
         leftMode === 'search'
-          ? searchPanel
+          ? (navigationOpen ? searchPanel : null)
           : leftMode === 'history'
-            ? historyPanel
+            ? (navigationOpen ? historyPanel : null)
             // Hands its whole height to the tree and keeps no scroll box of its
             // own. Whoever holds the scroller holds the empty space under the
             // last row, and that space is the one a blank click lands on — a
@@ -3753,11 +3876,15 @@ function CodePanel(props: DSH.CodePanelProps): React.ReactNode {
             // tree's click handler cannot see it.
             : h('div', { className: 'code-workbench-tree-column', style: { display: 'flex', flexDirection: 'column', flex: '1 1 auto', minHeight: 0 } },
               cwd
-                ? h(FileTree, { list, cwd, activePath, onOpen: (path: string) => { void openFile(path) }, joinPath, onAction: treeAction, refreshRevision: treeRevision, clipboard: treeClipboard, closeMenuSignal: tabMenu?.path ?? null, onMenuOpen: () => setTabMenu(null) })
+                ? h(FileTree, { list, cwd, activePath, onOpen: (path: string) => { void openFile(path) }, joinPath, onAction: treeAction, refreshRevision: treeRevision, clipboard: treeClipboard, closeMenuSignal: tabMenu?.path ?? null, onMenuOpen: () => setTabMenu(null), leading: viewButtons, collapsed: !navigationOpen })
                 : h('div', { style: { padding: '12px', color: T.fgMuted, fontSize: '12px' } }, '会话没有工作区目录')),
       ),
       h('div', { style: { display: 'flex', flexDirection: 'column', flex: '1 1 auto', minHeight: 0, minWidth: 0 } },
-        h('div', { className: 'code-workbench-tabs', onClick: () => { if (tabMenu) setTabMenu(null) } }, tabs.length ? tabs : h('span', { className: 'code-workbench-no-tabs' }, '未打开文件')),
+        // With no file open the strip goes quiet: same height, no text, no divider.
+        // It used to print 未打开文件 in grey under a line, which said nothing the
+        // editor's own empty state does not already say, and with no tabs there is
+        // nothing for that line to separate.
+        h('div', { className: tabs.length === 0 ? 'code-workbench-tabs code-workbench-tabs-quiet' : 'code-workbench-tabs', onClick: () => { if (tabMenu) setTabMenu(null) } }, tabs),
         tabMenu ? h('div', { role: 'menu', className: 'code-workbench-context-menu', style: { left: tabMenu.x, top: tabMenu.y }, onClick: (event: React.MouseEvent) => event.stopPropagation() }, ([
           ['close', '关闭', () => { void closeFile(tabMenu.path) }],
           ['closeOthers', '关闭其他', () => { void closeTabSet(openPaths.filter((path) => path !== tabMenu.path)) }],
@@ -3767,8 +3894,10 @@ function CodePanel(props: DSH.CodePanelProps): React.ReactNode {
           ['copyPath', '复制路径', () => { void copyPath(tabMenu.path) }],
           ['copyRelativePath', '复制相对路径', () => { void copyPath(tabMenu.path, true) }],
         ] as Array<[string, string, () => void]>).map(([action, label, handler]) => h('button', { key: action, type: 'button', role: 'menuitem', onClick: () => { setTabMenu(null); handler() } }, label))) : null,
-        h('div', { className: 'code-workbench-breadcrumb', title: relativePath ?? '' },
-          (relativePath ?? '代码工作台').split(/[\\/]/).filter(Boolean).map((part, index) => h('span', { key: `${part}-${index}` }, index > 0 ? ` › ${part}` : part))),
+        // No breadcrumb row either. The panel header above already prints the same
+        // relative path, with the absolute path as its tooltip, so this band was a
+        // second copy of one string — and the height that kept the two panes'
+        // separators from meeting.
         h('div', { style: { position: 'relative', display: 'flex', flex: '1 1 auto', minHeight: 0, minWidth: 0 } },
         h('div', { ref: hostRef, style: { flex: '1 1 auto', minHeight: 0, minWidth: 0, visibility: activePath ? 'visible' : 'hidden' } }),
         activePath === null ? h('div', { className: 'code-workbench-empty' },

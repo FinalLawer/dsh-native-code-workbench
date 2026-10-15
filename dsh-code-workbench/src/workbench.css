@@ -62,8 +62,19 @@
 }
 .code-workbench-tree-rail[data-on="false"] { background: transparent; }
 /* The row scroller. It is focusable only as a programmatic landing spot, never
-   a tab stop, so the keyboard path runs through the rows themselves. */
-.code-workbench-tree-body { outline: none; min-height: 0; }
+   a tab stop, so the keyboard path runs through the rows themselves.
+   The vertical rhythm is one number: every row carries `margin: 2px` top and
+   bottom, so two rows are 4px apart. This box's top padding is 2px so that the
+   gap *above* the first row — the root — is that same 2 + 2, rather than the
+   half-gap a bare margin would leave. The bottom padding is free: it sits under
+   the last row and separates it from nothing.
+   `scrollbar-gutter: stable` because a classic scrollbar takes its width out of
+   this box's content, and every row is sized by that: opening a folder tall enough
+   to scroll would slide every row — and the tree's tools, which ride the root row's
+   trailing edge — a dozen pixels left. The gutter is reserved whether or not the
+   scrollbar is showing, so the rows stay where they are and a name stops
+   re-ellipsising the moment the list grows. */
+.code-workbench-tree-body { outline: none; min-height: 0; padding: 2px 0 4px; scrollbar-gutter: stable; }
 /* The in-tree name field that stands in for a row while creating or renaming.
    It reads as part of the tree — one line at the row's depth — rather than as a
    floating panel, which is the whole point of editing in place.
@@ -99,32 +110,99 @@
   font-size: 11px;
   overflow-wrap: anywhere;
 }
-.code-workbench-tree-toolbar { display: flex; justify-content: flex-end; gap: 3px; padding: 5px 8px; border-bottom: 1px solid var(--dsw-alias-border-l2); }
-.code-workbench-tree-toolbar button { width: 25px; height: 24px; padding: 0; border: 0; border-radius: 5px; background: transparent; color: var(--dsw-alias-label-secondary); cursor: pointer; font-size: 15px; }
-.code-workbench-tree-toolbar button:hover { background: var(--dsw-alias-interactive-bg-hover); color: var(--dsw-alias-label-primary); }
-.code-workbench-tabs { display: flex; min-height: 38px; overflow-x: auto; border-bottom: 1px solid var(--dsw-alias-border-l2); background: var(--dsw-alias-bg-layer-1); }
+/* The switcher's row, above the pane's content. It holds the switcher and nothing
+   else — the tree's tools went down to the root row — so the switcher is centred
+   in it and the row centres its items vertically: a lone group pinned to one edge
+   reads as if the opposite half failed to load.
+   `flex: 0 0 auto` because a height alone does not hold a row in a flex column.
+   `flex-shrink` defaults to 1, and the scroller beside it takes a flex basis equal
+   to its content, so opening a folder with a few hundred entries makes the two
+   shrink in proportion and this band loses a few pixels — the header is squashed
+   exactly when the tree gets long. The tab strip opposite has carried the same rule
+   from the start; this row is its counterpart and needs it too. */
+.code-workbench-viewbar { box-sizing: border-box; display: flex; flex: 0 0 auto; align-items: center; justify-content: center; height: var(--cw-head-row, 39px); padding: 0 6px; border-bottom: 1px solid var(--dsw-alias-border-l2); }
+.code-workbench-viewbar-views { display: flex; align-items: center; gap: 2px; }
+/* Same explicit centring as the tree's tools, and for the same reason: an inline
+   SVG left to the UA's `text-align: center` is laid out on the text baseline and
+   the descender space under it lifts the glyph above the slot's middle. */
+.code-workbench-viewbar-views button { display: flex; align-items: center; justify-content: center; width: 30px; height: 26px; padding: 0; border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--dsw-alias-label-secondary); cursor: pointer; font-size: 21px; }
+.code-workbench-viewbar-views button[aria-pressed="true"] { color: var(--dsw-alias-brand-primary); background: var(--dsw-alias-interactive-bg-hover); border-color: var(--dsw-alias-border-l2); }
+/* The tree's tools, on the trailing edge of the tree's own header — which is the
+   root row. Smaller than the buttons elsewhere because that row is a row: 24px of
+   line box with 3px of padding above and below, where a 24px control would touch
+   both edges.
+   Revealed by the pointer being anywhere in the tree: the row lives inside
+   `.code-workbench-tree`, so both the root row and the rows below it count.
+   `opacity` rather than `display`, because the row's height and the buttons'
+   places must not move when they appear — and `:focus-within` as well, because a
+   control only a pointer can reveal is a control the keyboard cannot find. */
+.code-workbench-tree-tools { display: flex; align-items: center; gap: 1px; margin-left: auto; opacity: 0; transition: opacity .12s ease; }
+.code-workbench-tree:hover .code-workbench-tree-tools,
+.code-workbench-tree:focus-within .code-workbench-tree-tools { opacity: 1; }
+.code-workbench-tree-tools button { display: flex; align-items: center; justify-content: center; width: 22px; height: 20px; padding: 0; border: 0; border-radius: 4px; background: transparent; color: var(--dsw-alias-label-secondary); cursor: pointer; font-size: 14px; }
+.code-workbench-tree-tools button:hover { background: var(--dsw-alias-interactive-bg-hover); color: var(--dsw-alias-label-primary); }
+/* The strip's divider is an inset shadow, not a `border-bottom`, and that is what
+   lets the open tab interrupt it. The tab takes the editor's own background
+   (`bg-base`, where the strip is the raised `bg-layer-1`) and, being an opaque
+   child, paints over the shadow at the strip's last pixel: the line runs under every
+   tab except the open one, so the tab and the page below it read as one surface and
+   no stripe is needed to say which is open.
+   A shadow rather than the obvious `margin-bottom: -1px` overlap: this box scrolls
+   on `overflow-x: auto`, which makes `overflow-y` compute to `auto` too, and a child
+   hanging one pixel below the padding box is scrollable overflow — the fix for a
+   cosmetic line would have been a spurious scrollbar. */
+.code-workbench-tabs { box-sizing: border-box; display: flex; min-height: var(--cw-head-row, 39px); overflow-x: auto; box-shadow: inset 0 -1px 0 var(--dsw-alias-border-l2); background: var(--dsw-alias-bg-layer-1); }
 .code-workbench-tab { display: flex; align-items: center; gap: 7px; max-width: 190px; padding: 0 10px; border-right: 1px solid var(--dsw-alias-border-l2); color: var(--dsw-alias-label-secondary); cursor: pointer; font-size: 12px; }
 .code-workbench-tab > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.code-workbench-tab.active { color: var(--dsw-alias-label-primary); background: var(--dsw-alias-bg-base); border-top: 2px solid var(--dsw-alias-brand-primary); }
-.code-workbench-tab button { border: 0; background: transparent; color: inherit; cursor: pointer; font-size: 16px; line-height: 1; }
+/* The tab's file glyph, in the 16px box the tree's marker column established, so a
+   file looks like itself in both places. */
+.code-workbench-tab-icon { flex: 0 0 auto; }
+/* No stripe above it. The old one was the loudest thing in the panel, and because
+   it was a border it sat on this element's content box — the active tab's label rode
+   2px lower than its neighbours', so switching tabs nudged the text.
+   The background is the *editor's* token, not the panel's: the code surface is
+   `--dsw-alias-markdown-code-block` (see `take('editor.background', …)` in the theme
+   builder), while this plugin's surfaces are `--dsw-alias-bg-base`. Painting the tab
+   with the panel token looked like a near miss beside the code rather than a
+   continuation of it — the two are different colours on purpose. The fallback keeps
+   the tab opaque if a host theme has no code-block token; left to resolve to
+   nothing the declaration would be dropped and the strip's divider would show
+   straight through the open tab. */
+.code-workbench-tab.active { color: var(--dsw-alias-label-primary); background: var(--dsw-alias-markdown-code-block, var(--dsw-alias-bg-base)); }
+/* The close button is a box, not a glyph sitting on a baseline. It used to be a bare
+   `×` at `font-size: 16px; line-height: 1`, so whatever painted its hover frame
+   painted the text's *line box* — taller than the glyph and hanging above it,
+   because a line box reserves descender space under the baseline. Centring the glyph
+   in a square box of its own, rounded, is what puts the frame around the × instead
+   of around its line.
+   The `:hover` rule is deliberately two classes deep: the shell also styles bare
+   buttons on hover, and with equal specificity the two would be settled by
+   stylesheet order instead of by intent. */
+.code-workbench-tab button { display: flex; align-items: center; justify-content: center; width: 18px; height: 18px; padding: 0; border: 0; border-radius: 4px; background: transparent; color: inherit; cursor: pointer; font-size: 14px; line-height: 1; }
+.code-workbench-tabs .code-workbench-tab button:hover { background: var(--dsw-alias-interactive-bg-hover); }
 /* Where a dragged tab would land. The marker is an inset shadow rather than a
    border so inserting it cannot change the strip's layout mid-drag: a tab that
    shifted by a pixel would move the drop target out from under the pointer. */
 .code-workbench-tab-drop-before { box-shadow: inset 2px 0 0 var(--dsw-alias-brand-primary); }
 .code-workbench-tab-drop-after { box-shadow: inset -2px 0 0 var(--dsw-alias-brand-primary); }
-.code-workbench-breadcrumb { min-height: 30px; display: flex; align-items: center; padding: 0 14px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; border-bottom: 1px solid var(--dsw-alias-border-l2); color: var(--dsw-alias-label-secondary); font-size: 12px; }
 .code-workbench {
   position: relative;
   container-type: inline-size;
   font-family: var(--dsw-font-family, sans-serif);
+  /* The height of the first row of BOTH panes: the tab strip on the right and the
+     view bar on the left. They are the same band by construction, so the
+     separators under them meet across the split instead of stepping by a few
+     pixels. */
+  --cw-head-row: 39px;
 }
-.code-workbench-activity { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 8px 4px; flex: 0 0 42px; border-right: 1px solid var(--dsw-alias-border-l2); background: var(--dsw-alias-bg-layer-1); }
-.code-workbench-activity button { width: 34px; height: 34px; padding: 0; border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--dsw-alias-label-secondary); cursor: pointer; font-size: 23px; }
-.code-workbench-activity button[aria-pressed="true"] { color: var(--dsw-alias-brand-primary); background: var(--dsw-alias-interactive-bg-hover); border-color: var(--dsw-alias-border-l2); }
-.code-workbench-navigation-title { padding: 12px; font-size: 12px; color: var(--dsw-alias-label-secondary); border-bottom: 1px solid var(--dsw-alias-border-l2); }
-.code-workbench-tabs, .code-workbench-breadcrumb { flex-shrink: 0; }
+.code-workbench-tabs { flex-shrink: 0; }
 .code-workbench-tab { flex-shrink: 0; }
-.code-workbench-no-tabs { padding: 11px 14px; color: var(--dsw-alias-label-secondary); font-size: 12px; }
+/* The strip with no tabs in it. It keeps the band's height — so the left pane's
+   first row stays level with it and the editor does not jump when the first tab
+   arrives — but says nothing and draws no divider: there is nothing to list, and
+   nothing for a divider to separate. Only the shadow goes, so the height cannot
+   change with it. */
+.code-workbench-tabs-quiet { box-shadow: none; }
 .code-workbench button { font-family: inherit; }
 .code-workbench-dialog-backdrop { position: absolute; inset: 0; z-index: 10001; display: flex; align-items: center; justify-content: center; padding: 20px; background: #0005; }
 .code-workbench-dialog { width: min(360px, 100%); padding: 20px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 12px; background: var(--dsw-alias-bg-layer-1); box-shadow: 0 12px 40px #0003; }
@@ -170,7 +248,6 @@
 }
 @container (max-width: 480px) {
   .code-workbench-body { flex-direction: column; }
-  .code-workbench-activity { flex-direction: row; flex-basis: auto; padding: 4px 8px; border-right: none; border-bottom: 1px solid var(--dsw-alias-border-l2); }
   .code-workbench-navigation {
     width: 100% !important;
     flex: 0 1 180px !important;
@@ -186,9 +263,9 @@
    cursor is the one place motion costs more than it gives.
    --------------------------------------------------------------------------- */
 .code-workbench-tree-row { transition: background-color .12s ease, box-shadow .12s ease; }
-.code-workbench-tab { transition: color .12s ease, background-color .12s ease, border-top-color .12s ease; }
-.code-workbench-tree-toolbar button,
-.code-workbench-activity button { transition: background-color .12s ease, color .12s ease, border-color .12s ease; }
+.code-workbench-tab { transition: color .12s ease, background-color .12s ease; }
+.code-workbench-tree-tools button,
+.code-workbench-viewbar-views button { transition: background-color .12s ease, color .12s ease, border-color .12s ease; }
 .code-workbench-context-menu button { transition: background-color .1s ease; }
 .code-workbench button { transition: background-color .12s ease, opacity .12s ease; }
 
@@ -198,6 +275,15 @@
    rather than two pictures. */
 .code-workbench-tree-twisty { display: inline-flex; transition: transform .15s ease; transform: rotate(0deg); }
 .code-workbench-tree-twisty[data-open="true"] { transform: rotate(90deg); }
+/* The chevron column. A file has no chevron and still needs the column to exist,
+   so the box is rendered empty rather than omitted: the glyph column after it is
+   then at the same x for a file and a folder at the same depth. 12px matches the
+   triangle, and the colour is the one the twisty used to carry on itself. */
+.code-workbench-tree-chevron { flex: 0 0 auto; width: 12px; height: 16px; display: flex; align-items: center; justify-content: center; color: var(--dsw-alias-label-secondary); }
+/* The folder glyph the platform's own file tree draws. Its artwork strokes with
+   `currentColor`, which is why the colour has to arrive from here; the official
+   tree paints it with `--dsw-alias-label-tertiary`. */
+.code-workbench-tree-folder { color: var(--dsw-alias-label-tertiary); }
 
 /* The 16px marker column: a folder's twisty and a file's type glyph both sit
    here, centred, so file and folder names stay on one column. It is wider than
