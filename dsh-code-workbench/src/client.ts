@@ -4145,24 +4145,63 @@ function apply(ctx: DSH.ClientContext): void {
   }
   ctx.effect(() => ctx.slots.inject('conversation.chat.node', () => {
     const disposers: DSH.Disposer[] = []
-    const entries: DSH.SlotEntry[] = typeof ctx.slots.entries === 'function'
-      ? ctx.slots.entries('conversation.chat.node')
-      : []
+    /**
+     * The shipped renderer for one node kind — resolved **at render time**.
+     *
+     * `slots.inject` runs this callback inside the declaring `register()` call,
+     * and `entries()` reports only what is already committed. Whoever reaches
+     * the seat first therefore reads an **empty** list: when this plugin's
+     * `inject` is registered before the chat package's, the "original" captured
+     * here is nothing — and the wrapper below then replaced every user bubble
+     * with a bare block of text, which is the message that "jumped to the
+     * left". Load order decided which of the two happened, so it came and went.
+     *
+     * Reading the seat per render is the fix: by the time a node renders, every
+     * occupant is committed, whoever registered first. `entries()` hands back
+     * the registry's cached array (stable between mutations), so this is a
+     * bounded scan of a handful of entries per rendered node — not a
+     * subscription and not a snapshot we would have to invalidate.
+     */
+    const shipped = (key: string): StoredComponent | undefined => {
+      if (typeof ctx.slots.entries !== 'function') return undefined
+      const entry = ctx.slots.entries('conversation.chat.node')
+        .find((candidate) => candidate.options.key === key && (candidate.options.priority ?? 0) >= 0)
+      return entry?.component as StoredComponent | undefined
+    }
     for (const key of ['user', 'steering']) {
       const options = { name: 'conversation.chat.node', key, priority: -10 }
-      const original = entries.find((entry) => entry.options.key === key && (entry.options.priority ?? 0) >= 0)
-      const Original = original?.component as StoredComponent | undefined
       disposers.push(ctx.slots.register<ChatNodeProps>(options, (props) => {
+        const Original = shipped(key) as React.ComponentType<Record<string, unknown>> | undefined
         const content = props.node?.data?.content
-        const hasOriginal = typeof Original === 'function' || (typeof Original === 'object' && Original !== null && Original.$$typeof !== undefined)
-        const RenderOriginal = Original as React.ComponentType<Record<string, unknown>> | undefined
+        /**
+         * A message drawn without the shipped renderer.
+         *
+         * Deliberately a bubble rather than a bare block of text: if the seat
+         * ever answers with no renderer at all (an API change, not the race
+         * above), the message keeps the surface, width cap and edge it has in
+         * the shipped panel. Losing the bubble is survivable; losing the
+         * alignment makes the transcript look like someone else is speaking.
+         */
+        const plain = (text: string): React.ReactNode =>
+          // Empty text draws nothing, matching the shipped row (`showBubble` is
+          // false for an empty message): an empty padded bubble would be a
+          // shape the platform never draws.
+          text === '' ? null : h('div', { className: 'code-workbench-chat-bubble' }, text)
+        const textOf = (parts: Array<{ type?: string; text?: string }>): string =>
+          parts.map((part) => (part.type === 'text' ? part.text ?? '' : '')).join('\n')
+        const renderMessage = (parts: Array<{ type?: string; text?: string }>): React.ReactNode =>
+          Original === undefined
+            ? plain(textOf(parts))
+            : h(Original, { ...props, node: { ...props.node, data: { ...props.node?.data, content: parts } } })
         if (!Array.isArray(content)) {
-          return h('div', { className: 'code-workbench-chat-fallback' },
-            hasOriginal && RenderOriginal ? h(RenderOriginal, props) : typeof content === 'string' ? content : '',
-          )
+          // Not a parts array: there is nothing to compact, and rebuilding the
+          // node would only change what the shipped renderer sees. Hand it
+          // through untouched.
+          if (Original !== undefined) return h(Original, props)
+          return typeof content === 'string' ? plain(content) : null
         }
         const snippets: Array<{ anchor: string; code: string }> = []
-        const compactContent = (content as Array<{ type?: string; text?: string }>).flatMap((part) => {
+        const compact = (content as Array<{ type?: string; text?: string }>).flatMap((part) => {
           if (part.type !== 'text') return [part]
           return splitSnippets(part.text ?? '').flatMap((piece) => {
             if (piece.anchor === undefined) return [{ ...part, text: piece.text }]
@@ -4170,12 +4209,9 @@ function apply(ctx: DSH.ClientContext): void {
             return []
           })
         })
-        const renderMessage = (messageContent: Array<{ type?: string; text?: string }>) => hasOriginal && RenderOriginal
-          ? h(RenderOriginal, { ...props, node: { ...props.node, data: { ...props.node?.data, content: messageContent } } })
-          : h('div', { className: 'code-workbench-chat-fallback' }, messageContent.map((part) => part.type === 'text' ? part.text : '').join('\n'))
-        if (snippets.length === 0) return renderMessage(content as Array<{ type?: string; text?: string }>)
+        if (snippets.length === 0) return renderMessage(compact)
         return h('div', { className: 'code-workbench-chat-reference' },
-          renderMessage(compactContent),
+          renderMessage(compact),
           snippets.map((snippet, index) => h('details', { key: index, className: 'code-workbench-chat-snippet' },
             h('summary', null, `${snippet.anchor} · ${snippet.code.split('\n').length} 行`),
             h('pre', null, h('code', null, snippet.code)),

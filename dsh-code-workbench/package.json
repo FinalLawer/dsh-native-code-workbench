@@ -9,7 +9,7 @@
     "typecheck": "tsc --noEmit",
     "verify": "tsc --noEmit && node build.mjs",
     "build:vendor": "esbuild node_modules/@deepseek-ai/schemastery/lib/index.mjs --bundle --format=esm --outfile=vendor/schemastery.mjs --legal-comments=eof",
-    "test": "node ../tools/test-client-contract.mjs && node ../tools/test-host-write.mjs && node ../tools/test-file-operations.mjs && node ../tools/test-host-search.mjs && node ../tools/test-host-tool.mjs && node ../tools/test-host-complete.mjs && node ../tools/test-completion-api.mjs && node ../tools/test-host-history.mjs && node ../tools/test-host-update.mjs && node ../tools/test-bundle-slim.mjs && node ../tools/test-client-globals.mjs && node ../tools/test-client-smoke.mjs",
+    "test": "node ../tools/test-client-contract.mjs && node ../tools/test-chat-node.mjs && node ../tools/test-host-write.mjs && node ../tools/test-file-operations.mjs && node ../tools/test-host-search.mjs && node ../tools/test-host-tool.mjs && node ../tools/test-host-complete.mjs && node ../tools/test-completion-api.mjs && node ../tools/test-host-history.mjs && node ../tools/test-host-update.mjs && node ../tools/test-bundle-slim.mjs && node ../tools/test-client-globals.mjs && node ../tools/test-client-smoke.mjs",
     "manifest": "python ../tools/make-update-manifest.py"
   },
   "exports": {

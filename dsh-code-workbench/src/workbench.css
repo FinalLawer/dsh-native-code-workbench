@@ -209,9 +209,37 @@
 .code-workbench-dialog-title { font-size: 14px; margin-bottom: 16px; overflow-wrap: anywhere; }
 .code-workbench-dialog input { box-sizing: border-box; width: 100%; padding: 8px 10px; color: var(--dsw-alias-label-primary); background: var(--dsw-alias-bg-base); border: 1px solid var(--dsw-alias-border-l2); border-radius: 6px; }
 .code-workbench-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
-.code-workbench-chat-reference { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
-.code-workbench-chat-fallback { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--dsw-alias-label-primary); }
+/* The wrapper contributes no box: `display: contents` leaves the shipped chat
+   row with exactly the containing block it has without this plugin. A flex (or
+   any other box-making) wrapper turns the row into a shrink-to-fit item of a
+   new parent, and the row's own `max-width: 82%` cap then resolves against a
+   width it was never designed for — one way a user bubble ends up drawn
+   somewhere other than where the platform puts it. */
+.code-workbench-chat-reference { display: contents; }
+/* The user bubble, rebuilt for the one case where the shipped renderer is not
+   available. Same surface, radius, padding and width cap, and the same edge, so
+   a degraded message reads as the same message in the same place — only its
+   hover chrome is missing. */
+.code-workbench-chat-bubble {
+  box-sizing: border-box;
+  width: fit-content;
+  max-width: min(calc(var(--dsh-chat-content-width, 748px) * .702), 82%);
+  margin-inline-start: auto;
+  padding: 10px 16px;
+  border-radius: var(--dsw-radius-xl, 18px);
+  background: var(--dsw-specific-bubble, var(--dsw-alias-bg-layer-1));
+  color: var(--dsw-alias-label-primary);
+  font-size: var(--dsh-content-font-size, 14px);
+  line-height: calc(22px + var(--dsh-content-font-delta, 0px));
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
 .code-workbench-chat-snippet {
+  box-sizing: border-box;
+  /* Each card places itself now that the wrapper lays nothing out: hugging the
+     same edge as the message, with the gap the wrapper's `gap` used to give. */
+  width: fit-content;
+  margin: 6px 0 0 auto;
   max-width: 100%;
   border: 1px solid var(--dsw-alias-border-l2);
   border-radius: var(--dsw-radius-lg, 12px);
